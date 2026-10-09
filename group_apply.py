@@ -1025,12 +1025,13 @@ def _apply(app_dir, ctx, wait, txn):
 
     Whatever raises in there is dealt with in there: putting the backup back is part of the
     apply, and no other FCTool may claim or "resume" anything while it goes on."""
-    waited, began, gone, looks = 0.0, _clock(), set(), 0
+    waited, began, gone, looks, anew = 0.0, _clock(), set(), 0, 0
     while True:
         pending = group_state.read_pending(app_dir)
         leftover = group_state.read_applying(app_dir)
         if leftover is None and pending is None:
             return None                 # nothing staged, nothing left over
+        asked = False
         writer = _writer(pending) if leftover is None else None
         if writer is not None and writer not in gone \
                 and not (pending["kind"] == "import" and _incomplete()):
@@ -1046,6 +1047,7 @@ def _apply(app_dir, ctx, wait, txn):
             if len(gone) >= _MAX_WRITERS:       # each one gone, and always another: enough
                 return _report("deferred", kind, _worded(_MSG_CHANGING, kind), meta=meta)
             gone.add(writer)
+            asked = True
             waited, began = 0.0, _clock()       # the wait for the LOCK starts here
         again = False
         with group_state.apply_lock(app_dir) as held:
@@ -1059,9 +1061,14 @@ def _apply(app_dir, ctx, wait, txn):
                 again = True
         if again:                       # another writer: asked with the lock given up
             looks += 1
+            anew += asked               # its writer was asked about - and it was another's
             if looks > _MAX_WRITERS:    # staged again and again: the next start's business
+                # What stopped this start is said as it was: the work was staged anew
+                # between two looks - or no writer was ever asked, because a protocol
+                # file read "in use" outside the lock at every look.
                 kind = _kind(txn["kind"])
-                return _report("deferred", kind, _worded(_MSG_CHANGING, kind),
+                return _report("deferred", kind,
+                               _worded(_MSG_CHANGING, kind) if anew else _MSG_IN_USE,
                                meta=txn["meta"])
             continue
         # Held elsewhere, and there IS staged work (a pending or an applying file was read
@@ -1390,23 +1397,42 @@ def _log_tag(side, events, live, tag=None, by="") -> None:
     side["tag_log"] = events
 
 
-def _take_back(side, entry, files, stamp) -> list:
+def _take_back(side, entry, files, stamp, backup="") -> list:
     """The backup of history ``entry`` was put back - ``files`` are as they were just
-    before that import (``entry`` is ``None`` for a backup the history does not know).
-    Each of them holds again what was under that import (``under``; nothing recorded, for
-    an entry that does not say), and every applied import is ``restored`` or not by whether
-    a file still holds its change - ALL of them, earlier and later ones: one that went with
-    its last file is marked, one whose change is back in a file is un-marked. An entry
-    without a record keeps the mark it has; ``entry`` itself is marked whatever it says.
-    -> the entries that were in effect and are not any more, oldest first."""
+    before that import. Each of them holds again what was under that import (``under``;
+    nothing recorded, for an entry that does not say), and every applied import is
+    ``restored`` or not by whether a file still holds its change - ALL of them, earlier and
+    later ones: one that went with its last file is marked, one whose change is back in a
+    file is un-marked. An entry without a record keeps the mark it has; ``entry`` itself is
+    marked whatever it says. -> the entries that were in effect and are not any more,
+    oldest first.
+
+    ``entry`` is ``None`` for a backup the history does not know (its entry was deleted by
+    hand): then ``backup``, its name, is all there is to go by. A file whose list holds
+    that name keeps what was under it - the list is cut there; a file whose list does not
+    is left as it is, the backup says nothing about it.
+
+    Three things are as they are on purpose. A ``failed`` entry keeps its ``restored``
+    mark for good - it never was in effect, the mark only says its backup was put back.
+    An import that comes back in effect gets its mark and its tag back, not the attention
+    flags it raised or the structure check it queued: those were taken back with it, and
+    are not raised a second time behind the user's back. And a side file an earlier build
+    wrote, without the record, can show a mark that is out of date until the next import
+    or restore writes one (the comment above ``_held``)."""
     listed = [old for old in side["imports"] if old.get("status") == "applied"]
     was = {id(old) for old in listed if not old.get("restored")}
     held = _held(side)
     under = entry.get("under") if entry is not None else None
     for name in files:
         stack = under.get(name) if isinstance(under, dict) else None
-        if name in _STATE_NAMES:
-            held[name] = [backup for backup in stack if isinstance(backup, str)
+        if name not in _STATE_NAMES:
+            continue
+        if entry is None:               # the unknown backup: cut the list at its name
+            listed_there = held.get(name, [])
+            if backup in listed_there:
+                held[name] = listed_there[:listed_there.index(backup)]
+        else:
+            held[name] = [below for below in stack if isinstance(below, str)
                           ][-HISTORY_KEEP:] if isinstance(stack, list) else []
     side["on_disk"] = held
     for old in listed:
@@ -1480,7 +1506,7 @@ def _restore(app_dir, protocol, txn, side) -> dict:
         if config_back:
             side["tasks"] = [task for task in side["tasks"] if task.get("kind") != VERIFY_TASK]
         events = _tag_events(side, _held(side))     # the tag's history, as it is BEFORE
-        went = _take_back(side, entry, files, report["at"])
+        went = _take_back(side, entry, files, report["at"], _text(name))
         live = _live(side, side["on_disk"])
         side["applied"] = _newest_in_effect(side)
         _store_tag(side, _tag_of(events, live))
