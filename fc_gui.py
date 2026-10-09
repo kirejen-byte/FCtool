@@ -105,6 +105,10 @@ import role_cap
 # Role Tracker preset helpers: pure, shared with the group-configuration items
 # (which run before any window exists). Aliased back under their old names below.
 import role_presets
+# Custom Specialized Role categories: the pure model, and its editor window +
+# Fleet-tab helpers (pure core + Tk shell in one module). Neither imports fc_gui.
+import spec_roles
+import spec_roles_ui
 import charge_tracker
 import command_bursts
 # Fitting / doctrine / MOTD service layer (Fittings tab). Tk-free pure modules;
@@ -4692,6 +4696,12 @@ class FCToolGUI:
         self._links_reset_glyph = make_glyph_button(
             spec_header_row, "↻", "Reset link tracking", self._reset_links)
         self._links_reset_glyph.pack(side=tk.LEFT, padx=(5, 0))
+        # The user's own categories, shown after the built-in sections. The
+        # flat padding keeps this row at the title's height: a stock button
+        # (8, 4) made it 8 px taller, out of the roles canvas below.
+        ttk.Button(spec_header_row, text="Custom...", style="Dark.TButton",
+                   width=-9, padding=(6, 0),
+                   command=self._open_spec_roles_editor).pack(side=tk.RIGHT)
         self._spec_roles_blurb = tk.Label(
             comp_right_outer,
             text="Pilots drag burst charges into fleet chat — all in one message.",
@@ -4763,6 +4773,8 @@ class FCToolGUI:
             self._create_collapsible_section(self._spec_roles_frame, "Dreadnoughts")
         self._bridge_container, self._bridge_content, self._bridge_count = \
             self._create_collapsible_section(self._spec_roles_frame, "Bridge")
+        # The user's own categories come after the ten built-in sections.
+        self._rebuild_custom_spec_sections()
 
         # Store cached fleet locations for specialized role pilot info
         self._fleet_locations_cache: dict[str, tuple[str, str, str]] = {}
@@ -7381,9 +7393,123 @@ class FCToolGUI:
                      font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL, anchor=tk.W
                      ).pack(anchor=tk.W)
 
+        # The user's own categories: display only, after everything built in.
+        if getattr(self, "_spec_custom_sections", None):
+            self._fill_custom_spec_sections(members, doc)
+
         # Keep the MOTD +/- deltas current as the live fleet changes.
         if hasattr(self, "_schedule_motd_preview"):
             self._schedule_motd_preview()
+
+        # A section that just emptied can leave the view past the content's
+        # new end (a blank panel). getattr: bare test hosts bind this method.
+        sync = getattr(self, "_sync_spec_roles_scrollregion", None)
+        if sync is not None:
+            sync()
+
+    # ── Custom specialized roles ─────────────────────────────────────────
+    # spec_roles owns the stored shape, spec_roles_ui the editor and the
+    # who-is-in-it maths; this block only builds, fills and saves. The custom
+    # sections are ADDED after the ten built-in ones and feed nothing: not
+    # _roles_filled, not the Links section, not the fleet snapshot the FC HUD
+    # and the MOTD read.
+
+    def _rebuild_custom_spec_sections(self):
+        """(Re)build one collapsed section per stored custom category, after
+        the built-in sections. Tk thread. Total: a bad stored value, or a
+        config read that raises, means no custom section - the tab builds."""
+        previous = getattr(self, "_spec_custom_sections", ())
+        for _cat, container, content, _count in previous:
+            # ids are reused: a new frame must not inherit the open hull rows.
+            getattr(self, "_role_expand_state", {}).pop(id(content), None)
+            container.destroy()
+        self._spec_custom_sections = []
+        try:
+            categories = spec_roles.normalize(
+                self.config.get(spec_roles.CONFIG_KEY))
+        except Exception:
+            categories = []
+        for category in categories:
+            container, content, count_lbl = self._create_collapsible_section(
+                self._spec_roles_frame, category["title"], collapsed=True)
+            # Before any fleet data: the minimum already shows, in the dim
+            # colour every new section has (nothing is counted, so not red).
+            count_lbl.config(text="(" + spec_roles.count_text(
+                0, category["threshold"]) + ")")
+            self._spec_custom_sections.append(
+                (category, container, content, count_lbl))
+        # Only a rebuild that REMOVED sections can shrink the panel. Never at
+        # tab build (nothing to remove yet): the idle flush in there would map
+        # the half-built main window.
+        if previous:
+            self._sync_spec_roles_scrollregion()
+
+    def _sync_spec_roles_scrollregion(self):
+        """Put the roles canvas's scrollregion back on its content. Tk thread.
+
+        The frame's <Configure> does this UNLESS the content shrank while the
+        view was scrolled past its new end: the canvas then unmaps the frame,
+        no <Configure> arrives and the whole panel stays blank until the user
+        scrolls. Idle pump first (bbox is stale without it); the canvas
+        re-clamps its view when the region shrinks. No panel: nothing to do."""
+        try:
+            frame = getattr(self, "_spec_roles_frame", None)
+            if frame is not None:
+                frame.update_idletasks()
+                frame.master.configure(scrollregion=frame.master.bbox("all"))
+        except tk.TclError:
+            pass
+
+    def _fill_custom_spec_sections(self, members, doc):
+        """Fill every custom section from one fleet snapshot (the tail of
+        _update_specialized_roles; Tk thread). Hulls are tagged by ``doc``,
+        the doctrine the built-in guidance uses. One failing section never
+        costs the others or the caller."""
+        from zkill_monitor import resolve_name
+        try:
+            tag_index = fleet_composer.build_tag_index(
+                doc, getattr(self, "fittings", None))
+        except Exception:
+            tag_index = {}
+        for category, _box, content, count_lbl in self._spec_custom_sections:
+            try:
+                ship_members, text = spec_roles_ui.fleet_section(
+                    category, members, tag_index,
+                    lambda char_id: resolve_name(char_id, "character"))
+                # threshold= makes the built-ins' own renderer pick the count
+                # colour (their red / green / dim); only the text differs.
+                self._populate_role_section(content, count_lbl, ship_members,
+                                            threshold=category["threshold"])
+                count_lbl.config(text=text)
+            except Exception:
+                log.exception("[Fleet] a custom role section failed")
+
+    def _open_spec_roles_editor(self):
+        """The "Custom..." button: open the editor, or raise the open one (it
+        takes no input hold, so this is the one-editor guard)."""
+        win = getattr(self, "_spec_roles_editor_win", None)
+        if win is not None and win.winfo_exists():   # 0 once it is closed
+            win.lift()
+            return
+        self._spec_roles_editor_win = spec_roles_ui.open_editor(
+            self.root, spec_roles.normalize(self.config.get(spec_roles.CONFIG_KEY)),
+            tags=spec_roles_ui.tag_vocabulary(self._motd_tag_vocabulary(),
+                                              getattr(self, "fittings", None)),
+            search_hulls=spec_roles_ui.catalog_search(
+                getattr(self, "type_catalog", None)),
+            on_save=self._save_custom_spec_roles)
+
+    def _save_custom_spec_roles(self, categories):
+        """The editor's Save: store the list (an empty one removes the key),
+        rebuild the sections and refill them from the cached fleet."""
+        cleaned = spec_roles.normalize(categories)
+        if cleaned:
+            self.config[spec_roles.CONFIG_KEY] = cleaned
+        else:
+            self.config.pop(spec_roles.CONFIG_KEY, None)
+        self._save_config()
+        self._rebuild_custom_spec_sections()
+        self._refresh_specialized_roles_from_cache()
 
     def _clear_fleet_snapshot(self):
         """Drop every last-fleet artifact after a CONFIRMED no-fleet. Tk thread.
