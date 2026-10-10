@@ -182,15 +182,21 @@ def fit_text(text: str, limit: int, measure) -> str:
     it is a surrogate pair), fit or no fit: a cell must show SOMETHING. A cut
     never falls inside a surrogate pair. Widths need not grow with the text
     (a font may draw several code points as one glyph), so the parts are
-    tried from the long end; at most ``_FIT_SCAN`` characters are ever kept
-    of a text that does not fit whole, which bounds the measuring.
+    tried from the long end. For a text that does not fit whole, no part
+    longer than ``_FIT_SCAN`` characters is ever TRIED, which bounds the
+    measuring: one look at the whole, then at most ``_FIT_SCAN`` parts of at
+    most that length. When none of them fits, what comes back is the minimum
+    described below, measured or not.
 
     What is left never ENDS in a zero-width joiner: a font that does not
     draw a ZWJ sequence as one glyph would otherwise leave "first member +
     joiner" in the cell. A trailing joiner is dropped, and joiners at the
     very START stay with the first character (so only a text of nothing but
-    joiners comes back ending in one). This is the one rule - there is no
-    grapheme clustering here."""
+    joiners comes back ending in one). That makes the minimum "every leading
+    joiner + the first character after them", which is the one result that
+    can be LONGER than ``_FIT_SCAN``: 40 joiners + ``abc`` that fit nowhere
+    come back as 41 characters. This is the one rule - there is no grapheme
+    clustering here."""
     if not text:
         return text
     if measure(text) <= limit:

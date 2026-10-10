@@ -331,17 +331,23 @@ def _reason(exc) -> str:
     """``exc`` for a log line, WITHOUT a directory: a path can carry a Windows
     user name, and logs get shared for support.
 
-    An ``OSError`` that names its file is written as its type, the system's
-    own reason and the path's LAST component.  Anything else is written as its
-    type name only -- its text is not ours, and may spell a path."""
-    kind = type(exc).__name__
-    if isinstance(exc, OSError) and exc.filename is not None:
-        try:
-            name = os.path.basename(os.fspath(exc.filename))
-        except TypeError:                     # a file descriptor, not a path
-            name = "?"
-        return "%s: %s: %r" % (kind, exc.strerror or "could not be opened", name)
-    return kind
+    An ``OSError`` is written as its type, then its ``strerror`` when it has
+    one (the system's own reason -- or this module's, see :func:`_load`), then
+    the LAST component of the path it names, if it names one.  Never
+    ``str(exc)``: that spells the whole path, and an error without a
+    ``strerror`` can spell anything.  Anything else is written as its type
+    name only -- its text is not ours."""
+    why = type(exc).__name__
+    if isinstance(exc, OSError):
+        if exc.strerror:
+            why = "%s: %s" % (why, exc.strerror)
+        if exc.filename is not None:
+            try:
+                name = os.path.basename(os.fspath(exc.filename))
+            except TypeError:                 # a file descriptor, not a path
+                name = "?"
+            why = "%s: %r" % (why, name)
+    return why
 
 
 def _warn_once(message: str, *args) -> None:
@@ -365,7 +371,8 @@ def _load():
     try:
         path = _data_path()
         if not path:
-            raise FileNotFoundError("not found beside the app")
+            # (errno, strerror): the wording is logged as is (see _reason).
+            raise FileNotFoundError(2, "not found beside the app")
         data = _read_bytes(path)
     except OSError as exc:
         _warn_once("[Emoji] %s could not be read (%s); emoji are shown as "
