@@ -191,6 +191,12 @@ class PillCanvas(MarkupEditor):
       The MODEL does not change - an emoji is still plain characters in a
       ``TextRun``. A falsy value (None, False) means no provider. See the
       ``emoji`` section near the end of the class.
+    * ``on_emoji_query(query, x_root, y_root)`` - with a provider only: called
+      with the text after a typed ``:`` (from two characters on, at every
+      change) and the caret's screen position, and with ``None`` once when
+      that query ends. The popup's owner answers with
+      :meth:`accept_emoji_query` and asks :meth:`emoji_query_active` before
+      it takes a key. See the ``':' emoji query`` section.
     """
 
     def __init__(self, master, resolve_label: Callable,
@@ -207,6 +213,7 @@ class PillCanvas(MarkupEditor):
                  on_pill_activate: Callable[[str, dict], None] | None = None,
                  param_editors: bool = True,
                  emoji=None,
+                 on_emoji_query: Callable | None = None,
                  **kw):
         super().__init__(master, height=height, on_change=on_change,
                          style_toolbar=style_toolbar, **kw)
@@ -230,6 +237,14 @@ class PillCanvas(MarkupEditor):
         self._emoji_bad: set = set()
         self._emoji_logged = False
         self._emoji_tag = None
+        # The ':' query seam - live only with BOTH a provider and a callback:
+        # the callback, the open query as (colon index, text), the colon of a
+        # name Esc dismissed, and whether a callback fault has been logged.
+        self._on_emoji_query = (
+            (on_emoji_query or None) if self._emoji is not None else None)
+        self._emoji_q = None
+        self._emoji_q_shut = None
+        self._emoji_q_logged = False
 
         # name (embedded-window pathname) -> TokenRun / chip Frame
         self._pills: dict = {}
@@ -268,6 +283,8 @@ class PillCanvas(MarkupEditor):
         self._bind_canvas_events()
         if self._emoji is not None:
             self._emoji_bind()
+            if self._on_emoji_query is not None:
+                self._emoji_query_bind()
 
     # ── construction ────────────────────────────────────────────────────────
 
@@ -525,6 +542,8 @@ class PillCanvas(MarkupEditor):
     # ── selection ───────────────────────────────────────────────────────────
 
     def _select_pill(self, name):
+        if self._emoji_q is not None:        # the caret leaves an open ':' query
+            self._emoji_query_end()
         if self._selected_pill and self._selected_pill != name:
             self._deselect_current()
         self._selected_pill = name
@@ -692,6 +711,8 @@ class PillCanvas(MarkupEditor):
         Low-level: does NOT touch the undo/redo stacks — :meth:`set_doc` clears
         them, undo/redo preserve them.
         """
+        if self._emoji_q is not None:        # an open ':' query ends here
+            self._emoji_query_end()
         self._selected_pill = None
         for _name, frame in list(self._pill_frames.items()):
             try:
@@ -862,6 +883,8 @@ class PillCanvas(MarkupEditor):
         except tk.TclError:
             pass
         self._fire_change()
+        if self._emoji_q is not None:        # an open ':' query: still there?
+            self._emoji_query_sync(True)
 
     def _fire_change(self):
         # Suppress change notification while set_doc is loading a document
@@ -1809,8 +1832,10 @@ class PillCanvas(MarkupEditor):
         tags = list(self.text.bindtags())
         tags.insert(tags.index("Text") + 1 if "Text" in tags else len(tags), tag)
         self.text.bindtags(tuple(tags))
+        hook = (self._emoji_after_key if self._on_emoji_query is None
+                else self._emoji_query_after_key)   # ...then the ':' query
         self.tk.call("bind", tag, "<KeyPress>",
-                     self.register(self._emoji_after_key) + " %A %s")
+                     self.register(hook) + " %A %s")
         self.bind("<Destroy>", self._emoji_unbind, add="+")
         # Middle-click and the Insert key paste Tk's PRIMARY selection, whose
         # text omits every image: both are routed through the canvas instead.
@@ -1918,15 +1943,28 @@ class PillCanvas(MarkupEditor):
         except tk.TclError:
             pass
 
+    def _emoji_colon_ok(self, opening, line) -> bool:
+        """The boundary rule a typed ``:name:`` and a ``:`` query share: the
+        colon at ``opening`` (``line`` is the start of its line) may open a
+        name when it is at the line start or NOT preceded by a letter, digit
+        or underscore (an image or a pill before it is none of those), and it
+        is not inside a ``<...>`` token being typed. A token holds no
+        whitespace, so an unclosed ``<`` followed by whitespace ("ETA <10 min",
+        "a < b") is not one - the rule of ``emoji_data.replace_shortcodes``."""
+        t = self.text
+        before = t.get(opening + "-1c", opening)
+        if before.isalnum() or before == "_":
+            return False
+        head = t.get(line, opening)
+        opened = head.rfind("<")
+        return not (opened > head.rfind(">")
+                    and not any(ch.isspace() for ch in head[opened:]))
+
     def _emoji_shortcode(self):
         """The caret follows a just-typed ``:``. Replace ``:name:`` by its emoji
         (one undo step) when the name has no whitespace and no ``<`` / ``>``,
-        the opening colon is at the line start or NOT preceded by a letter,
-        digit or underscore (an image or a pill before it is none of those),
-        the span is not inside a ``<...>`` token being typed, and the provider
-        knows the name. A token holds no whitespace, so an unclosed ``<``
-        followed by whitespace ("ETA <10 min", "a < b") is not one - the rule
-        of ``emoji_data.replace_shortcodes``."""
+        holds no pill or image, the opening colon passes the boundary rule
+        (:meth:`_emoji_colon_ok`), and the provider knows the name."""
         t = self.text
         close = t.index("insert-1c")
         line = t.index("insert linestart")
@@ -1938,14 +1976,8 @@ class PillCanvas(MarkupEditor):
             return
         if t.dump(opening, close, window=True, image=True):
             return                              # a pill or an image in the name
-        before = t.get(opening + "-1c", opening)
-        if before.isalnum() or before == "_":
+        if not self._emoji_colon_ok(opening, line):
             return
-        head = t.get(line, opening)
-        opened = head.rfind("<")
-        if (opened > head.rfind(">")
-                and not any(ch.isspace() for ch in head[opened:])):
-            return                              # inside a <...> token
         try:
             seq = self._emoji.from_shortcode(name)
         except Exception:
@@ -1959,6 +1991,180 @@ class PillCanvas(MarkupEditor):
         self._emoji_draw("insert", seq, tags)
         self._emoji_recluster("insert")
         self._after_mutation()
+
+    # -- the ':' emoji query (opt-in: ``emoji`` AND ``on_emoji_query``) ---------
+    #
+    # The canvas side of an autocomplete popup that lives elsewhere. While the
+    # caret follows ``:`` plus two or more query characters (letters of any
+    # script, digits, ``_`` ``+`` ``-``) and the colon passes the typed
+    # shortcode's boundary rule (:meth:`_emoji_colon_ok`), ``on_emoji_query``
+    # is told the query and the caret's screen position on every change, and
+    # ``None`` exactly once when it ends. A query OPENS only on an edit at the
+    # caret (a typed character or BackSpace) - moving the caret into a name
+    # opens nothing - and ENDS when the text before the caret is no longer
+    # the reported query: a character that is not one, fewer than two left, the
+    # caret moved, a click, Esc, a pill selected, the document rebuilt, the
+    # canvas destroyed. ``self._emoji_q`` is the open query as ``(colon index,
+    # text)``; nothing below is bound, and it stays None, without BOTH arguments.
+
+    def emoji_query_active(self) -> bool:
+        """True while a ``:`` query is open AT THE CARET. A query the caret has
+        left without the canvas hearing of it (a host moved the insert mark)
+        is ended here - ``None`` is reported - and the answer is False."""
+        cur = self._emoji_q
+        if cur is None:
+            return False
+        if self._emoji_query_find() == cur:
+            return True
+        self._emoji_query_end()
+        return False
+
+    def accept_emoji_query(self, seq: str) -> None:
+        """Replace the open ``:query`` span (colon included) with the emoji
+        ``seq`` as ONE undo step, leave the caret after it and end the query
+        (``None`` is reported once). With no query open at the caret the emoji
+        is inserted there. It goes in through :meth:`_put_text`, so it is
+        drawn as an image and the model gets its characters."""
+        if not seq or not isinstance(seq, str):
+            return
+        cur = self._emoji_q
+        span = cur if cur is not None and self._emoji_query_find() == cur else None
+        self._flush_burst()
+        cap = self._capture()
+        if self._undo_stack and self._undo_stack[-1] == cap:
+            # The canvas's own <Return> opened a burst on this very state
+            # before the popup's owner accepted: it already is the undo step.
+            self._redo_stack.clear()
+        else:
+            self._push_undo(cap)
+        self._emoji_q = self._emoji_q_shut = None
+        try:
+            if span is None:
+                self._put_text("insert", seq)
+            else:
+                tags = self._emoji_tags_at(span[0])
+                self.text.delete(span[0], "insert")
+                self._put_text("insert", seq, tags)
+        except tk.TclError:
+            pass
+        self._after_mutation()
+        if cur is not None:
+            self._emoji_query_tell(None)
+
+    def _emoji_query_bind(self):
+        """The seam's own bindings, each added AFTER the canvas's (so a pill
+        selection or a chip drag still gets Esc first). They die with the
+        widgets; nothing is scheduled."""
+        t = self.text
+        t.bind("<Escape>", self._emoji_query_escape, add="+")
+        t.bind("<Button-1>", lambda event: self._emoji_query_end(), add="+")
+        # Tk's <Tab> class binding inserts the tab and BREAKS, so the
+        # post-class hook never hears of it: the release settles what is left.
+        t.bind("<KeyRelease>", lambda event: self._emoji_query_sync(), add="+")
+        self.bind("<Destroy>", self._emoji_query_gone, add="+")
+
+    def _emoji_query_after_key(self, char="", state=0):
+        """The post-class ``<KeyPress>`` hook of a canvas with the seam: the
+        provider's own hook, then the query. Only a typed character or
+        BackSpace can open a query; the Delete character (0x7F) is followed
+        while one is open but opens none (deleting what comes AFTER a name is
+        no reason to offer emoji); any other key can only end it."""
+        self._emoji_after_key(char, state)
+        if self._destroyed:
+            return
+        try:
+            state = int(state)
+        except (TypeError, ValueError):
+            state = 0
+        code = ord(char[0]) if char else 0
+        if code == 0x7F:
+            edit = self._emoji_q is not None
+        else:
+            edit = code == 0x08 or (code >= 0x20
+                                    and not state & _KEY_NOT_TYPING)
+        self._emoji_query_sync(edit)
+
+    def _emoji_query_find(self):
+        """``(colon index, query)`` for the ``:`` + query characters that end
+        at the caret - the query may be empty - or None. Both ends are element
+        boundaries (a colon, the insert mark), never the middle of an astral
+        character."""
+        t = self.text
+        try:
+            line = t.index("insert linestart")
+            opening = t.search(":", "insert", stopindex=line, backwards=True)
+            if not opening:
+                return None
+            query = t.get(opening + "+1c", "insert")
+            if (any(not (ch.isalnum() or ch in "_+-") for ch in query)
+                    or t.dump(opening, "insert", window=True, image=True)
+                    or not self._emoji_colon_ok(opening, line)):
+                return None             # (a pill or an image is no character)
+        except tk.TclError:
+            return None
+        return (opening, query)
+
+    def _emoji_query_sync(self, edit=False):
+        """Bring the open query in line with what is at the caret now: report
+        a new or changed query (``edit`` only), or end the one that is gone."""
+        cur, shut = self._emoji_q, self._emoji_q_shut
+        if cur is None and shut is None and not edit:
+            return
+        found = self._emoji_query_find()
+        if shut is not None and (found is None or found[0] != shut):
+            self._emoji_q_shut = shut = None    # the caret left the dismissed name
+        if found is not None and (len(found[1]) < 2 or found[0] == shut):
+            found = None
+        if found == cur:
+            return
+        if found is None or not edit:
+            self._emoji_query_end()
+            return
+        self._emoji_q = found
+        self._emoji_query_tell(found[1])
+
+    def _emoji_query_end(self, shut=False):
+        """End the open query, if any: ``None`` is reported, once. ``shut``
+        (Esc) keeps that name quiet until the caret has left it."""
+        cur = self._emoji_q
+        if cur is None:
+            return
+        self._emoji_q = None
+        self._emoji_q_shut = cur[0] if shut else None
+        self._emoji_query_tell(None)
+
+    def _emoji_query_tell(self, query):
+        """Call ``on_emoji_query(query, x_root, y_root)`` with the bottom-left
+        of the caret on screen (the Text's own corner while the caret has no
+        box: not mapped, scrolled out of view). A raising callback is logged
+        once per canvas and never reaches the key binding."""
+        x = y = 0
+        try:
+            x, y = self.text.winfo_rootx(), self.text.winfo_rooty()
+            box = self.text.bbox("insert")
+            if box:
+                x, y = x + box[0], y + box[1] + box[3]
+        except tk.TclError:
+            pass                                # the canvas is being destroyed
+        try:
+            self._on_emoji_query(query, x, y)
+        except Exception:
+            if not self._emoji_q_logged:
+                self._emoji_q_logged = True
+                _LOG.exception("on_emoji_query callback raised")
+
+    def _emoji_query_escape(self, event=None):
+        """Esc with a query open closes the popup and nothing else: it must
+        not go on to the window's own Esc."""
+        if self._emoji_q is None:
+            return None
+        self._emoji_query_end(shut=True)
+        return "break"
+
+    def _emoji_query_gone(self, event=None):
+        if event is not None and getattr(event, "widget", None) is not self:
+            return
+        self._emoji_query_end()
 
     # ── legacy MarkupEditor overrides (§14) ─────────────────────────────────
 
