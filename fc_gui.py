@@ -142,10 +142,8 @@ import motd_markup
 import motd_doc
 import motd_palette
 import pill_canvas
-# Discord ping ("Copy ping", MOTD builder): config store, pure composer, editor.
-import ping_store
-import ping_compose
-import ping_dialog
+# Discord ping ("Copy ping", MOTD builder): PingWiringMixin, a base of FCToolGUI.
+import ping_wiring
 import system_coords
 from markup_editor import MarkupEditor
 from eveo_tracker import find_thumbs, preview_running, reset_process_cache
@@ -1282,7 +1280,7 @@ def _preview_alert_border(peak_hex, started, now, steady):
     return preview_tile.pulse_color(peak_hex, now - started, 0.5)
 
 
-class FCToolGUI(group_wiring.GroupConfigMixin):
+class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
     def __init__(self):
         _apply_dpi_awareness(_read_overlay_dpi_pref())
         self.root = tk.Tk()
@@ -14268,7 +14266,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         self._motd_staging_autofilled_value = (
             self.config.get("zkillboard", {}).get("staging_system", "") or "").strip()
         # Discord ping: the pending "When" (never persisted) + the one editor.
-        self._ping_when = ping_compose.WhenSession()
+        self._ping_when = ping_wiring.WhenSession()
         self._ping_dialog = None
 
         # Linked-MOTD auto-push state. The on/off choice is REMEMBERED across
@@ -17296,104 +17294,6 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
                 text="Markup copied to clipboard.", fg=FG_GREEN)
         except Exception as e:
             messagebox.showerror("Copy failed", f"Could not copy markup:\n{e}", parent=getattr(self, "root", None))
-
-    # -- Discord ping: the yellow "Copy ping" split button (ping_*.py) ----------
-
-    def _ping_store(self):
-        """The discord_ping block's reader/writer. It is handed ``lambda:
-        self.config``, never the dict: Save Settings REPLACES self.config."""
-        return ping_store.PingStore(lambda: self.config, self._save_config)
-
-    def _ping_env(self):
-        """What a ping takes from the app right now: doctrine, FC, staging."""
-        doctrine = self._motd_selected_doctrine()
-        auth = self._motd_selected_fc_auth() or getattr(self, "esi_auth", None)
-        zkill = self.config.get("zkillboard")       # hand-edited config: any shape
-        staging = zkill.get("staging_system") if isinstance(zkill, dict) else None
-        return ping_compose.Env(
-            getattr(doctrine, "id", None), getattr(doctrine, "name", None) or "",
-            getattr(auth, "character_name", None) or "",
-            staging.strip() if isinstance(staging, str) else "")
-
-    def _ping_preview_text(self):
-        """The main button's tooltip: what a click would copy. Never raises."""
-        try:
-            when = self._ping_when.unix
-            return ping_compose.tooltip_text(
-                ping_compose.compose(self._ping_store(), self._ping_env(), when,
-                                     int(time.time())), pending=when is not None)
-        except Exception:
-            return ""
-
-    def _copy_discord_ping(self):
-        """THE one ping copy -- the main button and the editor's button both end
-        here. A pending time is used up by a copy that SUCCEEDED, never else.
-        A failure is never silent (the exe has no stderr): the status line says it."""
-        dialog, status = getattr(self, "_ping_dialog", None), self._motd_fleet_status
-        copied = said = False
-        try:
-            editing = dialog is not None and dialog.alive()
-            if editing:
-                dialog.flush()      # a template edit still pending is copied too
-            now = int(time.time())
-            composed = ping_compose.compose(self._ping_store(), self._ping_env(),
-                                            self._ping_when.unix, now)
-            consumed = None
-            if composed.text:
-                try:
-                    self.root.clipboard_clear()
-                    self.root.clipboard_append(composed.text)
-                except Exception as e:
-                    messagebox.showerror("Copy failed", f"Could not copy the ping:\n{e}",
-                                         parent=getattr(self, "root", None))
-                    return
-                copied, consumed = True, self._ping_when.consume()
-            text, level = ping_compose.summary(composed, consumed_when=consumed, now_unix=now)
-            status.config(text=text, fg=FG_GREEN if level == "ok" else FG_YELLOW)
-            said = True             # said FIRST: a refresh that fails costs no confirmation
-            if copied and editing:
-                dialog.refresh_when()
-        except Exception as exc:
-            log.warning("ping: the copy routine failed (%s, copied=%s)",
-                        type(exc).__name__, copied)
-            if not said:
-                status.config(fg=FG_YELLOW, text="Ping copied" if copied else (
-                    "Ping not copied %s an internal error (%s); see fctool.log"
-                    % (chr(0x2014), type(exc).__name__)))
-
-    def _open_ping_dialog(self):
-        """The arrow: open the ping editor, or lift the one already open."""
-        try:
-            dialog = getattr(self, "_ping_dialog", None)
-            if dialog is not None and dialog.alive():
-                dialog.lift()
-                return
-            self._ping_dialog = ping_dialog.PingDialog(
-                self.root, store=self._ping_store(), env=self._ping_env,
-                when=self._ping_when, copy=self._copy_discord_ping,
-                system_names=lambda: list(getattr(self, "_system_names", []) or []),
-                confirm=lambda title, message: bool(messagebox.askyesno(
-                    title, message, parent=getattr(self._ping_dialog, "win", self.root))),
-                emoji=False,
-                doctrine_ids=lambda: [d.id for d in self.fittings.list_doctrines()])
-        except Exception as exc:    # never silent; self._ping_dialog stays as it was
-            log.warning("ping: the editor could not be opened (%s)", type(exc).__name__)
-            self._motd_fleet_status.config(
-                text="The ping editor could not be opened; see fctool.log", fg=FG_YELLOW)
-
-    def _ping_doctrine_changed(self, op, *ids):
-        """Duplicate / Delete: keep the ping entry in step (``op`` = the PingStore
-        method). An open editor stores its pending edit FIRST -- saved later, it
-        would bring a dropped entry back. Never blocks the doctrine operation."""
-        try:
-            try:
-                editor = getattr(self, "_ping_dialog", None)
-                if editor is not None and editor.alive():
-                    editor.flush()
-            finally:
-                getattr(self._ping_store(), op)(*ids)
-        except Exception as exc:
-            log.warning("ping: %s did not go through cleanly (%s)", op, type(exc).__name__)
 
     # ── MOTD: import current MOTD + template persistence (Task 7.3) ────────────
 

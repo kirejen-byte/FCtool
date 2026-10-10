@@ -175,13 +175,18 @@ def tooltip_text(composed: Composed, *, pending: bool, max_lines: int = 14,
     """What the one-click button's tooltip shows: the ping a click would copy, bounded.
 
     The first ``max_lines`` lines, each cut to ``TOOLTIP_LINE_CHARS``, the whole then cut
-    to ``max_chars``; every cut ends in an ellipsis. With ``pending`` (a time is set and
-    this copy will use it up) one more line says so, after the cut - it is never lost.
-    An empty ping is its own sentence and resets nothing, so it gets no such line.
+    to ``max_chars``. Every cut is marked: a shortened line and a shortened whole end in
+    an ellipsis, and lines left out are stood for by one line that is only an ellipsis.
+    With ``pending`` (a time is set and this copy will use it up) one more line says so,
+    after the cut - it is never lost. An empty ping is its own sentence and resets
+    nothing, so it gets no such line.
     """
     text = composed.text if isinstance(composed.text, str) else ""
     if not text:
         return _NOTHING_TO_COPY
-    lines = [_cut(line, TOOLTIP_LINE_CHARS) for line in text.splitlines()[:max(1, max_lines)]]
+    every = text.splitlines()
+    lines = [_cut(line, TOOLTIP_LINE_CHARS) for line in every[:max(1, max_lines)]]
+    if len(every) > len(lines):
+        lines.append(_ELLIPSIS)
     shown = _cut("\n".join(lines), max_chars)
     return shown + "\n" + _WHEN_RESETS if pending else shown
