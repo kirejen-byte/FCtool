@@ -329,20 +329,26 @@ class EmojiTiles:
             if path is None:
                 path = _sheet_path()
             if not path:
-                raise FileNotFoundError("not found beside the app")
+                # (errno, strerror): the wording below is logged as is.
+                raise FileNotFoundError(2, "not found beside the app")
             data = _read_bytes(path)
         except OSError as exc:
-            # ``strerror`` alone: the full text would repeat the path.
+            # The exception's TYPE, plus the system's own wording when it
+            # has one (``strerror``) - never ``str(exc)``: that repeats the
+            # path, and an error without a ``strerror`` can spell anything.
+            why = _ascii(type(exc).__name__)
+            if exc.strerror:
+                why = "%s: %s" % (why, _ascii(exc.strerror))
             return self._fail(
                 self._attempts >= _MAX_READ_ATTEMPTS,
-                "[Emoji] %s could not be read (%s: %s); emoji are shown as "
-                "plain characters", self._looked_for(),
-                type(exc).__name__, _ascii(exc.strerror or exc))
+                "[Emoji] %s could not be read (%s); emoji are shown as "
+                "plain characters", self._looked_for(), why)
         except Exception as exc:                # a path that is no path at all
-            return self._fail(True, "[Emoji] %s could not be located (%s: "
-                              "%s); emoji are shown as plain characters",
-                              self._looked_for(), type(exc).__name__,
-                              _ascii(exc))
+            # The TYPE only: whatever raised here may spell a path.
+            return self._fail(True, "[Emoji] %s could not be located (%s); "
+                              "emoji are shown as plain characters",
+                              self._looked_for(),
+                              _ascii(type(exc).__name__))
 
         try:
             sheet = _parse_sheet(data)

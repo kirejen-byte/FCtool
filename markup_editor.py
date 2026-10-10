@@ -294,6 +294,7 @@ class MarkupEditor(tk.Frame):
     def _set_pending(self, tag, exclusive_prefix=None):
         """Arm a pending typing style. With exclusive_prefix (e.g. 'fg_'/'size_'),
         drop any other pending tag with that prefix first (one colour / one size)."""
+        self._pending_settle()      # what is already typed keeps the OLD style
         if exclusive_prefix:
             self._pending_tags = {t for t in self._pending_tags
                                   if not t.startswith(exclusive_prefix)}
@@ -301,12 +302,14 @@ class MarkupEditor(tk.Frame):
             self._pending_tags.add(tag)
 
     def _toggle_pending(self, tag):
+        self._pending_settle()
         if tag in self._pending_tags:
             self._pending_tags.discard(tag)
         else:
             self._pending_tags.add(tag)
 
     def _clear_pending(self):
+        self._pending_settle()
         self._pending_tags.clear()
 
     def _pending_keypress(self, e):
@@ -358,9 +361,32 @@ class MarkupEditor(tk.Frame):
                 start = t.index(_PENDING_MARK)  # ...where the typed text starts
             end = t.index(_PENDING_END_MARK)    # ...and where it ends
             t.mark_unset(_PENDING_MARK, _PENDING_END_MARK)
+            self._pending_press_idx = None
+            # A typing key types ONE character. The end mark has right
+            # gravity, so it also moved behind anything put there by code
+            # since the press (a pill, a paste, a picked emoji - with the
+            # key held, or its release lost): never style past the one.
+            one = t.index("%s +1c" % start)
+            if t.compare(one, "<", end):
+                end = one
             if self._pending_tags and t.compare(end, ">", start):
                 for tag in self._pending_tags:
                     t.tag_add(tag, start, end)
+        except tk.TclError:
+            pass
+
+    def _pending_cancel(self):
+        """Forget an armed key press WITHOUT styling anything: the document is
+        about to be replaced (``set_markup``; a subclass's rebuild). The marks
+        would survive the rebuild - at 1.0 and at the END of the new document -
+        and the next settle would style all of it. Does nothing, not even a Tk
+        call, when no press is armed (the marks exist only while one is)."""
+        self._pending_press_idx = None
+        if not self._pending_armed:
+            return
+        self._pending_armed = False
+        try:
+            self.text.mark_unset(_PENDING_MARK, _PENDING_END_MARK)
         except tk.TclError:
             pass
 
@@ -574,6 +600,7 @@ class MarkupEditor(tk.Frame):
         ``fg_<hex>``, bold/italic/underline, ``size_<n>``); a newline segment
         inserts ``"\\n"``. Restores formatting so a loaded MOTD shows styled.
         Does not fire the change callback (loading is not a user edit)."""
+        self._pending_cancel()
         self.text.config(state=tk.NORMAL)
         self.text.delete("1.0", tk.END)
         for seg in motd_markup.parse_markup(markup or ""):

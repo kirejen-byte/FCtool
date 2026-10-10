@@ -328,18 +328,20 @@ def _log(level: str, message: str, *args) -> None:
 
 
 def _reason(exc) -> str:
-    """``exc`` as text for a log line, WITHOUT a directory.
+    """``exc`` for a log line, WITHOUT a directory: a path can carry a Windows
+    user name, and logs get shared for support.
 
-    An ``OSError`` spells out the full path of the file it failed on, a path
-    can carry a Windows user name, and logs get shared for support: only the
-    path's last component is kept."""
+    An ``OSError`` that names its file is written as its type, the system's
+    own reason and the path's LAST component.  Anything else is written as its
+    type name only -- its text is not ours, and may spell a path."""
+    kind = type(exc).__name__
     if isinstance(exc, OSError) and exc.filename is not None:
         try:
             name = os.path.basename(os.fspath(exc.filename))
         except TypeError:                     # a file descriptor, not a path
             name = "?"
-        return "%s: %r" % (exc.strerror or "could not be opened", name)
-    return str(exc)
+        return "%s: %s: %r" % (kind, exc.strerror or "could not be opened", name)
+    return kind
 
 
 def _warn_once(message: str, *args) -> None:
@@ -366,20 +368,30 @@ def _load():
             raise FileNotFoundError("not found beside the app")
         data = _read_bytes(path)
     except OSError as exc:
-        _warn_once("[Emoji] %s could not be read (%s: %s); emoji are shown as "
-                   "plain characters", DATA_FILE, type(exc).__name__,
-                   _reason(exc))
+        _warn_once("[Emoji] %s could not be read (%s); emoji are shown as "
+                   "plain characters", DATA_FILE, _reason(exc))
         return None, settled
     except Exception as exc:                  # a path that is no path at all
-        _warn_once("[Emoji] %s could not be located (%s: %s); emoji are shown "
-                   "as plain characters", DATA_FILE, type(exc).__name__,
-                   _reason(exc))
+        _warn_once("[Emoji] %s could not be located (%s); emoji are shown "
+                   "as plain characters", DATA_FILE, _reason(exc))
         return None, True
     try:
-        index = _build(_parse(data))
+        table = _parse(data)
     except Exception as exc:
-        _warn_once("[Emoji] %s is unusable (%s: %s); emoji are shown as plain "
-                   "characters", DATA_FILE, type(exc).__name__, _reason(exc))
+        _warn_once("[Emoji] %s is unusable (%s); emoji are shown as plain "
+                   "characters", DATA_FILE, _reason(exc))
+        return None, True
+    try:
+        index = _build(table)
+    except ValueError as exc:
+        # _build's own words about the table's SHAPE (a version, a count, an
+        # entry's position): written by this module, never a path.
+        _warn_once("[Emoji] %s is unusable (%s); emoji are shown as plain "
+                   "characters", DATA_FILE, exc)
+        return None, True
+    except Exception as exc:
+        _warn_once("[Emoji] %s is unusable (%s); emoji are shown as plain "
+                   "characters", DATA_FILE, _reason(exc))
         return None, True
     if _attempts > 1:
         _log("info", "[Emoji] %s read on attempt %d", DATA_FILE, _attempts)
@@ -538,6 +550,16 @@ def shortcodes(seq: str) -> tuple:
     return entry.shortcodes if entry is not None else ()
 
 
+def _name_like(name: str) -> bool:
+    """Whether an UNKNOWN ``:name:`` may be followed directly by another
+    shortcode: non-empty, and every character a letter, a digit or one of
+    ``_ + -`` -- the characters a typed ``:`` query is made of.  An emoji
+    character or punctuation is none of those, so the colon after ``:a.b:``
+    or ``:-):`` stays a doubled colon.  ``pill_canvas._emoji_colon_ok`` spells
+    the same test for the typed path; the shared rows keep the two in step."""
+    return bool(name) and all(ch.isalnum() or ch in "_+-" for ch in name)
+
+
 def replace_shortcodes(text: str) -> str:
     """``text`` with every KNOWN ``:name:`` replaced by its characters, in one
     left-to-right pass.
@@ -555,14 +577,16 @@ def replace_shortcodes(text: str) -> str:
     **A doubled colon opens nothing**: an opening colon directly preceded by a
     raw ``:`` is not one, so ``PING::x:up``, ``::x:`` and ``std::x:`` are left
     alone.  The one exception is the colon that CLOSED a well-formed ``:name:``
-    this very pass has just read -- a name it converted, or an unknown one it
-    left as written (a server's custom emoji) -- whose own opening colon passed
-    these rules.  So shortcodes written back to back convert
-    (``:skull::skull:``), so does a known one straight after an unknown one
-    (``:custom::skull:``, ``:a::b::skull:``), and what follows a converted
-    ``:name:`` (a ``:skin-tone-N:`` the table has no emoji for included) is
-    read as before.  The typed path applies the same rule
-    (``pill_canvas._emoji_colon_ok``)."""
+    this very pass has just read, whose own opening colon passed these rules:
+    a name it converted, or an UNKNOWN one it left as written (a server's
+    custom emoji) -- and an unknown one counts only when it looks like a name
+    (:func:`_name_like`: letters, digits, ``_ + -``).  So shortcodes written
+    back to back convert (``:skull::skull:``), so does a known one straight
+    after an unknown one (``:custom::skull:``, ``:a::b::skull:``), and what
+    follows a converted ``:name:`` (a ``:skin-tone-N:`` the table has no emoji
+    for included) is read as before -- while ``:a.b::skull:``, ``:-)::skull:``
+    and a "name" holding an emoji character open nothing.  The typed path
+    applies the same rule (``pill_canvas._emoji_colon_ok``)."""
     if not text or ":" not in text:
         return text
     index = _table()
@@ -605,10 +629,12 @@ def replace_shortcodes(text: str) -> str:
             # that colon may open a shortcode is the same question as for any
             # other: not after the letter that ends ``:nope:``, but yes after
             # the bracket that ends ``:-):``.
-            # (And a name may follow it directly: ``:custom::skull:``.)
+            # (And a name may follow it directly -- ``:custom::skull:`` -- when
+            # what it closes looks like a name.)
             out.append(text[pos:end - 1])
             pos = scan = end - 1
-            glued = end
+            if _name_like(name):
+                glued = end
             continue
         out.append(text[pos:start])
         out.append(seq)

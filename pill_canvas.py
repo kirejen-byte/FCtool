@@ -717,6 +717,7 @@ class PillCanvas(MarkupEditor):
         Low-level: does NOT touch the undo/redo stacks — :meth:`set_doc` clears
         them, undo/redo preserve them.
         """
+        self._pending_cancel()               # an armed key press: its text is gone
         if self._emoji_q is not None:        # an open ':' query ends here
             self._emoji_query_end()
         self._emoji_q_shut = None            # (an index, stale after a rebuild)
@@ -1942,10 +1943,12 @@ class PillCanvas(MarkupEditor):
             if char == ":":
                 self._emoji_shortcode()
             if self._pending_armed:
-                # MarkupEditor applies an armed typing style at key RELEASE,
-                # from the index it noted at key press. A redraw above may have
-                # moved everything: re-aim it at the element just typed, so the
-                # tag never starts inside a raw astral character.
+                # MarkupEditor applies an armed typing style BETWEEN two marks
+                # it set at the key press, when the press is settled (at its
+                # release, or at the next key press). A redraw above may have
+                # replaced EARLIER elements too, and the start mark stays in
+                # front of them: re-aim the start at the element just typed,
+                # so the style covers that element and nothing before it.
                 self._pending_press_idx = t.index("insert-1c")
         except tk.TclError:
             pass
@@ -1961,17 +1964,23 @@ class PillCanvas(MarkupEditor):
 
         A DOUBLED colon opens nothing either ("PING::x:", "::ro") - unless
         the raw ``:`` directly before the opening colon CLOSES a well-formed
-        ``:name:`` on the same line: a non-empty run of name characters (no
-        whitespace, no ``<`` / ``>``) holding no pill and no image, whose own
-        opening colon passes this same rule. That is an unknown name left as
-        typed (a server's custom emoji), so ":custom::skull:" converts the
-        skull and ":a::b::sk" opens a query. A shortcode CONVERTED just before
-        is an image (or its emoji characters), never a colon, so names typed
-        back to back convert as always. ``replace_shortcodes`` makes the same
+        ``:name:`` on the same line: a non-empty run of name characters
+        (letters, digits, ``_ + -`` - what a ``:`` query is made of, and the
+        test of ``emoji_data._name_like``) holding no pill and no image, whose
+        own opening colon passes this same rule. That is an unknown name left
+        as typed (a server's custom emoji), so ":custom::skull:" converts the
+        skull and ":a::b::sk" opens a query, while ":a.b::skull:" and a "name"
+        with an emoji in it open nothing. A shortcode CONVERTED just before is
+        an image (or its emoji characters), never a colon, so names typed back
+        to back convert as always. ``replace_shortcodes`` makes the same
         exception for the colon that closed the ``:name:`` it has just read."""
         t = self.text
         at = opening
-        while True:                     # (one turn per ":name:" directly before)
+        # One turn per ":name:" directly before. Deliberately NOT capped: a
+        # cap would make a long chain read differently typed than pasted.
+        # Measured: +1 ms per key press at 50 glued unknown names, +97 ms at
+        # 1,600 - a line nobody types.
+        while True:
             before = t.get(at + "-1c", at)
             if before.isalnum() or before == "_":
                 return False
@@ -1982,7 +1991,8 @@ class PillCanvas(MarkupEditor):
             if not at:
                 return False                    # a bare "::"
             name = t.get(at + "+1c", closing)
-            if (not name or any(ch.isspace() or ch in "<>" for ch in name)
+            if (not name
+                    or not all(ch.isalnum() or ch in "_+-" for ch in name)
                     or t.dump(at, closing, window=True, image=True)):
                 return False                    # that colon closed no name
         head = t.get(line, opening)

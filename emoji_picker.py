@@ -110,12 +110,19 @@ CELL_PX = 30
 #: The widest text a cell without a tile draws, in px. Canvas text is clipped
 #: by nothing, and its bounding box is 1 px wider than the text on each side;
 #: this leaves it a pixel clear of the cell's edges (one emoji is 25 px wide
-#: in the cell font -- measured 2026-10-09).
+#: in the cell font -- measured 2026-10-09, in a fresh process). What Tk
+#: reports for the SAME text depends on process-wide font state: once a
+#: mapped Text had drawn them in another font, one emoji measured 19 px and
+#: a three-member ZWJ family 57 px instead of 23 (measured 2026-10-10). So
+#: how much of a sequence a cell draws is never a constant of the sequence.
 _CELL_TEXT_PX = CELL_PX - 4
 
 #: How many leading characters of a sequence :func:`fit_text` will try. The
 #: longest real emoji sequence is far shorter; the cap bounds a hostile one.
 _FIT_SCAN = 32
+
+#: ZERO WIDTH JOINER: what glues the members of an emoji sequence together.
+_ZWJ = chr(0x200D)
 
 #: Group names whose first word does not make a good label.
 _SHORT = {"Activities": "Activity"}
@@ -176,12 +183,23 @@ def fit_text(text: str, limit: int, measure) -> str:
     never falls inside a surrogate pair. Widths need not grow with the text
     (a font may draw several code points as one glyph), so the parts are
     tried from the long end; at most ``_FIT_SCAN`` characters are ever kept
-    of a text that does not fit whole, which bounds the measuring."""
-    if not text or measure(text) <= limit:
+    of a text that does not fit whole, which bounds the measuring.
+
+    What is left never ENDS in a zero-width joiner: a font that does not
+    draw a ZWJ sequence as one glyph would otherwise leave "first member +
+    joiner" in the cell. A trailing joiner is dropped, and joiners at the
+    very START stay with the first character (so only a text of nothing but
+    joiners comes back ending in one). This is the one rule - there is no
+    grapheme clustering here."""
+    if not text:
         return text
-    first = 2 if _splits_pair(text, 1) else 1
+    if measure(text) <= limit:
+        return text.rstrip(_ZWJ) or text
+    lead = len(text) - len(text.lstrip(_ZWJ))
+    first = lead + (2 if _splits_pair(text, lead + 1) else 1)
     for cut in range(min(len(text) - 1, _FIT_SCAN), first, -1):
-        if not _splits_pair(text, cut) and measure(text[:cut]) <= limit:
+        if (text[cut - 1] != _ZWJ and not _splits_pair(text, cut)
+                and measure(text[:cut]) <= limit):
             return text[:cut]
     return text[:first]
 
