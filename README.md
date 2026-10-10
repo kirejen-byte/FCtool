@@ -92,6 +92,25 @@ Native previews work under **Proton / Wine** as well as on Windows. Wine has no 
 
 Previews are **view-only**: they mirror the full client area of **your own** running clients (no cropped sub-regions, no overlays that read another client's screen, overview, or local). Clicking a tile or pressing a focus hotkey performs **exactly one OS window-focus change** and **nothing else** — no input of any kind is ever sent into an EVE client. All caption/label/flash data comes **only from your own SSO-authorized characters' ESI and your own chat/combat log files** — never another player's data, no scraping, no injection, no telemetry, everything stays local. This matches CCP's stated position that view-only full-client previews (as EVE-O Preview does them) are fine, and that switching clients must bring the client to the front. The one thing FCTool ever asks an EVE client to do is **close**: the **Close Clients** button on the Fleet Management tab sends each client window you confirmed a standard window close request — the same request as the window's own close button, only after the slide-to-confirm in its dialog, with no keyboard or mouse input sent and nothing ever force-closed — and that button is not covered by the CCP statement above.
 
+## Discord ping
+
+A form-up message for your Discord, written for you from the doctrine you have selected. **FCTool never sends anything to Discord** — it only puts text on your clipboard, and you paste it where you want it.
+
+**The button.** In the **MOTD composer** (on the **Fittings** tab), on the second button row, right of **Refresh fleet**, there is a yellow **Copy ping ▾** button.
+- **Click the button** — the ping for the selected doctrine is copied to the clipboard. One click, no window. The status line tells you what was copied, and which lines were left out if any were. Hover the button to see what a click would copy (shortened when it is long).
+- **Click the arrow** — opens the **Discord ping** window.
+
+**The window.** The left side holds this ping's values; the right side is the doctrine's template, a free-text canvas with draggable pills like the MOTD composer's; the bottom is a preview of the message. Your edits save as you make them.
+- Templates are **per doctrine**. Every doctrine starts from a **basic template**; **Reset to basic** drops a doctrine's own template, and **Make this my basic template** copies the current one to the basic slot.
+- Six fields: **fleet type**, **FC**, **location**, **when**, **doctrine** and **comms**. The **lists** of fleet types, locations and comms options are shared — edit them once with the pencil button beside the field and every doctrine uses them — but each doctrine remembers its **own picks** from those lists. FC comes from your FC pick in the MOTD composer.
+- A line whose field is empty is **left out** of the ping rather than copied half-blank.
+
+**When.** Choose **Now**, or **At a time...** and type a date and time in **EVE time** or **your local time**. A time is pasted as the EVE time plus **Discord timestamp tags**, so each reader sees it in *their own* local time. Pick one of three formats: time plus countdown (the default), full date and time, or date, time and countdown. A time you set is used for **one copy**: after the next successful copy, When goes back to **Now**, and the status line says so.
+
+**Emoji.** Paste them, type a `:shortcode:` (the closing colon converts it), type `:` and two letters to get suggestions, or use the **Emoji** picker. They are drawn with the emoji artwork Discord uses (Twemoji — see [Emoji data & attribution](#emoji-data--attribution)) but copied as ordinary emoji characters, so they arrive in Discord as real emoji.
+
+**The preview** shows the message as Discord roughly displays it — an approximation, not a pixel match — or switch it to the raw text that will be copied.
+
 ## Download & run (end users)
 
 1. Open **[releases/latest](https://github.com/kirejen-byte/FCtool/releases/latest)** and download the `.zip`.
@@ -124,25 +143,6 @@ pip install pyinstaller
 pyinstaller --clean --noconfirm FCTool.spec
 # -> dist/FCTool.exe
 ```
-
-## Discord ping
-
-A form-up message for your Discord, written for you from the doctrine you have selected. **FCTool never sends anything to Discord** — it only puts text on your clipboard, and you paste it where you want it.
-
-**The button.** In the MOTD builder, on the second button row, right of **Refresh fleet**, there is a yellow **Copy ping ▾** button.
-- **Click the button** — the ping for the selected doctrine is copied to the clipboard. One click, no window. The status line tells you what was copied, and which lines were left out if any were. Hover the button to see the exact text a click would copy.
-- **Click the arrow** — opens the **Discord ping** window.
-
-**The window.** The left side holds this ping's values; the right side is the doctrine's template, a free-text canvas with draggable pills like the MOTD composer; the bottom is a preview of the message. Your edits save as you make them.
-- Templates are **per doctrine**. Every doctrine starts from a **basic template**; **Reset to basic** drops a doctrine's own template, and **Make this my basic template** copies the current one to the basic slot.
-- Six fields: **fleet type**, **FC**, **location**, **when**, **doctrine** and **comms**. Fleet types, locations and comms options are **shared lists** — edit them once with the pencil button beside the field and every doctrine uses them. FC comes from your FC pick in the MOTD builder.
-- A line whose field is empty is **left out** of the ping rather than copied half-blank.
-
-**When.** Choose **Now**, or **At a time...** and type a date and time in **EVE time** or **your local time**. A time is pasted as the EVE time plus **Discord timestamp tags**, so each reader sees it in *their own* local time and a live countdown. A time you set is used for **one copy**: after the next successful copy, When goes back to **Now**, and the status line says so.
-
-**Emoji.** Paste them, type a `:shortcode:` (the closing colon converts it), or use the **Emoji** picker. They are drawn with Discord's artwork (Twemoji) but copied as ordinary emoji characters, so they arrive in Discord as real emoji.
-
-**The preview** shows the message as Discord roughly displays it — an approximation, not a pixel match — or switch it to the raw text that will be copied.
 
 ## Notes
 
@@ -186,16 +186,16 @@ Regenerate after an expansion that adds or moves systems or stargates:
 
     py -3.13 tools/gen_map_layout.py --download --out map_layout.json
 
-EVE Online and the EVE logo are the registered trademarks of CCP hf. All
-rights are reserved worldwide. FCTool is a free fan-made tool; CCP hf. is
-not affiliated with it and does not endorse it.
-
 ### Emoji data & attribution
 
-The Discord ping's emoji pack is built from third-party data and bundled with FCTool:
+The Discord ping's emoji pack is built from third-party data and is bundled inside `FCTool.exe` together with its notice:
 
-- Emoji artwork: Twemoji (jdecked/twemoji), CC-BY 4.0, resized.
+- Emoji artwork: [Twemoji](https://github.com/jdecked/twemoji), © Twitter, Inc and contributors / jdecked/twemoji, [CC-BY 4.0](https://creativecommons.org/licenses/by/4.0/), resized and reduced to 256 colours.
 - Emoji names and sequences: Unicode `emoji-test.txt` (Unicode License v3).
 - `:shortcode:` names: the `discord-emoji` package (MIT).
 
-The full notices are in `assets/emoji/NOTICE.txt`, which also ships beside the tiles in the release.
+The full notices are bundled inside `FCTool.exe` with the tiles, and the same text is in the repository at [`assets/emoji/NOTICE.txt`](assets/emoji/NOTICE.txt).
+
+EVE Online and the EVE logo are the registered trademarks of CCP hf. All
+rights are reserved worldwide. FCTool is a free fan-made tool; CCP hf. is
+not affiliated with it and does not endorse it.
