@@ -1372,8 +1372,16 @@ _PING_MODE_WORDS = {"text": "the doctrine text", "name": "the doctrine's name"}
 # file cost seconds, in the import preview and again at the next start. What FCTool writes
 # is clean and never longer than ``MAX_CHARS``.
 _PING_SCAN_CHARS = 8 * ping_store.MAX_CHARS
-# The runs a template of ``MAX_PING_DOC_CHARS`` can hold at most: the shortest run is 39
-# characters of JSON, and two more separate it from the next.
+# How many usable runs of a ping template are looked at before any of it is cleaned. A
+# deliberately COARSE upper bound, not the fit limit: the most runs that can really fit is
+# 487 (the shortest run is 39 characters of JSON and two more separate it from the next, so
+# ``n`` runs are at least ``41 n`` characters), and the size check AFTER the cleaning is
+# what still enforces ``MAX_PING_DOC_CHARS`` exactly. Coarse is safe because the bound sits
+# ABOVE that figure - no template that fits is ever refused for its number of kept runs -
+# and all it has to do is keep a hand-made list of 300,000 runs from being cleaned at all.
+# (It counts runs before it is known which of them are kept, so a hand-made template with
+# more than this many usable runs is refused even if most of them would have been left out;
+# what FCTool's editor writes holds no such run.)
 _PING_MAX_RUNS = MAX_PING_DOC_CHARS // 40
 
 
