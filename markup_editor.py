@@ -75,6 +75,12 @@ _BASE_SIZE = 11
 # so with NumLock ON nothing typed counted as typing.
 KEY_NOT_TYPING = 0x4 | 0x20000
 
+# The two Text marks a pending typing style is applied BETWEEN. They exist only
+# from a typing key's press to the moment that press is settled (see
+# ``MarkupEditor._pending_keypress``).
+_PENDING_MARK = "pending_style_start"
+_PENDING_END_MARK = "pending_style_end"
+
 
 class MarkupEditor(tk.Frame):
     """A toolbar + ``tk.Text`` widget that edits EVE markup as formatted text.
@@ -115,8 +121,10 @@ class MarkupEditor(tk.Frame):
         # arbitrary colours on the fly (fg_<hex>).
         self._configured_fg = set()
         self._pending_tags = set()      # Tk tag names to apply to the next typed chars
-        self._pending_press_idx = None  # insert index captured on a self-inserting KeyPress
-        self._pending_armed = False
+        # None, unless a subclass that REDREW what the armed key press typed
+        # has named the index its style starts at (pill_canvas, emoji provider).
+        self._pending_press_idx = None
+        self._pending_armed = False     # a typing key was pressed, not yet settled
 
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
@@ -302,30 +310,59 @@ class MarkupEditor(tk.Frame):
         self._pending_tags.clear()
 
     def _pending_keypress(self, e):
+        # A press that is still armed has had no release yet: key auto-repeat
+        # sends several presses and ONE release, and so does pressing the next
+        # key before letting go of the last. Settle it now - before this key
+        # changes anything - or only the last character typed gets the style.
+        self._pending_settle()
         # Arm only when a style is pending AND this key is a real self-inserting
         # printable char (not a modifier/navigation/control combo): no Control
         # and no Alt in e.state (KEY_NOT_TYPING; NumLock and the other locks
         # do not count).
         if not self._pending_tags:
-            self._pending_armed = False
             return
         is_insert = (bool(e.char) and len(e.char) == 1 and e.char.isprintable()
                      and not (e.state & KEY_NOT_TYPING))
         if is_insert:
-            self._pending_press_idx = self.text.index("insert")
+            # Where the character goes is not always the caret: Tk's class
+            # binding first deletes a selection the caret is in (or at either
+            # end of). Two marks at the caret follow that deletion; the
+            # LEFT-gravity one then stays in front of what is inserted and the
+            # RIGHT-gravity one moves behind it. Between them is exactly what
+            # this press typed: a whole character (an astral one is two index
+            # units - an index noted here could end up between them), nothing
+            # at all when the press inserted nothing, and never text that was
+            # already there, wherever the caret has gone by the release.
+            self._pending_press_idx = None
+            self.text.mark_set(_PENDING_MARK, "insert")
+            self.text.mark_gravity(_PENDING_MARK, "left")
+            self.text.mark_set(_PENDING_END_MARK, "insert")
+            self.text.mark_gravity(_PENDING_END_MARK, "right")
             self._pending_armed = True
-        else:
-            self._pending_armed = False
 
     def _pending_keyrelease(self, e):
-        if not (self._pending_armed and self._pending_tags):
+        self._pending_settle()
+
+    def _pending_settle(self):
+        """Apply the pending typing style to what the armed key press typed -
+        the text between the two marks set at the press - and disarm. Nothing
+        was typed (a binding broke the key, the widget is disabled): nothing
+        is tagged."""
+        if not self._pending_armed:
             return
         self._pending_armed = False
-        start = self._pending_press_idx
-        cur = self.text.index("insert")
-        if start is not None and self.text.compare(cur, ">", start):
-            for tag in self._pending_tags:
-                self.text.tag_add(tag, start, cur)
+        t = self.text
+        try:
+            start = self._pending_press_idx     # a subclass re-aimed it, or...
+            if start is None:
+                start = t.index(_PENDING_MARK)  # ...where the typed text starts
+            end = t.index(_PENDING_END_MARK)    # ...and where it ends
+            t.mark_unset(_PENDING_MARK, _PENDING_END_MARK)
+            if self._pending_tags and t.compare(end, ">", start):
+                for tag in self._pending_tags:
+                    t.tag_add(tag, start, end)
+        except tk.TclError:
+            pass
 
     # ── toolbar actions ─────────────────────────────────────────────────────
 
