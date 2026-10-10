@@ -1,4 +1,4 @@
-"""Group configuration: the six Fittings items (spec section 6.5).
+"""Group configuration: the eight Fittings items (spec section 6.5).
 
 ==========================  =====  ==========================================================
 item                        order  what it carries
@@ -9,6 +9,8 @@ item                        order  what it carries
 ``fittings.seed``              40  the default seed target (``market.seed_target``, 1-9,999)
 ``fittings.motds``             50  MOTD templates (``fittings.saved_motds``)
 ``fittings.motd_settings``     60  MOTD length limit and remembered logi channel
+``fittings.ping_defaults``     70  the Discord ping's lists, texts, format and basic template
+``fittings.ping_templates``    80  a doctrine's own ping template and picks, by doctrine NAME
 ==========================  =====  ==========================================================
 
 The three library items never parse a fit or a doctrine themselves. They run the library
@@ -56,8 +58,14 @@ exporter's own characters.
 A file never carries a MOTD template in the old (pre-composer) format: the export migrates
 the exporter's own, and one found in a file is left out, never migrated.
 
-Pure: stdlib, ``fittings_store``, ``motd_doc``, ``group_bundle`` and ``group_items`` only.
-No Tk, no ``ui_theme``, no ``fc_gui`` - this module runs in the boot hook.
+The two Discord ping items share ONE config block, ``discord_ping``, and write it only
+through its own store (``ping_store.PingStore``). The block names no character - the FC,
+the staging system and the time of a ping are never stored - and a doctrine id never
+travels: a doctrine's template is carried, and landed, by the doctrine's NAME.
+
+Pure: stdlib, ``fittings_store``, ``motd_doc``, ``ping_doc``, ``ping_store``,
+``group_bundle`` and ``group_items`` only. No Tk, no ``ui_theme``, no ``fc_gui`` - this
+module runs in the boot hook.
 """
 
 import copy
@@ -66,11 +74,14 @@ import re
 
 import fittings_store
 import motd_doc
+import ping_doc
+import ping_store
 from fit_models import fit_to_dict
 from fittings_store import FittingsStore
-from group_bundle import MAX_NAME, clean_text
+from group_bundle import MAX_NAME, clean_text, has_visible
 from group_items import (ABSENT, ConfigFieldsItem, Field, Item, ItemResult, Record, get_path,
-                         set_path)
+                         set_path, value_text)
+from ping_store import PingStore
 
 
 MAX_TAGS = 100                      # tag vocabulary entries in one file
@@ -1249,6 +1260,847 @@ class MotdSettingsItem(ConfigFieldsItem):
         return result
 
 
+# -- The Discord ping ----------------------------------------------------------
+#
+# Everything the ping remembers is ONE config block, ``discord_ping`` (``ping_store``).
+# Two items share it: ``fittings.ping_defaults`` carries what holds for every doctrine,
+# ``fittings.ping_templates`` what a doctrine has of its own - BY DOCTRINE NAME, because the
+# block is keyed by doctrine ids and an id means nothing in another library.
+#
+# Neither item writes the block itself. ``apply`` drives a real ``PingStore`` over the
+# state's config (``_PingConfig``): the store's own cleaning, its "no change - no write -
+# no block" and its version stamp are the rule here too, and what a row did is read off the
+# number of saves. Nothing of the block names a character, so the one thing to scrub is a
+# template: a pill that is not a ping pill (a MOTD pill pasted in can carry a name) is left
+# out, and a ping pill travels without parameters.
+
+MAX_PING_DOC_CHARS = MAX_MOTD_DOC_CHARS     # the JSON text of one ping template, as written
+
+_PING = ping_store.BLOCK
+# The titles the ping window gives the three lists (``ping_dialog.LIST_TITLES``) and its
+# wording of the When formats (``discord_time.PRESET_LABELS``). MIRRORED: neither module may
+# be imported here (Tk; no boot-path module). tests/test_group_items_ping.py holds them equal.
+PING_LIST_LABELS = {"fleet_types": "Fleet types", "locations": "Locations", "comms": "Comms"}
+PING_WHEN_LABELS = {"time_countdown": "Time + countdown", "full": "Full date and time",
+                    "datetime_countdown": "Date, time + countdown"}
+_PING_TEXT_ROWS = ("now_text", "doctrine_text")
+# The rows of ``fittings.ping_defaults``, in the order they are shown AND applied: the three
+# lists first - a pick of the same file may name an item one of them brings.
+PING_ROWS = ping_store.LIST_KINDS + _PING_TEXT_ROWS + ("when_format", "basic", "default_picks")
+PING_ROW_LABELS = dict(PING_LIST_LABELS, now_text='Text for "Now"',
+                       doctrine_text="Doctrine text", when_format="When format",
+                       basic="Basic template", default_picks="Picks with no doctrine")
+# pick field -> the list it picks from (the ``doctrine`` pick is a mode, not a list item)
+_PING_PICK_LIST = {"fleet_type": "fleet_types", "location": "locations", "comms": "comms"}
+
+# What ``_TEXT_CONTROL`` removes from free text, and the surrogate code points with it: a
+# surrogate in a str is always a lone one, and it cannot be written to a file.
+_PING_TEXT_CONTROL = re.compile("[%s%s-%s]" % (_TEXT_CONTROL.pattern[1:-1],
+                                               chr(0xD800), chr(0xDFFF)))
+
+_PING_NOT_A_TEMPLATE = "is not a template"
+_PING_EMPTY = "an empty template is left out"
+_PING_TOO_LONG = "is too long"
+_PING_CONTROLS = "control characters removed"
+_PING_FOREIGN = ("1 pill that is not a ping pill left out",
+                 "{} pills that are not ping pills left out")
+_PING_LIBRARY_BROKEN = "your fittings library could not be read - ping templates left out"
+_PING_NO_DOCTRINES = "your library has no doctrines - ping templates left out"
+_PING_SECOND = "a second doctrine of this name - its ping template is left out"
+_PING_NOTE_CHARS = 60               # one side of an "<old> -> <new>" note
+_PING_LINE_CHARS = 120              # a template as one line of "What will be saved"
+_PING_MODE_WORDS = {"text": "the doctrine text", "name": "the doctrine's name"}
+
+
+def _ping_names(values, kind):
+    """One of the three shared lists from an untrusted payload. -> ``(names, reasons)``.
+
+    Only the first ``ping_store.MAX_ITEMS`` ENTRIES are looked at (a list FCTool wrote never
+    has more): the bound comes before any per-entry work. Then the store's own cleaning
+    (``ping_store._clean_items``: one line each, one spelling per name, the sentinel never
+    a location, a name cut to ``MAX_CHARS``), and a name nobody can see is left out. An
+    EMPTY result is "no list": never a reason to clear the importer's. Total."""
+    if not isinstance(values, list):
+        return [], ["is not a list of names"]
+    reasons, limit = [], ping_store.MAX_ITEMS
+    if len(values) > limit:
+        reasons.append(f"only the first {limit} names are kept ({len(values) - limit} left out)")
+        values = values[:limit]
+    junk = sum(1 for value in values if not has_visible(ping_store._clean_text(value)))
+    if junk:
+        reasons.append(_count(junk, "entry that is not a name", "entries that are not names")
+                       + " left out")
+    return [name for name in ping_store._clean_items(values, kind) if has_visible(name)], reasons
+
+
+def _ping_text(value) -> str:
+    """One of the two texts as the store keeps it, or ``""`` for anything that is not text
+    and for text nobody can see."""
+    text = ping_store._clean_text(value)
+    return text if has_visible(text) else ""
+
+
+def _ping_doc_scrub(raw):
+    """A ping template as it may travel. -> ``(runs | None, reasons)``; see ``_ping_doc``."""
+    if not isinstance(raw, list):
+        # BEFORE ping_doc.clean_doc: it reads anything that is no list as the built-in
+        # template, and a file must not turn junk into a template.
+        return None, [_PING_NOT_A_TEMPLATE]
+    if not raw:
+        return None, [_PING_EMPTY]
+    usable = [run for run in raw if isinstance(run, dict)
+              and (run.get("t") == "token"
+                   or (run.get("t") == "text" and isinstance(run.get("text"), str)))]
+    doc, foreign, controls = [], 0, False
+    for run in motd_doc.doc_to_json(ping_doc.clean_doc(usable)):
+        if run["t"] == "token":
+            if run["kind"] in ping_doc.PING_KINDS:
+                doc.append({"t": "token", "kind": run["kind"], "params": {}})
+            else:
+                foreign += 1
+            continue
+        shown = _PING_TEXT_CONTROL.sub("", run["text"])
+        controls = controls or shown != run["text"]
+        if shown:
+            doc.append({"t": "text", "text": shown, "style": run["style"]})
+    if not doc:
+        # Under "theirs" an empty template would blank the importer's own.
+        return None, [_NOTHING_LEFT]
+    if len(json.dumps(doc, ensure_ascii=False)) > MAX_PING_DOC_CHARS:
+        return None, [_PING_TOO_LONG]
+    said = []
+    if foreign:
+        said.append(_PING_FOREIGN[0] if foreign == 1 else _PING_FOREIGN[1].format(foreign))
+    if controls:
+        said.append(_PING_CONTROLS)
+    return doc, said
+
+
+def _ping_doc(raw):
+    """A ping template from a config or a file, as it may travel.
+
+    -> ``(runs, said)``: ``motd_doc.doc_to_json`` forms, rebuilt from scratch through
+    ``ping_doc.clean_doc`` - text runs with their usable style, ping pills (``ping_doc.
+    PING_KINDS``) with ``params: {}``. Every other pill is left out and ``said`` says how
+    many; so is a control character or a lone surrogate in a text. ``(None, [reason])``
+    for anything that is not a list, an empty list, a template with nothing left and one
+    over ``MAX_PING_DOC_CHARS`` of JSON text as it is written.
+
+    Total: any input, never raises, never edits ``raw``. Idempotent: what it returns it
+    returns again, with nothing to say."""
+    try:
+        return _ping_doc_scrub(raw)
+    except Exception:
+        return None, [_PING_NOT_A_TEMPLATE]
+
+
+def _ping_travel(stored):
+    """A STORED template as a file would carry it - what an incoming template is compared
+    with, so that importing your own export changes nothing. ``None`` for no template."""
+    return _ping_doc(stored)[0] if isinstance(stored, list) else None
+
+
+def _ping_picks(raw):
+    """Picks from an untrusted payload. -> ``(picks, reasons)``: the known pick fields
+    only, each cleaned as the store cleans one; the doctrine pick is one of the two modes.
+    Whether a pick names a list item is not asked here - the lists are the importer's."""
+    if not isinstance(raw, dict):
+        return {}, ["is not a set of picks"]
+    picks, reasons = {}, []
+    for field in ping_store.PICK_FIELDS:
+        if field not in raw:
+            continue
+        label = ping_doc.FIELD_LABELS[field]
+        if not isinstance(raw[field], str):
+            reasons.append(f"the {label} pick is not text")
+            continue
+        value = ping_store._clean_text(raw[field])
+        if field == "doctrine":
+            if value not in ping_store.DOCTRINE_MODES:
+                reasons.append(f"the {label} pick is not one of the known choices")
+                continue
+        elif not has_visible(value):
+            reasons.append(f"the {label} pick is blank")
+            continue
+        picks[field] = value
+    return picks, reasons
+
+
+def _ping_pick_target(store, field, value):
+    """What a cleaned pick names in the lists ``store`` reads NOW, in the list's own
+    spelling: a mode, the staging sentinel (the exact string only), or a list item whatever
+    its capitals. ``None`` when it names nothing."""
+    if field == "doctrine":
+        return value if value in ping_store.DOCTRINE_MODES else None
+    if field == "location" and value == ping_store.STAGING:
+        return value
+    return ping_store._match(value, store.items(_PING_PICK_LIST[field]))
+
+
+def _ping_own_picks(store, raw) -> dict:
+    """The stored picks ``raw`` that name something in this setup's own lists, as they
+    travel: in the list's spelling. A pick that names nothing is not exported."""
+    picks, _reasons = _ping_picks(raw) if isinstance(raw, dict) else ({}, [])
+    own = {}
+    for field, value in picks.items():
+        target = _ping_pick_target(store, field, value)
+        if target is not None:
+            own[field] = target
+    return own
+
+
+def _ping_entry(raw):
+    """One doctrine's entry from an untrusted payload. -> ``(entry | None, said)``:
+    ``{"doc"?, "picks"?}``. An entry with neither a usable template nor a usable pick is
+    not an entry."""
+    if not isinstance(raw, dict):
+        return None, []
+    entry, said = {}, []
+    if "doc" in raw:
+        doc, reasons = _ping_doc(raw["doc"])
+        said.extend(reasons)
+        if doc is not None:
+            entry["doc"] = doc
+    if "picks" in raw:
+        picks, reasons = _ping_picks(raw["picks"])
+        said.extend(reasons)
+        if picks:
+            entry["picks"] = picks
+    return (entry or None), said
+
+
+def _ping_name_fault(name) -> str:
+    """Why a (stripped) doctrine name cannot carry a ping template, or ``""``: the rules
+    the store has for a doctrine that arrives in a share. Never cut short - it would name
+    some other doctrine."""
+    if not name:
+        return "it has no name"
+    if len(name) > fittings_store.MAX_SHARE_NAME:
+        return f"its name is longer than {fittings_store.MAX_SHARE_NAME} characters"
+    if _PILL_CONTROL.search(name):
+        return "its name holds a control character"
+    return ""
+
+
+def _ping_shown(name) -> str:
+    """A doctrine name as a line quotes it: clipped, nothing invisible."""
+    return fittings_store._share_shown(name) or "(no name)"
+
+
+def _library_doctrines(state):
+    """``[(name, id)]`` for the doctrines of ``state.fittings``, in library order: every
+    entry the store would load (a dict with an ``id``) whose name is text. ``[]`` for a
+    missing library, ``None`` for an unreadable one. Total; nothing is modified."""
+    library = getattr(state, "fittings", None)
+    if library is None:
+        return []
+    if not isinstance(library, dict):
+        return None
+    doctrines = library.get("doctrines")
+    rows = []
+    for entry in doctrines.values() if isinstance(doctrines, dict) else ():
+        if isinstance(entry, dict) and "id" in entry:
+            name = entry.get("name", "")
+            if isinstance(name, str):
+                rows.append((name, entry["id"]))
+    return rows
+
+
+def _first_ids(rows) -> dict:
+    """``{name: id}`` for the FIRST doctrine of each name - the one ``merge_share`` writes
+    to and the only one the composer can select. Only an id that is non-empty text is an
+    id: ``PingStore`` reads an empty one as "no doctrine", and would then write the BASIC
+    template and the picks with no doctrine. A first doctrine without one still holds its
+    name: the second of that name is never written in its place."""
+    ids, seen = {}, set()
+    for name, doctrine_id in rows:
+        if name in seen:
+            continue
+        seen.add(name)
+        if isinstance(doctrine_id, str) and doctrine_id:
+            ids[name] = doctrine_id
+    return ids
+
+
+def _doctrine_ids_by_name(state):
+    """``{doctrine name: its id}`` in ``state.fittings`` (``_first_ids``); ``{}`` for a
+    missing library, ``None`` for an unreadable one. The name is the stored one, exactly:
+    the key ``merge_share`` matches a doctrine by."""
+    rows = _library_doctrines(state)
+    return None if rows is None else _first_ids(rows)
+
+
+class _PingConfig:
+    """The ``discord_ping`` block of a state for ONE export or apply: a real ``PingStore``
+    over the state's config, and how often it saved (``saves`` - the store saves exactly
+    once per call that changed something, so the count before and after a call says
+    whether that call wrote).
+
+    A missing ``config.json`` (``None``) stays missing until the first save: the store is
+    handed a dict of its own to write into, which becomes the state's config only then."""
+
+    def __init__(self, state):
+        self._state = state
+        self._made = {}
+        self.saves = 0
+        self.store = PingStore(self.config, self._saved)
+
+    def config(self) -> dict:
+        config = self._state.config
+        if config is None:
+            return self._made
+        if not isinstance(config, dict):
+            raise TypeError("config is not readable")
+        return config
+
+    def _saved(self) -> None:
+        if self._state.config is None:
+            self._state.config = self._made
+        self.saves += 1
+
+    def entry(self, doctrine_id) -> dict:
+        """A doctrine's stored entry (the live dict), or an empty stand-in."""
+        entry = get_path(self.config(), (_PING, "doctrines", doctrine_id))
+        return entry if isinstance(entry, dict) else {}
+
+    def stored_picks(self, doctrine_id) -> dict:
+        """The picks stored for a doctrine - for ``None``, the picks with no doctrine."""
+        picks = get_path(self.config(), (_PING, "default_picks")) if doctrine_id is None \
+            else self.entry(doctrine_id).get("picks")
+        return picks if isinstance(picks, dict) else {}
+
+
+def _land_ping_picks(ping, doctrine_id, picks, where, result) -> bool:
+    """Store the picks of a payload for ``doctrine_id`` (``None``: the picks with no
+    doctrine). -> whether every one of them named something.
+
+    A pick is resolved against the IMPORTER's lists as they are now - after the lists of
+    the same import landed - and stored in the list's spelling. One that names nothing is
+    not written: the importer's own stored pick stays, a list is never grown by a pick,
+    and ``result`` gets one warning starting with ``where``. One the stored pick names
+    already (capitals aside) is no change. A field the payload does not carry is not
+    touched."""
+    whole, stored = True, ping.stored_picks(doctrine_id)
+    for field in ping_store.PICK_FIELDS:
+        value = picks.get(field)
+        if not isinstance(value, str):
+            continue
+        target = _ping_pick_target(ping.store, field, value)
+        if target is None:
+            whole = False
+            result.warnings.append(
+                f"{where}: {ping_doc.FIELD_LABELS[field]} '{fittings_store._share_shown(value)}'"
+                f" is not one of yours - pick left out")
+            continue
+        mine = stored.get(field)
+        if isinstance(mine, str) and \
+                _ping_pick_target(ping.store, field, ping_store._clean_text(mine)) == target:
+            continue
+        ping.store.set_pick(doctrine_id, field, target)
+    return whole
+
+
+# -- the Discord ping: how a payload is shown ---------------------------------
+
+def _ping_doc_line(doc, limit) -> str:
+    """A template as one line of text: pills as ``<Fleet type>``, its lines joined with
+    `` / ``, clipped to ``limit``."""
+    parts = []
+    for run in doc if isinstance(doc, list) else ():
+        if not isinstance(run, dict):
+            continue
+        if run.get("t") == "text" and isinstance(run.get("text"), str):
+            parts.append(run["text"])
+        elif run.get("t") == "token":
+            kind = run.get("kind")
+            label = ping_doc.FIELD_LABELS.get(kind) if isinstance(kind, str) else None
+            parts.append(f"<{label or 'pill'}>")
+    lines = [clean_text(line.replace("\t", " "), limit) for line in "".join(parts).split("\n")]
+    return value_text(" / ".join(line for line in lines if line), limit)
+
+
+def _ping_picks_text(picks) -> str:
+    """Picks as text, ``"Fleet type: CTA, Location: your staging system"``; ``""`` for
+    none."""
+    parts = []
+    for field in ping_store.PICK_FIELDS:
+        value = picks.get(field) if isinstance(picks, dict) else None
+        if not isinstance(value, str) or not value:
+            continue
+        if field == "doctrine":
+            value = _PING_MODE_WORDS.get(value, value)
+        elif field == "location" and value == ping_store.STAGING:
+            value = "your staging system"
+        parts.append(f"{ping_doc.FIELD_LABELS[field]}: {clean_text(value, MAX_NAME)}")
+    return ", ".join(parts)
+
+
+def _ping_row_text(key, value) -> str:
+    """What a row of ``fittings.ping_defaults`` holds, as text; ``""`` when the payload
+    does not carry that row."""
+    if key in PING_LIST_LABELS:
+        names = [name for name in value if isinstance(name, str)] \
+            if isinstance(value, list) else []
+        return value_text(names) if names else ""
+    if key == "basic":
+        return _ping_doc_line(value, _PING_LINE_CHARS) if isinstance(value, list) and value \
+            else ""
+    if key == "default_picks":
+        return _ping_picks_text(value)
+    if not isinstance(value, str) or not value:
+        return ""
+    return PING_WHEN_LABELS.get(value, value_text(value)) if key == "when_format" \
+        else value_text(value)
+
+
+# -- fittings.ping_defaults ----------------------------------------------------
+
+class PingDefaultsItem(Item):
+    """What the Discord ping uses for every doctrine, any subset of::
+
+        {"fleet_types": [...], "locations": [...], "comms": [...],   # the three shared lists
+         "now_text": "...", "doctrine_text": "...", "when_format": "...",
+         "basic": [...runs...],                                      # the basic template
+         "default_picks": {"fleet_type": ..., "location": ..., "doctrine": ..., "comms": ...}}
+
+    Only what this setup STORES travels: a list nobody edited, a text or a format still on
+    its built-in value and a basic template nobody made are not in the file (absent means
+    untouched). Each row can be ticked alone.
+
+    The three lists follow the mode. merge: the importer's list as the ping reads it (the
+    built-in fleet types when nothing is stored) keeps its order and spelling, and the
+    file's names it lacks - capitals aside - are appended, up to ``ping_store.MAX_ITEMS``.
+    replace: the list becomes the file's; a stored pick of a name that left is left be (the
+    ping falls back when it reads one). Everything else is a value: the file's wins when
+    ticked, and one that is in force already is not stored.
+
+    A pick is written only when it names something in the importer's lists as they are
+    after the lists of the same file landed (``_land_ping_picks``). The location pick
+    ``@staging`` travels as that sentinel - "the importer's own staging system when a ping
+    is copied": no system name is ever written by this item."""
+
+    id = "fittings.ping_defaults"
+    label = "Discord ping defaults"
+    kind = "value"
+    files = ("config",)
+    paths = tuple(("config", (_PING, key)) for key in ("version",) + PING_ROWS)
+    order = 70
+    modes = ("merge", "replace")
+    never_saved = ("The FC name", "Which system is your staging", "The time of a ping")
+
+    def _line(self, row, reason) -> str:
+        return f"{self.label} - {PING_ROW_LABELS[row]}: {reason}"
+
+    def _clean(self, payload):
+        """-> ``(clean payload | ABSENT, problems)``: the known rows, each rebuilt from
+        scratch. A reason never quotes text of unbounded size. Total."""
+        if not isinstance(payload, dict):
+            return ABSENT, [f"{self.label}: not a settings block"]
+        clean, problems = {}, []
+
+        def say(row, reasons):
+            problems.extend(self._line(row, reason) for reason in reasons)
+
+        for kind in ping_store.LIST_KINDS:
+            if kind in payload:
+                names, reasons = _ping_names(payload[kind], kind)
+                say(kind, reasons)
+                if names:                       # an empty list is "no list", never "clear mine"
+                    clean[kind] = names
+        for key in _PING_TEXT_ROWS:
+            if key in payload:
+                text = _ping_text(payload[key])
+                if text:
+                    clean[key] = text
+                else:
+                    say(key, ["is blank" if isinstance(payload[key], str) else "is not text"])
+        if "when_format" in payload:
+            preset = payload["when_format"]
+            if isinstance(preset, str) and preset in ping_store.WHEN_FORMATS:
+                clean["when_format"] = str(preset)
+            else:
+                say("when_format", ["is not one of the known choices"])
+        if "basic" in payload:
+            doc, reasons = _ping_doc(payload["basic"])
+            say("basic", reasons)
+            if doc is not None:
+                clean["basic"] = doc
+        if "default_picks" in payload:
+            picks, reasons = _ping_picks(payload["default_picks"])
+            say("default_picks", reasons)
+            if picks:
+                clean["default_picks"] = picks
+        return (clean or ABSENT), problems
+
+    def _exported(self, state):
+        """-> ``(payload | ABSENT, notes)``: what this setup stores, as it travels, and
+        what the template scrub left out of it. Total."""
+        try:
+            ping = _PingConfig(state)
+            block = get_path(ping.config(), (_PING,))
+            if not isinstance(block, dict):
+                return ABSENT, []
+            payload, notes = {}, []
+            for kind in ping_store.LIST_KINDS:
+                names = _ping_names(block.get(kind), kind)[0]
+                if names:
+                    payload[kind] = names
+            for key in _PING_TEXT_ROWS:
+                text = _ping_text(block.get(key))
+                if text:
+                    payload[key] = text
+            preset = block.get("when_format")
+            if isinstance(preset, str) and preset in ping_store.WHEN_FORMATS:
+                payload["when_format"] = str(preset)
+            if isinstance(block.get("basic"), list):
+                doc, reasons = _ping_doc(block["basic"])
+                notes.extend(self._line("basic", reason) for reason in reasons)
+                if doc is not None:
+                    payload["basic"] = doc
+            # A pick travels only when it names something in this setup's own lists.
+            picks = _ping_own_picks(ping.store, block.get("default_picks"))
+            if picks:
+                payload["default_picks"] = picks
+            return (payload or ABSENT), notes
+        except Exception:
+            return ABSENT, []
+
+    def export(self, state, ctx):
+        return self._exported(state)[0]
+
+    def export_notes(self, state, ctx=None) -> list:
+        """Lines for the builder: what is left out of this setup's basic template (a pill
+        that is not a ping pill, control characters, a template that cannot travel)."""
+        return self._exported(state)[1]
+
+    def validate(self, payload, ctx):
+        return self._clean(payload)
+
+    def _present(self, payload) -> list:
+        """``[(row key, label, text)]`` for the rows a payload carries, in ``PING_ROWS``
+        order."""
+        if not isinstance(payload, dict):
+            return []
+        rows = []
+        for key in PING_ROWS:
+            text = _ping_row_text(key, payload.get(key))
+            if text:
+                rows.append((key, PING_ROW_LABELS[key], text))
+        return rows
+
+    def records(self, payload) -> list:
+        return [Record(key, label, text) for key, label, text in self._present(payload)]
+
+    def lines(self, payload) -> list:
+        return [(label, text) for _key, label, text in self._present(payload)]
+
+    def summary(self, payload) -> str:
+        present = self._present(payload)
+        if len(present) == 1:
+            return value_text(present[0][2], 80)
+        return _count(len(present), "setting", "settings")
+
+    @staticmethod
+    def _row(result, key, wrote, note) -> None:
+        if wrote:
+            result.updated.append(key)
+            result.notes.append(note)
+        else:
+            result.unchanged.append(key)
+
+    def _apply_list(self, ping, kind, incoming, replace, result) -> None:
+        label = PING_LIST_LABELS[kind]
+        mine = ping.store.items(kind)           # as the ping reads it: the built-ins too
+        have = {name.casefold() for name in mine}
+        added = [name for name in incoming if name.casefold() not in have]
+        removed, over = [], 0
+        if replace:
+            new = list(incoming)
+            arriving = {name.casefold() for name in incoming}
+            removed = [name for name in mine if name.casefold() not in arriving]
+        else:
+            room = max(0, ping_store.MAX_ITEMS - len(mine))
+            added, over = added[:room], len(added) - len(added[:room])
+            new = mine + added                  # an import never deletes: mine stay, in order
+        full = f"your list is full ({ping_store.MAX_ITEMS} names) - " \
+               f"{_count(over, 'name', 'names')} left out"
+        before = ping.saves
+        if new != mine:
+            ping.store.set_items(kind, new)
+        if ping.saves == before:
+            if over:
+                result.skipped.append(kind)
+                result.warnings.append(self._line(kind, full))
+            else:
+                result.unchanged.append(kind)
+            return
+        result.updated.append(kind)
+        result.removed.extend(removed)
+        parts = ([f"{len(added)} added"] if added else []) + (
+            [f"{len(removed)} removed"] if removed else [])
+        result.notes.append(f"{label}: {', '.join(parts) or 'now as in the file'}")
+        if over:
+            result.warnings.append(self._line(kind, full))
+
+    def apply(self, state, payload, mode, conflict, ctx) -> ItemResult:
+        result = ItemResult(self.id)
+        clean, _problems = self._clean(payload)     # cleaned again: a caller may not have
+        if clean is ABSENT:
+            return result
+        ping = _PingConfig(state)
+        store = ping.store
+        for kind in ping_store.LIST_KINDS:          # first: see PING_ROWS
+            if kind in clean:
+                self._apply_list(ping, kind, clean[kind], mode == "replace", result)
+        for key in _PING_TEXT_ROWS:
+            if key in clean:
+                old, before = store.text(key), ping.saves
+                store.set_text(key, clean[key])
+                self._row(result, key, ping.saves > before,
+                          f"{PING_ROW_LABELS[key]}: {value_text(old, _PING_NOTE_CHARS)} -> "
+                          f"{value_text(clean[key], _PING_NOTE_CHARS)}")
+        if "when_format" in clean:
+            old, before = store.when_format(), ping.saves
+            store.set_when_format(clean["when_format"])
+            self._row(result, "when_format", ping.saves > before,
+                      f"{PING_ROW_LABELS['when_format']}: {PING_WHEN_LABELS[old]} -> "
+                      f"{PING_WHEN_LABELS[clean['when_format']]}")
+        if "basic" in clean:
+            stored, before = store.template(None), ping.saves
+            # The template in force: the stored one as a file would carry it, else the
+            # built-in one - a file that brings what is in force stores nothing.
+            in_force = _ping_travel(stored) if stored is not None \
+                else motd_doc.doc_to_json(ping_doc.default_doc())
+            if in_force != clean["basic"]:
+                store.make_basic(clean["basic"])
+            self._row(result, "basic", ping.saves > before,
+                      f"{PING_ROW_LABELS['basic']}: replaced by the file's")
+        if "default_picks" in clean:
+            label, before = PING_ROW_LABELS["default_picks"], ping.saves
+            whole = _land_ping_picks(ping, None, clean["default_picks"],
+                                     f"{self.label} - {label}", result)
+            wrote = ping.saves - before
+            if wrote or whole:
+                self._row(result, "default_picks", wrote,
+                          f"{label}: {_count(wrote, 'pick', 'picks')} set")
+            else:
+                result.skipped.append("default_picks")
+        if result.skipped and not (result.added or result.updated or result.removed):
+            result.status = "skipped"
+        return result.settle()
+
+
+# -- fittings.ping_templates ---------------------------------------------------
+
+class PingTemplatesItem(Item):
+    """What a doctrine has of its own for the Discord ping, by doctrine NAME::
+
+        {"Test Doctrine":   {"doc": [...runs...], "picks": {"fleet_type": ..., ...}},
+         "Second Doctrine": {"picks": {"doctrine": "name"}}}     # no "doc": the basic one
+
+    The config keys an entry by doctrine id; an id means nothing in another library, so
+    none travels. Export: the entries of the doctrines this library has, each under its
+    doctrine's name - of two doctrines with one name the FIRST in library order, and an
+    entry of an id the library no longer has not at all.
+
+    Import, per name: the entry lands on the importer's doctrine of exactly that name -
+    the first of them, the one ``merge_share`` writes to. The library is read AFTER
+    ``fittings.doctrines`` (order 20) ran, so a doctrine the same file brings is found;
+    one the importer does not have is skipped with a warning, never guessed (a doctrine
+    renamed since the export is such a one). A doctrine with an entry already - a template
+    of its own, or any stored pick - gets the file's ("theirs") or is left whole ("mine").
+    A file entry without a template never takes the importer's own template away.
+
+    The library is read and never written: ``files`` names the config alone, so the engine
+    copies no library for this item, and an unreadable one is answered here."""
+
+    id = "fittings.ping_templates"
+    label = "Discord ping templates"
+    kind = "collection"
+    files = ("config",)
+    paths = (("config", (_PING, "version")), ("config", (_PING, "doctrines")))
+    order = 80
+    conflicts = True
+    never_saved = ("The FC name", "The time of a ping")
+
+    def _clean(self, payload):
+        """-> ``({name: entry}, problems)``: one clean entry per doctrine name. An entry
+        that has something of its own to say gets a line; the rest are counted. Total."""
+        if not isinstance(payload, dict):
+            return {}, [f"{self.label}: not a set of ping templates"]
+        if len(payload) > fittings_store.MAX_SHARE_DOCTRINES:
+            return {}, [f"{self.label}: too many doctrines"]
+        entries, problems, unusable, twins = {}, [], 0, 0
+        for raw_name, raw in payload.items():
+            name = _doctrine_name(raw_name) if isinstance(raw_name, str) else ""
+            if _ping_name_fault(name):
+                unusable += 1
+                continue
+            if name in entries:                 # twins after stripping: the first stays
+                twins += 1
+                continue
+            entry, said = _ping_entry(raw)
+            problems.extend(f"{self.label}: {_ping_shown(name)}: {line}" for line in said)
+            if entry is None:
+                unusable += 0 if said else 1
+                continue
+            entries[name] = entry
+        if unusable:
+            odd = _count(unusable, "entry that is not a usable ping template",
+                         "entries that are not usable ping templates")
+            problems.append(f"{self.label}: {odd} left out")
+        if twins:
+            odd = _count(twins, "doctrine named twice", "doctrines named twice")
+            problems.append(f"{self.label}: {odd} left out")
+        return entries, problems
+
+    def _exported(self, state):
+        """-> ``({name: entry}, notes)``: this setup's entries as they travel, and what
+        was left out of them. Total."""
+        try:
+            rows = _library_doctrines(state)
+            ping = _PingConfig(state)
+            table = get_path(ping.config(), (_PING, "doctrines"))
+            if not rows or not isinstance(table, dict):
+                return {}, []
+            entries, notes, seen, over = {}, [], set(), 0
+            for raw_name, doctrine_id in rows:
+                name = _doctrine_name(raw_name)
+                first = name not in seen
+                seen.add(name)
+                stored = table.get(doctrine_id) \
+                    if isinstance(doctrine_id, str) and doctrine_id else None
+                if not isinstance(stored, dict):
+                    continue
+                doc, said = _ping_doc(stored["doc"]) if isinstance(stored.get("doc"), list) \
+                    else (None, [])
+                picks = _ping_own_picks(ping.store, stored.get("picks"))
+                if doc is None and not picks and not said:
+                    continue                    # nothing of its own, and nothing to say
+                where = f"{self.label}: {_ping_shown(raw_name)}"
+                fault = _ping_name_fault(name)
+                if fault:
+                    notes.append(f"{where}: {fault} - left out")
+                elif not first:
+                    notes.append(f"{where}: {_PING_SECOND}")
+                elif len(entries) >= fittings_store.MAX_SHARE_DOCTRINES:
+                    over += 1
+                else:
+                    notes.extend(f"{where}: {line}" for line in said)
+                    entry = ({} if doc is None else {"doc": doc})
+                    if picks:
+                        entry["picks"] = picks
+                    if entry:
+                        entries[name] = entry
+            if over:
+                notes.append(f"{self.label}: only the first "
+                             f"{fittings_store.MAX_SHARE_DOCTRINES} doctrines are saved "
+                             f"({over} left out)")
+            return entries, notes
+        except Exception:
+            return {}, []
+
+    def export(self, state, ctx):
+        return self._exported(state)[0] or ABSENT
+
+    def export_notes(self, state, ctx=None) -> list:
+        """Lines for the builder: a pill left out of a doctrine's template, a template that
+        cannot travel, a doctrine whose name cannot, the second doctrine of one name."""
+        return self._exported(state)[1]
+
+    def validate(self, payload, ctx):
+        entries, problems = self._clean(payload)
+        return (entries or ABSENT), problems
+
+    def _rows(self, payload) -> list:
+        """``[(doctrine name, entry)]``: the name is the record key."""
+        if not isinstance(payload, dict):
+            return []
+        return [(name, entry) for name, entry in payload.items()
+                if isinstance(name, str) and name and isinstance(entry, dict)]
+
+    @staticmethod
+    def _detail(entry) -> str:
+        picks = entry.get("picks")
+        count = sum(1 for field in ping_store.PICK_FIELDS
+                    if isinstance(picks, dict) and isinstance(picks.get(field), str))
+        own = isinstance(entry.get("doc"), list) and entry["doc"]
+        detail = "own template" if own else "basic template"
+        if count:
+            detail += ", " + _count(count, "pick", "picks")
+        return detail[:MOTD_DETAIL_CHARS]
+
+    def records(self, payload) -> list:
+        return [Record(name, name, self._detail(entry)) for name, entry in self._rows(payload)]
+
+    def summary(self, payload) -> str:
+        return _count(len(self._rows(payload)), "doctrine", "doctrines")
+
+    def lines(self, payload) -> list:
+        """Per doctrine: its template as one line (or that it uses the basic one), and -
+        on a line of their own - its picks."""
+        lines = []
+        for name, entry in self._rows(payload):
+            doc = entry.get("doc")
+            lines.append((name, _ping_doc_line(doc, _PING_LINE_CHARS)
+                          if isinstance(doc, list) and doc else "uses the basic template"))
+            picks = _ping_picks_text(entry.get("picks"))
+            if picks:
+                lines.append((f"{name} - picks", picks))
+        return lines
+
+    def subset(self, payload, keys):
+        wanted = _key_set(keys)
+        return {name: entry for name, entry in self._rows(payload) if name in wanted} or ABSENT
+
+    def apply(self, state, payload, mode, conflict, ctx) -> ItemResult:
+        result = ItemResult(self.id)
+        incoming, _problems = self._clean(payload)      # cleaned again
+        if not incoming:
+            return result
+        rows = _library_doctrines(state)                # AFTER fittings.doctrines wrote
+        if not rows:
+            result.skipped.extend(incoming)
+            reason = _PING_LIBRARY_BROKEN if rows is None else _PING_NO_DOCTRINES
+            return _skipped(result, f"{self.label}: {reason}")
+        ids = _first_ids(rows)
+        keep_mine = isinstance(conflict, str) and conflict.strip().lower() == "mine"
+        ping = _PingConfig(state)
+        unknown = False
+        for name, entry in incoming.items():
+            shown = _ping_shown(name)
+            doctrine_id = ids.get(name)                 # the exact name, the first of it
+            if doctrine_id is None:
+                unknown = True
+                result.skipped.append(name)
+                result.warnings.append(f"{shown}: not a doctrine in your library - "
+                                       f"ping template left out")
+                continue
+            mine = ping.entry(doctrine_id)
+            had = isinstance(mine.get("doc"), list) or any(
+                field in ping.stored_picks(doctrine_id) for field in ping_store.PICK_FIELDS)
+            if had and keep_mine:
+                result.skipped.append(name)             # the importer's whole entry stays
+                continue
+            before = ping.saves
+            doc = entry.get("doc")
+            # No "doc" in the file never removes the importer's own template; one that is
+            # the importer's already, as a file would carry it, is no change.
+            if isinstance(doc, list) and _ping_travel(mine.get("doc")) != doc:
+                ping.store.set_template(doctrine_id, doc)
+            if isinstance(entry.get("picks"), dict):
+                _land_ping_picks(ping, doctrine_id, entry["picks"], shown, result)
+            if ping.saves == before:
+                result.unchanged.append(name)
+            elif had:
+                result.updated.append(name)
+            else:
+                result.added.append(name)
+        if unknown and not (result.added or result.updated):
+            result.status = "skipped"
+        return result.settle()
+
+
 # ── The items ───────────────────────────────────────────────────────────────
 
 ITEMS = (
@@ -1267,4 +2119,6 @@ ITEMS = (
                       lo=200, hi=10000),
                 Field("logi_channel", "Logi channel", "str", ("fittings", "logi_channel"),
                       max_len=100))),
+    PingDefaultsItem(),
+    PingTemplatesItem(),
 )
