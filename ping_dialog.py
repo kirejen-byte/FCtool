@@ -354,10 +354,54 @@ _EMOJI_FACE = chr(0x263A)       # the smiling face before the button's label
 #: are not among them, on purpose - they are the canvas's, and the picker follows on
 #: its word: Escape (the canvas ends its own query and keeps that name quiet
 #: afterwards) and Left / Right (a caret move inside the name ends the query).
+#: Up / Down walk the results one by one (a search rarely fills a row of the grid).
+#: A picker method that answers False had nothing to do with the key - no result to
+#: step through, nothing highlighted to take - and the key goes on to the canvas.
 _QUERY_KEYS = {
-    "Up": ("move_selection", (0, -1)), "Down": ("move_selection", (0, 1)),
+    "Up": ("step", (-1,)), "Down": ("step", (1,)),
     "Return": ("accept", ()), "Tab": ("accept", ()),
 }
+
+#: What ``foreground()`` answers.
+FRONT_TK = "tk"                 # a Tk toplevel of THIS process: the only one to force over
+FRONT_OWN = "own"               # another window of this process (a yes/no box, a file dialog)
+FRONT_OTHER = "other"           # another application's window
+FRONT_NONE = "none"             # no foreground window, or it cannot be told
+
+_TK_TOPLEVEL_CLASS = "TkTopLevel"   # the Win32 class of a Tk toplevel's wrapper window
+
+
+def foreground() -> str:
+    """Whose window the user is working in, as one of the ``FRONT_*`` names: one
+    read-only look at the foreground window (its process id and its window class).
+    ``FRONT_NONE`` whenever that cannot be told. Never raises.
+
+    The one place the window asks the operating system about focus; tests stub it."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        user32 = ctypes.WinDLL("user32")            # a private handle: its prototypes
+        user32.GetForegroundWindow.argtypes = ()    # are set for these calls alone
+        user32.GetForegroundWindow.restype = wintypes.HWND
+        user32.GetWindowThreadProcessId.argtypes = (
+            wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+        user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+        user32.GetClassNameW.argtypes = (wintypes.HWND, wintypes.LPWSTR, ctypes.c_int)
+        user32.GetClassNameW.restype = ctypes.c_int
+        window = user32.GetForegroundWindow()
+        if not window:
+            return FRONT_NONE
+        owner = wintypes.DWORD(0)
+        user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
+        if not owner.value:
+            return FRONT_NONE
+        if owner.value != os.getpid():
+            return FRONT_OTHER
+        name = ctypes.create_unicode_buffer(64)
+        user32.GetClassNameW(window, name, len(name))
+        return FRONT_TK if name.value == _TK_TOPLEVEL_CLASS else FRONT_OWN
+    except Exception:
+        return FRONT_NONE
 
 
 def scaled(widget, pixels) -> int:
@@ -488,6 +532,8 @@ class PingDialog:
         self._picker = None                 # the ONE picker, made on first use
         self._picker_for_query = False      # it was opened by the template's ':' query
         self._query_tag = None              # the binding tag of the query keys
+        self._emoji_press_closed = False    # this click's press closed the picker
+        self._emoji_warned = set()          # the emoji failures already logged
         self.emoji_button = None
         self.combos = {}
         self.pencils = {}
@@ -596,6 +642,8 @@ class PingDialog:
             self.emoji_button.grid(row=row + 1, column=0, columnspan=3, sticky="w",
                                    pady=(4, 0))
             attach_tooltip(self.emoji_button, "Pick an emoji for the template")
+            # add="+": the tooltip has bindings on this button too.
+            self.emoji_button.bind("<ButtonPress-1>", self._on_emoji_press, add="+")
         return panel
 
     def _build_when(self, parent):
@@ -912,6 +960,15 @@ class PingDialog:
             return False
 
     def _ask(self, title, message) -> bool:
+        # The picker goes FIRST. The question is a native window of FCTool's own: left
+        # open, the picker would close itself once the box has the focus and hand the
+        # keyboard back to the template from inside the box's own loop.
+        picker = self._picker
+        if picker is not None:
+            try:
+                picker.close()
+            except Exception:
+                pass
         try:
             if callable(self._confirm):
                 return bool(self._confirm(title, message))
@@ -1076,8 +1133,16 @@ class PingDialog:
                 return ""
             return "break"
         except Exception as exc:            # never out into the key binding
-            log.warning("ping dialog: an emoji key failed (%s)", type(exc).__name__)
+            self._emoji_warn("an emoji key failed", exc)
             return ""
+
+    def _emoji_warn(self, what, exc):
+        """One WARNING per window for each kind of emoji failure (a key that is held,
+        a button pressed again, would otherwise write a line every time). The
+        exception's TYPE only."""
+        if what not in self._emoji_warned:
+            self._emoji_warned.add(what)
+            log.warning("ping dialog: %s (%s)", what, type(exc).__name__)
 
     def _emoji_picker(self):
         """The window's ONE picker, made on first use; None in a window without emoji
@@ -1092,15 +1157,31 @@ class PingDialog:
                     search=getattr(hooks, "search", None),
                     groups=getattr(hooks, "groups", None))
             except Exception as exc:        # (a button command must not raise into Tk)
-                log.warning("ping dialog: no emoji picker (%s)", type(exc).__name__)
+                self._emoji_warn("no emoji picker", exc)
         return self._picker
 
+    def _on_emoji_press(self, _event=None):
+        """The mouse button went DOWN on the Emoji button. The toggle is decided here,
+        not on the release: the press takes the focus out of the picker, the picker
+        closes itself 150 ms later, and the release of a slow click would then find it
+        closed and open it again. So a press on the button while the picker it opened
+        is up closes it now, and that click's release is spent."""
+        self._emoji_press_closed = False
+        picker = self._picker
+        if (self._closed or picker is None or self._picker_for_query
+                or not picker.is_open()):
+            return
+        self._emoji_press_closed = True
+        picker.close()
+
     def _on_emoji_button(self):
-        """The Emoji button: the picker, hung under the button. Pressed while the
-        picker it opened is up, it closes it."""
+        """The Emoji button (the release of a click, or its keyboard / code
+        equivalent): the picker, hung under the button. With the picker it opened
+        up, it closes it - unless the press of this very click already did."""
+        spent, self._emoji_press_closed = self._emoji_press_closed, False
         picker = self._emoji_picker()
         button = self.emoji_button
-        if picker is None or button is None:
+        if spent or picker is None or button is None:
             return
         if picker.is_open() and not self._picker_for_query:
             picker.close()
@@ -1138,12 +1219,17 @@ class PingDialog:
     def _focus_canvas(self):
         """Give the keyboard back to the template after the picker closed.
 
-        ``focus_force``, because a plain focus request was measured leaving FCTool with
-        no focus widget at all once the picker's borderless window is gone. Three
-        cases need no force: the template still has the keyboard (the autocomplete
-        never took it); the user has meanwhile put the focus on another widget of
-        FCTool (it stays there); and another application is in front (the request is
-        only remembered - forcing would pull the keyboard out of that application)."""
+        Nothing is done when a widget of FCTool has the keyboard: the template itself
+        (the autocomplete never took it), or one the user has meanwhile clicked.
+
+        Otherwise the request is FORCED only when the foreground window is positively
+        a Tk toplevel of this process (``foreground()``) - a plain request was measured
+        leaving FCTool with no focus widget at all once the picker's borderless window
+        is gone. Over anything else it is only remembered, for when the window is back
+        in front: a native window of FCTool's own (a yes/no box, a file dialog - the
+        picker also closes when one of those takes the focus, and a force would take
+        the box's activation and its keyboard), another application (the game), or no
+        foreground window that can be named."""
         if not self.alive() or not self._canvas_alive():
             return
         text = self.canvas.text
@@ -1151,10 +1237,14 @@ class PingDialog:
             holder = self._focus_name()
             if holder and holder != str(self.win):
                 return                      # the template itself, or the user's choice
-            if self._other_app_in_front():
-                text.focus_set()
-            else:
+            try:
+                ours = foreground() == FRONT_TK
+            except Exception:
+                ours = False
+            if ours:
                 text.focus_force()
+            else:
+                text.focus_set()
         except tk.TclError:
             pass
 
@@ -1165,28 +1255,6 @@ class PingDialog:
             return str(self.win.tk.call("focus", "-displayof", self.win._w))
         except Exception:
             return ""
-
-    def _other_app_in_front(self) -> bool:
-        """Is the window the user is working in another PROCESS's? One read-only look
-        at the foreground window; ``False`` whenever that cannot be told (no foreground
-        window, not Windows). Never raises."""
-        try:
-            import ctypes
-            from ctypes import wintypes
-            user32 = ctypes.WinDLL("user32")        # a private handle: its prototypes
-            user32.GetForegroundWindow.argtypes = ()    # are set for this call alone
-            user32.GetForegroundWindow.restype = wintypes.HWND
-            user32.GetWindowThreadProcessId.argtypes = (
-                wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
-            user32.GetWindowThreadProcessId.restype = wintypes.DWORD
-            window = user32.GetForegroundWindow()
-            if not window:
-                return False
-            owner = wintypes.DWORD(0)
-            user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
-            return owner.value not in (0, os.getpid())
-        except Exception:
-            return False
 
     def _release_emoji(self):
         """Close the picker, take the query keys off their tag and let the tiles go.

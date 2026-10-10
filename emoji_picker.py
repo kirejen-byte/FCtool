@@ -7,7 +7,8 @@ its ``:shortcode:``.  It is opened two ways:
 * from a button (``take_focus=True``): the search box takes the keyboard;
 * as an autocomplete while the user types ``:name`` in the editor
   (``take_focus=False``): the keyboard STAYS in the editor, which forwards
-  Up / Down / Return / Tab / Esc to :meth:`EmojiPicker.move_selection`,
+  Up / Down / Return / Tab / Esc to :meth:`EmojiPicker.step` (the next / the
+  previous result; :meth:`EmojiPicker.move_selection` moves by grid cell),
   :meth:`EmojiPicker.accept` and :meth:`EmojiPicker.close`, and calls
   :meth:`EmojiPicker.set_query` as the user types.
 
@@ -231,6 +232,15 @@ class GridModel:
         col = min(max(col + dx, 0), self.cols - 1)
         return self._set(min(row * self.cols + col, count - 1))
 
+    def step(self, delta: int) -> bool:
+        """Move the highlight ``delta`` items along the list - the next or the
+        previous result, whatever row it is on - clamped at both ends (never
+        wrapping); the page follows it.  True when anything changed."""
+        count = len(self.items)
+        if not count:
+            return False
+        return self._set(min(max(max(self.sel, 0) + delta, 0), count - 1))
+
     def select(self, index: int) -> bool:
         """Highlight item ``index``; ignored when there is no such item."""
         if not 0 <= index < len(self.items):
@@ -410,6 +420,25 @@ class EmojiPicker:
             return
         if self._model.move(int(dx), int(dy)):
             self._render()
+
+    def step(self, delta: int) -> bool:
+        """Move the highlight to the next (``+1``) or the previous (``-1``)
+        result, clamped at both ends, paging when it crosses a page - the
+        linear walk a caller's Up / Down make while it drives the popup.
+
+        False when there is nothing to step through - the popup is closed, it
+        shows no result, or ``delta`` is no number - so the caller can let the
+        key go on to its own widget.  True otherwise, at an end too: the key
+        was the popup's even though the highlight had nowhere left to go."""
+        if self._win is None or not self._model.items:
+            return False
+        try:
+            delta = int(delta)
+        except (TypeError, ValueError, OverflowError):
+            return False
+        if self._model.step(delta):
+            self._render()
+        return True
 
     def accept(self) -> bool:
         """Pick the highlighted emoji: close (``on_close``), then

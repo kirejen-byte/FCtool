@@ -440,7 +440,8 @@ def make_hooks(master) -> "tuple[EmojiHooks, EmojiTiles] | None":
     ONE known tile - the table's first entry. A sheet that merely could not
     be READ is tried again, ``_MAX_READ_ATTEMPTS`` tries in all, as
     :meth:`EmojiTiles.image` would on later calls. The probed tile stays
-    cached. Never raises."""
+    cached. Never raises: a failure nobody planned for is one WARNING (the
+    exception's TYPE only) and None - a window without emoji leaves a trace."""
     try:
         if not emoji_data.available():
             return None
@@ -455,7 +456,8 @@ def make_hooks(master) -> "tuple[EmojiHooks, EmojiTiles] | None":
                         tiles)
             if tiles._failed:           # the sheet is WRONG: no second try
                 break
-        tiles.release()
-    except Exception:
-        pass
+        tiles.release()         # (EmojiTiles has logged why the sheet is no use)
+    except Exception as exc:
+        _log("warning", "[Emoji] the emoji hooks could not be made (%s); emoji "
+             "are shown as plain characters", _ascii(type(exc).__name__))
     return None
