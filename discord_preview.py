@@ -22,22 +22,40 @@ preview and nothing else - it copies nothing and sends nothing.
   timestamp span (no style = ``f``). The digits are matched with an explicit
   ``[0-9]`` class and capped in length, so ``int()`` cannot refuse them; a
   value past Discord's own ceiling is text.
-* ``@everyone`` / ``@here`` at a line start or after whitespace, and
-  ``<@&DIGITS>`` (shown as ``@role``) - mention spans.
+* ``@everyone`` / ``@here`` at a line start or NOT preceded by a letter, a
+  digit or an underscore (``**@everyone**`` and ``(@here)`` ping in Discord,
+  ``mail@everyone.com`` does not), and ``<@&DIGITS>`` (shown as ``@role``) -
+  mention spans.
+* A bare URL - ``http://`` or ``https://`` up to the next whitespace - is
+  literal text: nothing inside it is a marker (``https://x.com/_foo_/x``
+  keeps its underscores). The rule is exactly that wide, so a URL written
+  flush against a closing marker (``**https://x.com**``) swallows it.
+* A backslash before a marker character (``*`` ``_`` ``~`` or a backtick)
+  escapes it: the character is text and the backslash is not shown. A
+  backslash before anything else is just a backslash.
 * Emoji - only through the optional ``split_emoji`` hook. Each emoji it names
   becomes ONE span and is atomic: a marker character inside one (the keycap
   asterisk starts with ``*``) is never markup. Without the hook, or when the
   hook misbehaves, emoji are ordinary text.
 
 Shown literally, on purpose: fenced code blocks (the fence lines and
-everything between them), lists, spoilers, masked links, backslash escapes,
-user and channel mentions.
+everything between them), lists, spoilers, masked links, user and channel
+mentions.
 
 ``DiscordPreview`` (below the seam) draws that on Discord's dark background.
 It is READ-ONLY - text can be selected and copied, never edited - and it never
 raises, whatever string it is handed: the editor re-renders it on a timer. A
 render that would draw exactly what is already on screen rewrites nothing, so
 a selection survives the timer.
+
+THE DRAW BUDGET. Every styled run is its own tagged insert, and Tk's cost for
+one logical line grows with the SQUARE of the runs on it (measured: one dense
+5,000-character line took 2.6 s to draw, 20,000 characters 71 s - on the
+thread that also drives the app's live previews). So the rendered view draws
+at most ``MAX_RUNS_PER_LINE`` styled runs on one line and ``MAX_RUNS_TOTAL``
+in all; the rest of an over-budget line, and everything once the total is
+spent, is drawn as plain unstyled text. Nothing is dropped - only its styling.
+Raw mode is one insert and is not affected.
 
 No network, no Pillow (images are ``tk.PhotoImage`` objects handed in by the
 ``emoji_image`` hook), no ``fc_gui`` / ``ui_theme`` import.
@@ -63,6 +81,11 @@ DEFAULT_STYLE = "f"
 MAX_UNIX = 8640000000000
 #: What a role mention shows as: the role's name is not known here.
 ROLE_TEXT = "@role"
+
+#: The draw budget (module docstring): styled runs the rendered view draws on
+#: ONE logical line, and in the whole message, before it stops styling.
+MAX_RUNS_PER_LINE = 150
+MAX_RUNS_TOTAL = 3000
 
 
 @dataclass(frozen=True)
@@ -107,6 +130,10 @@ _FENCE = "```"
 _TIME_RE = re.compile(r"<t:([0-9]{1,13})(?::([A-Za-z]))?>")
 _ROLE_RE = re.compile(r"<@&[0-9]+>")
 _MENTIONS = ("@everyone", "@here")
+# A bare URL: the scheme, then everything up to the next whitespace.
+_URL_RE = re.compile(r"https?://\S*")
+# What a backslash can escape: the inline marker characters, nothing else.
+_ESCAPABLE = frozenset("*_~`")
 
 # A span's emphasis, as (bold, italic, underline, strike) - the order of the
 # Span fields, so it can be splatted into the constructor.
@@ -115,8 +142,9 @@ _BOLD, _ITALIC, _UNDERLINE, _STRIKE = range(4)
 # Two-character markers first: "**" must be tried before "*".
 _MARKERS = (("**", _BOLD), ("__", _UNDERLINE), ("~~", _STRIKE),
             ("*", _ITALIC), ("_", _ITALIC))
-# Every character that can START something other than plain text.
-_SPECIAL = frozenset("`<@*_~")
+# Every character that can START something other than plain text ("h" for a
+# URL, the backslash for an escape).
+_SPECIAL = frozenset("`<@*_~h\\")
 # Markers deeper than this are text. Real nesting is three or four deep; the
 # cap only bounds the recursion on hostile input.
 _MAX_DEPTH = 8
@@ -203,7 +231,9 @@ class _Inline:
         out = []
         pending = i                         # start of the text not emitted yet
         while i < end:
-            if line[i] not in _SPECIAL and not atomic[i]:
+            ch = line[i]
+            if not atomic[i] and (ch not in _SPECIAL or (
+                    ch == "h" and not line.startswith("http", i, end))):
                 i += 1
                 continue
             spans, after = self._piece(i, end, style, depth)
@@ -246,15 +276,25 @@ class _Inline:
                 return [Span("mention", ROLE_TEXT, *style)], match.end()
             return None, i + 1
         if ch == "@":
-            if i == 0 or line[i - 1].isspace():
+            # At the line start, or not glued to a word ("mail@everyone.com").
+            if i == 0 or not (line[i - 1].isalnum() or line[i - 1] == "_"):
                 for word in _MENTIONS:
                     if line.startswith(word, i, end):
                         return [Span("mention", word, *style)], i + len(word)
+            return None, i + 1
+        if ch == "h":                       # a bare URL is literal, whole
+            match = _URL_RE.match(line, i, end)
+            return None, (match.end() if match is not None else i + 1)
+        if ch == "\\":
+            if self._escapes(i, end):       # the backslash is not shown
+                return [Span("text", line[i + 1], *style)], i + 2
             return None, i + 1
         if depth < _MAX_DEPTH:              # ch is one of * _ ~
             for marker, slot in _MARKERS:
                 if not line.startswith(marker, i, end):
                     continue
+                if len(marker) == 2 and self.atomic[i + 1]:
+                    continue                # its second half is an emoji's
                 inner = i + len(marker)
                 if not self._opens(marker, i, inner, end):
                     continue
@@ -292,6 +332,12 @@ class _Inline:
                     return inner, stop, k
         return None, None, inner
 
+    def _escapes(self, i: int, end: int) -> bool:
+        """Does the backslash at ``i`` escape the character after it?"""
+        after = i + 1
+        return (after < end and self.line[after] in _ESCAPABLE
+                and not self.atomic[after])
+
     def _opens(self, marker: str, i: int, inner: int, end: int) -> bool:
         line = self.line
         if marker == "_":                   # only at a word edge
@@ -310,7 +356,8 @@ class _Inline:
 
     def _closer(self, marker: str, start: int, end: int) -> int:
         """The index of the marker that closes one opened just before
-        ``start``, or -1. Code spans and emoji are stepped over.
+        ``start``, or -1. Code spans, emoji, URLs and escaped characters are
+        stepped over.
 
         Runs of the marker character decide who owns what: a two-character
         marker closes on the LAST two of a run of two or more, a one-character
@@ -335,6 +382,14 @@ class _Inline:
             if c == "`":
                 k = self._code(k, end)[2]
                 continue
+            if c == "\\" and self._escapes(k, end):
+                k += 2
+                continue
+            if c == "h" and line.startswith("http", k, end):
+                match = _URL_RE.match(line, k, end)
+                if match is not None:
+                    k = match.end()
+                    continue
             if c != ch:
                 k += 1
                 continue
@@ -357,15 +412,31 @@ class _Inline:
 
 
 def _merged(spans: list) -> tuple:
-    """Adjacent text spans that look the same become one."""
+    """Adjacent text spans that look the same become one. Linear: the texts
+    of a group are collected and joined once, never concatenated pairwise."""
     out = []
+    first = look = None                     # the open group's first span
+    parts = []
+
+    def close():
+        if first is not None:
+            out.append(first if len(parts) == 1
+                       else replace(first, text="".join(parts)))
+
     for span in spans:
-        last = out[-1] if out else None
-        if (last is not None and span.kind == "text" == last.kind
-                and replace(span, text="") == replace(last, text="")):
-            out[-1] = replace(last, text=last.text + span.text)
-        else:
+        if span.kind != "text":
+            close()
+            first = None
             out.append(span)
+            continue
+        this = (span.bold, span.italic, span.underline, span.strike,
+                span.code)
+        if first is not None and this == look:
+            parts.append(span.text)
+            continue
+        close()
+        first, look, parts = span, this, [span.text]
+    close()
     return tuple(out)
 
 
@@ -400,6 +471,7 @@ def parse(text: str, *, split_emoji=None) -> list:
 # visible in the file (the close_clients.py shape).
 import logging                                                    # noqa: E402
 import tkinter as tk                                              # noqa: E402
+import tkinter.font as tkfont                                     # noqa: E402
 from tkinter import ttk                                           # noqa: E402
 
 from discord_time import render_style                             # noqa: E402
@@ -420,6 +492,11 @@ TIMESTAMP_BG = "#3f4147"        # the grey chip under a <t:...> time
 CODE_BG = "#2b2d31"             # inline code
 QUOTE_BAR = "#4e5058"           # the bar left of a "> " quote
 SELECT_BG = "#4752c4"           # selection
+
+#: The name of a quote bar's image element in ``.text``. Tk numbers repeats
+#: (``quote-bar``, ``quote-bar#1``, ...), so a caller counting EMOJI images
+#: with ``.text.dump(..., image=True)`` skips names that start with this.
+QUOTE_BAR_NAME = "quote-bar"
 
 # Positive sizes are POINTS, so everything follows ``tk scaling``. 12 pt is
 # Discord's 16 px body at 96 dpi; its line is 21 px there, so a 22 px emoji
@@ -442,6 +519,20 @@ _BLOCK_TAGS = {
 }
 
 
+def _same(a, b) -> bool:
+    """``a == b``, where a comparison that raises is "not the same"."""
+    try:
+        return bool(a == b)
+    except Exception:
+        return False
+
+
+def _plain(spans) -> str:
+    """Spans as unstyled text: what is drawn once the draw budget is spent
+    (a timestamp is then its tag as written)."""
+    return "".join(span.text for span in spans)
+
+
 class DiscordPreview(tk.Frame):
     """The preview box: a read-only ``tk.Text`` (``.text``) and its scrollbar
     (``.scrollbar``) on Discord's dark background.
@@ -462,18 +553,42 @@ class DiscordPreview(tk.Frame):
     for one emoji, and None (or no hook) leaves its characters. The widget
     keeps a reference to every image for as long as it is on screen. Text
     copied out of the RENDERED view does not include image emoji - RAW is the
-    exact string.
+    exact string. (A quoted line also starts with an image element: its bar,
+    named ``QUOTE_BAR_NAME``. No embedded window is ever created.)
 
     READ-ONLY: the Text is ``state="disabled"``, which on Windows still takes
     the focus on a click, shows a selection and copies it.
 
     NEVER RAISES from ``render``: a hook that raises is treated as "no
     image" / "no emoji", and a drawing that fails is drawn again more simply
-    (without images, then as plain text), with one WARNING in the log.
+    (without images, then as plain text), with ONE WARNING in the log for
+    the life of the widget.
 
-    A render that would put exactly the same thing on screen changes nothing,
-    so the caller may re-render on a timer without wiping the selection or
-    the scroll position.
+    THE DRAW BUDGET (module docstring): at most ``MAX_RUNS_PER_LINE`` styled
+    runs on one logical line and ``MAX_RUNS_TOTAL`` in all; what is over is
+    drawn as plain text. A run is one tagged insert, one image or one quote
+    bar; unstyled text between runs is free and is merged into single inserts
+    (an ordinary ping of plain lines is ONE insert).
+
+    AN UNCHANGED RENDER TOUCHES NOTHING, so the caller may re-render on a
+    timer without wiping the selection or the scroll position:
+
+      * the text is parsed ONCE and each emoji is asked of ``emoji_image``
+        ONCE for as long as the text stays the same - a tick neither
+        re-parses nor re-asks. Because the widget reuses the object it was
+        given, the "nothing changed" check holds even for a hook that would
+        build a new image per call; the tiles are asked again (and the old
+        ones let go) only when the TEXT changes. A hook should still return
+        the same object for the same sequence, as the tile provider does:
+        that is what makes a text EDIT cheap and flicker-free;
+      * same text, same mode and - when the text holds a timestamp - the
+        same ``now_unix``: nothing is even compared;
+      * a later ``now_unix``: the drawing is planned again from the cached
+        parse and put on screen only if it differs (a countdown that still
+        reads "in 2 hours" rewrites nothing).
+
+    AFTER ``destroy()`` (its own, or its window's) ``render`` and
+    ``set_mode`` are silent no-ops: no Tk call, no log line.
     """
 
     def __init__(self, master, *, split_emoji=None, emoji_image=None,
@@ -485,11 +600,16 @@ class DiscordPreview(tk.Frame):
         self._mode = MODE_RENDERED
         self._source = ""
         self._now = 0
+        self._lines = None          # parse(self._source), once per text
+        self._has_time = True       # ... and whether it holds a timestamp
+        self._tiles = {}            # emoji sequence -> image / None, per text
         self._shown = None          # the drawing plan last put on screen
+        self._drawn_key = None      # (mode, text, now) that plan was made for
         self._images = []           # every PhotoImage now in the Text
-        self._bars = []             # every quote-bar window now in the Text
+        self._bar_image = None      # the one quote-bar image, made on demand
         self._font_tags = set()
         self._warned = False
+        self._dead = False
 
         self.text = tk.Text(
             self, wrap="word", width=48, height=8,
@@ -516,7 +636,12 @@ class DiscordPreview(tk.Frame):
 
     # -- the public surface ---------------------------------------------------
     def render(self, text: str, now_unix: int) -> None:
-        self._source = text if isinstance(text, str) else ""
+        if not self._alive():
+            return
+        source = text if isinstance(text, str) else ""
+        if source != self._source:
+            self._forget()          # a new text: parse and ask for tiles anew
+        self._source = source
         self._now = now_unix
         self._redraw()
 
@@ -524,7 +649,7 @@ class DiscordPreview(tk.Frame):
         if mode not in MODES:
             raise ValueError("Unknown preview mode %r: expected 'rendered' "
                              "or 'raw'" % (mode,))
-        if mode != self._mode:
+        if mode != self._mode and self._alive():
             self._mode = mode
             self._redraw()
 
@@ -534,10 +659,39 @@ class DiscordPreview(tk.Frame):
     def destroy(self):
         # Let go of the emoji tiles with the widget: their owner may want to
         # free the sheet as soon as the window closes.
-        self._shown = None
+        self._dead = True
+        self._forget()
+        self._shown = self._drawn_key = None
         self._images = []
-        self._bars = []
+        self._bar_image = None
         super().destroy()
+
+    def _alive(self) -> bool:
+        """False once the widget is gone - by ``destroy()`` or because Tk
+        destroyed its window (a parent torn down from the Tcl side never
+        calls the Python method). Latched: a dead widget stays dead."""
+        if not self._dead:
+            try:
+                if self.winfo_exists():
+                    return True
+            except Exception:       # the application itself is gone
+                pass
+            self._dead = True
+        return False
+
+    def _forget(self) -> None:
+        self._lines = None
+        self._has_time = True
+        self._tiles = {}
+
+    def _parsed(self) -> list:
+        """``parse`` of the current text - run once per text, not per tick."""
+        if self._lines is None:
+            lines = parse(self._source, split_emoji=self._split_emoji)
+            self._has_time = any(span.kind == "timestamp"
+                                 for line in lines for span in line.spans)
+            self._lines = lines
+        return self._lines
 
     # -- tags -----------------------------------------------------------------
     def _configure_tags(self) -> None:
@@ -561,10 +715,14 @@ class DiscordPreview(tk.Frame):
         view.tag_raise("sel")       # a selection stays readable over a chip
 
     def _font_tag(self, block: str, span) -> str:
-        """The tag carrying the font for ``span`` on a ``block`` line."""
+        """The tag carrying the font for ``span`` on a ``block`` line, or
+        ``""`` when that is the widget's own font (plain body text carries no
+        tag at all, so it costs no styled run)."""
         size = _BLOCK_PT.get(block, _BODY_PT)
         bold = bool(span.bold or block in _HEADERS)
         italic = bool(span.italic)
+        if size == _BODY_PT and not (bold or italic or span.code):
+            return ""
         if span.code:
             family, size, label = _CODE_FONT, size - 1, "code"
         else:
@@ -584,24 +742,64 @@ class DiscordPreview(tk.Frame):
 
     # -- the drawing plan -----------------------------------------------------
     # A plan is a tuple of operations: ("text", chars, tags), ("image",
-    # photo, tags) or ("bar",). Building one touches no text; comparing two
-    # is how "nothing changed" is known.
+    # photo, tags) or ("bar", None, ()). Building one touches no text;
+    # comparing two is how "nothing changed" is known.
     def _raw_plan(self, tags=("raw",)) -> tuple:
         return (("text", self._source, tags),) if self._source else ()
 
     def _rendered_plan(self, use_images: bool = True) -> tuple:
-        plan = []
+        """The rendered drawing, inside the draw budget.
+
+        A RUN is a tagged text insert, an image or a quote bar. Untagged text
+        costs nothing and is merged with its untagged neighbours (newlines
+        included), so it never multiplies inserts. Once a line has used
+        ``MAX_RUNS_PER_LINE`` runs the rest of that line goes in untagged;
+        once ``MAX_RUNS_TOTAL`` are used, so does everything that is left.
+        (The newline that ends a header / subtext / quote line is tagged; when
+        it needs an insert of its own it counts toward the total, not toward
+        its line.) So a drawing never holds more than ``MAX_RUNS_TOTAL``
+        tagged inserts, images and bars together - the count IS the number
+        of such operations issued.
+        """
+        lines = self._parsed()
+        plan = []                   # [kind, payload, tags]; text = its parts
+
+        def put(chars, tags=()) -> bool:
+            """Add text; True when that took a NEW insert of its own."""
+            if plan and plan[-1][0] == "text" and plan[-1][2] == tags:
+                plan[-1][1].append(chars)
+                return False
+            plan.append(["text", [chars], tags])
+            return True
+
+        total = 0
         newline_tags = None
-        for line in parse(self._source, split_emoji=self._split_emoji):
+        for number, line in enumerate(lines):
+            if total >= MAX_RUNS_TOTAL:
+                rest = "\n".join(_plain(left.spans)
+                                 for left in lines[number:])
+                put(("\n" if number else "") + rest)
+                break
             block_tags = _BLOCK_TAGS.get(line.block, ())
             if newline_tags is not None:
-                # The newline belongs to the line it ends.
-                plan.append(("text", "\n", newline_tags))
+                # The newline belongs to the line it ends, and is a run of
+                # its own only when it could not ride on that line's last.
+                if put("\n", newline_tags) and newline_tags:
+                    total += 1
             newline_tags = block_tags
-            if line.block == "quote":
-                plan.append(("bar",))
-            for span in line.spans:
-                tags = (self._font_tag(line.block, span),) + block_tags
+            used = 0
+            if line.block == "quote" and total < MAX_RUNS_TOTAL:
+                plan.append(["bar", None, ()])
+                used += 1
+                total += 1
+            for index, span in enumerate(line.spans):
+                if used >= MAX_RUNS_PER_LINE or total >= MAX_RUNS_TOTAL:
+                    put(_plain(line.spans[index:]))
+                    break
+                tags = block_tags
+                font = self._font_tag(line.block, span)
+                if font:
+                    tags = (font,) + tags
                 if span.underline:
                     tags += ("underline",)
                 if span.strike:
@@ -610,7 +808,9 @@ class DiscordPreview(tk.Frame):
                 if span.kind == "emoji":
                     image = self._image_for(shown) if use_images else None
                     if image is not None:
-                        plan.append(("image", image, tags))
+                        plan.append(["image", image, tags])
+                        used += 1
+                        total += 1
                         continue
                 elif span.kind == "timestamp":
                     wording = self._wording(span)
@@ -621,17 +821,24 @@ class DiscordPreview(tk.Frame):
                     tags += ("mention",)
                 elif span.code:
                     tags += ("code",)
-                if shown:
-                    plan.append(("text", shown, tags))
-        return tuple(plan)
+                if shown and put(shown, tags) and tags:
+                    used += 1
+                    total += 1
+        return tuple((kind, "".join(payload) if kind == "text" else payload,
+                      tags) for kind, payload, tags in plan)
 
     def _image_for(self, seq: str):
-        if self._emoji_image is None:
-            return None
-        try:
-            return self._emoji_image(seq)
-        except Exception:
-            return None
+        """The tile for one emoji - asked of the hook once per text."""
+        if seq in self._tiles:
+            return self._tiles[seq]
+        image = None
+        if self._emoji_image is not None:
+            try:
+                image = self._emoji_image(seq)
+            except Exception:
+                image = None
+        self._tiles[seq] = image
+        return image
 
     def _wording(self, span):
         """What Discord shows for a timestamp here and now, or None when it
@@ -646,8 +853,12 @@ class DiscordPreview(tk.Frame):
     # -- drawing --------------------------------------------------------------
     def _redraw(self) -> None:
         """Draw the current text in the current mode - or, when that fails,
-        something simpler. Never raises."""
+        something simpler. Never raises; the caller has checked the widget
+        is alive."""
         raw = self._mode == MODE_RAW
+        key = self._key()
+        if _same(key, self._drawn_key):
+            return                          # same text, mode and clock
         attempts = (
             self._raw_plan if raw else self._rendered_plan,
             self._raw_plan if raw else (lambda: self._rendered_plan(False)),
@@ -662,16 +873,34 @@ class DiscordPreview(tk.Frame):
                 self._note_failure(exc)
                 continue
             if attempt == 0:
-                if plan == self._shown:
-                    return                  # already on screen: touch nothing
+                # A comparison that RAISES (an image object with a hostile
+                # ``==``) just means "not known to be the same": redraw.
+                if self._shown is not None and _same(plan, self._shown):
+                    break                   # already on screen: touch nothing
                 # Recorded BEFORE drawing: a plan that cannot be drawn is not
                 # tried again on every tick.
                 self._shown = plan
             try:
                 self._draw(plan)
-                return
+                break
             except Exception as exc:
                 self._note_failure(exc)
+        # Whatever ended up on screen - the plan or a fallback - belongs to
+        # this key: an identical render is not attempted again.
+        self._drawn_key = key
+
+    def _key(self) -> tuple:
+        """What the drawing depends on. The clock is part of it only when the
+        text holds a timestamp (every style is worded through ``now_unix``:
+        ``R`` counts from it and a garbage clock words nothing)."""
+        if self._mode == MODE_RAW:
+            return (MODE_RAW, self._source, None)
+        try:
+            self._parsed()
+            timed = self._has_time
+        except Exception:
+            timed = True
+        return (MODE_RENDERED, self._source, self._now if timed else None)
 
     def _note_failure(self, exc) -> None:
         if self._warned:
@@ -686,9 +915,6 @@ class DiscordPreview(tk.Frame):
     def _draw(self, plan: tuple) -> None:
         view = self.text
         top = view.yview()[0]
-        for bar in self._bars:
-            bar.destroy()
-        self._bars = []
         images = []
         # Filled while NORMAL: insert / delete on a disabled Text are silent
         # no-ops, so the toggle around a refill is load-bearing.
@@ -697,7 +923,10 @@ class DiscordPreview(tk.Frame):
             view.delete("1.0", "end")
             for op in plan:
                 if op[0] == "text":
-                    view.insert("end", op[1], op[2])
+                    if op[2]:
+                        view.insert("end", op[1], op[2])
+                    else:
+                        view.insert("end", op[1])
                 elif op[0] == "image":
                     index = view.index("end-1c")
                     view.image_create(index, image=op[1], padx=1)
@@ -713,14 +942,33 @@ class DiscordPreview(tk.Frame):
         view.yview_moveto(top)
 
     def _add_bar(self) -> None:
-        """The quote bar: a thin embedded window at the start of the line,
-        stretched to the line's height - a bar, then a gap, as Discord draws
-        it. (A wrapped quote keeps its indent; the bar marks its first row.)"""
+        """The quote bar: an image element at the start of the line - a bar,
+        then a gap, as Discord draws it. (A wrapped quote keeps its indent;
+        the bar marks its first row.)
+
+        An IMAGE, never an embedded window: tearing embedded windows down
+        costs milliseconds EACH on this Tk (measured: a ``delete`` over 40 bar
+        windows took 260 ms and over 750 took 3.1 s; 3,000 bar images take
+        3 ms). Every bar shares the one image, exactly as tall as a line of
+        body text, so the bars of consecutive quoted lines join.
+        """
+        try:
+            bar = self._bar_tile()
+        except Exception:
+            return                  # no bar is a cosmetic loss, not a failure
         view = self.text
         index = view.index("end-1c")
-        holder = tk.Frame(view, width=self._quote_px, height=1, bg=DISCORD_BG)
-        tk.Frame(holder, bg=QUOTE_BAR).place(x=0, y=0, width=self._bar_px,
-                                             relheight=1)
-        self._bars.append(holder)
-        view.window_create(index, window=holder, stretch=1)
+        view.image_create(index, image=bar, name=QUOTE_BAR_NAME)
         view.tag_add("block-quote", index)
+
+    def _bar_tile(self):
+        if self._bar_image is None:
+            # A Font belongs to its interpreter: built here, on demand.
+            height = max(1, int(tkfont.Font(
+                root=self, font=(_UI_FONT, _BODY_PT)).metrics("linespace")))
+            image = tk.PhotoImage(master=self, width=self._quote_px,
+                                  height=height)
+            # The rest of the image stays transparent: that is the gap.
+            image.put(QUOTE_BAR, to=(0, 0, self._bar_px, height))
+            self._bar_image = image
+        return self._bar_image
