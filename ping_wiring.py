@@ -155,7 +155,7 @@ class PingWiringMixin:
                 system_names=lambda: list(getattr(self, "_system_names", []) or []),
                 confirm=lambda title, message: bool(messagebox.askyesno(
                     title, message, parent=getattr(self._ping_dialog, "win", self.root))),
-                emoji=False,
+                emoji=True,     # a flag: the window builds and owns the emoji itself
                 doctrine_ids=lambda: [d.id for d in self.fittings.list_doctrines()])
         except Exception as exc:    # never silent; self._ping_dialog stays as it was
             log.warning("ping: the editor could not be opened (%s at %s)",

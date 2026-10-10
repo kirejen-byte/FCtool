@@ -40,6 +40,19 @@ The rules the shell keeps:
 * **A typed time is read once.** Re-filling the date and time fields (a basis switch, a
   quick button) only re-displays the stored moment; the fields are not read back, because
   inside the repeated hour of a daylight-saving night that would move the ping an hour.
+* **Emoji belong to the window, and only to a window that asked.** Built with
+  ``emoji=True`` the window makes the emoji hooks itself (``emoji_tiles.make_hooks``),
+  hands them to its canvas and its preview, grows an Emoji button and ONE picker, and
+  lets all of it go when it closes. No hooks - the flag is off, or the pack cannot draw -
+  is the plain window: no button, no picker, emoji shown as the characters they are.
+  The emoji modules are imported inside the two methods that need them, never at the
+  top: app start and the one-click copy import this module and must load none of them.
+  A template only ever holds the CHARACTERS; an image is how the window draws them.
+* **The ``:`` autocomplete is the canvas's query and the window's picker.** The canvas
+  says what is typed after a colon and when that ends (Escape included); the window
+  only opens, feeds and closes the picker on its word, and never ends a query itself -
+  the picker reports "closed" before "picked" and for a dismissal alike. While a query
+  is open Up, Down, Return and Tab are the picker's (``_bind_query_keys``).
 
 Imports no ``fc_gui`` and nothing that talks to the network.
 """
@@ -48,6 +61,7 @@ from __future__ import annotations
 import calendar
 import functools
 import logging
+import os
 import time
 from dataclasses import dataclass
 
@@ -331,6 +345,20 @@ KIND_GLYPHS = {
 
 _SAVED, _SAVING, _NOT_SAVED = "saved", "saving", "failed"
 
+EMOJI_LABEL = "Emoji"
+_EMOJI_FACE = chr(0x263A)       # the smiling face before the button's label
+
+#: While a ``:`` query is open in the template these keys belong to the picker:
+#: key -> (picker method, arguments). They are bound on a binding tag of the window's
+#: own that comes FIRST in the template's tag order (``_bind_query_keys``). Three keys
+#: are not among them, on purpose - they are the canvas's, and the picker follows on
+#: its word: Escape (the canvas ends its own query and keeps that name quiet
+#: afterwards) and Left / Right (a caret move inside the name ends the query).
+_QUERY_KEYS = {
+    "Up": ("move_selection", (0, -1)), "Down": ("move_selection", (0, 1)),
+    "Return": ("accept", ()), "Tab": ("accept", ()),
+}
+
 
 def scaled(widget, pixels) -> int:
     """``pixels`` at 96 dpi, as pixels of ``widget``'s display."""
@@ -402,14 +430,20 @@ class PingDialog:
     ``refresh_when()``     read ``when`` again (after a copy used the time up).
     ``close()``            store what is pending, stop the timers, destroy the window.
 
-    ``emoji`` is accepted and not used yet. ``doctrine_ids`` (optional, ``() -> ids``) is
-    every doctrine the app has; with it the "basic template" question can say how many
-    doctrines inherit, without it the question does not name a number.
+    ``emoji`` (a flag): draw emoji as images and offer the picker - the window builds
+    and owns what that takes (module docstring). ``emoji_hooks`` is the test seam for
+    it: a ``(window) -> (hooks, tiles) | None`` factory used in place of
+    ``emoji_tiles.make_hooks`` (``hooks``: ``split`` / ``image`` / ``from_shortcode``,
+    and optionally ``search`` / ``groups`` for the picker; ``tiles``: ``release()``).
+    ``doctrine_ids`` (optional, ``() -> ids``) is every doctrine the app has; with it
+    the "basic template" question can say how many doctrines inherit, without it the
+    question does not name a number.
     """
 
     def __init__(self, parent, *, store, env, when, copy,
                  clock=None, system_names=None, confirm=None,
-                 emoji=False, local_to_utc=None, utc_to_local=None, doctrine_ids=None):
+                 emoji=False, local_to_utc=None, utc_to_local=None, doctrine_ids=None,
+                 emoji_hooks=None):
         self._store = store
         self._env_fn = env
         self._when = when
@@ -447,6 +481,14 @@ class PingDialog:
         self._bad = ()
         self._text_entry = None             # the Doctrine text field, while it is open
         self._editor = None                 # the one list editor
+        self._emoji_wanted = bool(emoji)
+        self._emoji_factory = emoji_hooks
+        self._emoji = None                  # the hooks; None = no emoji in this window
+        self._emoji_tiles = None            # what is released when the window goes
+        self._picker = None                 # the ONE picker, made on first use
+        self._picker_for_query = False      # it was opened by the template's ':' query
+        self._query_tag = None              # the binding tag of the query keys
+        self.emoji_button = None
         self.combos = {}
         self.pencils = {}
         self.pill_buttons = {}
@@ -467,6 +509,7 @@ class PingDialog:
             self._refresh_echo()
         except Exception:
             self._closed = True             # never leave a half-built window behind
+            self._release_emoji()
             self._destroy()
             raise
         # add="+": make_modal's <Escape> lives on the toplevel too.
@@ -482,6 +525,7 @@ class PingDialog:
             _SAVING: "Saving" + _ELLIPSIS,
             _NOT_SAVED: "Not saved",
         }
+        self._make_emoji()                  # first: the panels below are built around it
         body = tk.Frame(win, bg=BG_DARK, padx=8, pady=6)
         body.pack(fill=tk.BOTH, expand=True)
         body.grid_columnconfigure(0, weight=0, minsize=scaled(win, PANEL_WIDTH))
@@ -544,6 +588,14 @@ class PingDialog:
             button.grid(row=index // 3, column=1 + index % 3, sticky="ew",
                         padx=(3, 0), pady=1)
             self.pill_buttons[kind] = button
+        if self._emoji is not None:         # no hooks, no button: there is no picker
+            face = glyph_or(panel, _EMOJI_FACE, "")
+            self.emoji_button = _mini_button(
+                panel, "%s %s" % (face, EMOJI_LABEL) if face else EMOJI_LABEL,
+                self._on_emoji_button)
+            self.emoji_button.grid(row=row + 1, column=0, columnspan=3, sticky="w",
+                                   pady=(4, 0))
+            attach_tooltip(self.emoji_button, "Pick an emoji for the template")
         return panel
 
     def _build_when(self, parent):
@@ -590,13 +642,17 @@ class PingDialog:
         _label(frame, "TEMPLATE", font=_BOLD, fg=FG_ACCENT).grid(
             row=0, column=0, sticky="w", pady=(0, 2))
         # on_pill_activate is ALWAYS passed: without it a ping pill would open the
-        # canvas's own read-only window, which takes the input hold.
+        # canvas's own read-only window, which takes the input hold. param_editors is
+        # ALWAYS off for the same reason: a stored template may hold a MOTD pill kind,
+        # and that kind's editor takes the hold too.
         self.canvas = PillCanvas(
             frame, self._resolve_label, on_change=self._on_template_change, height=8,
             style_toolbar=False, kind_glyphs=dict(KIND_GLYPHS),
-            on_pill_activate=self._on_pill_activate)
+            on_pill_activate=self._on_pill_activate, param_editors=False,
+            **self._canvas_emoji_options())
         self.canvas.text.configure(width=30)    # a request; the column stretches it
         self.canvas.grid(row=1, column=0, sticky="nsew")
+        self._bind_query_keys()
         return frame
 
     def _build_preview(self, parent):
@@ -611,7 +667,11 @@ class PingDialog:
             self.mode_buttons[mode] = button
         self.count_label = _label(head, fg=FG_DIM)
         self.count_label.pack(side=tk.RIGHT)
-        self.preview = DiscordPreview(frame, utc_to_local=self._utc_to_local)
+        hooks = self._emoji
+        self.preview = DiscordPreview(
+            frame, utc_to_local=self._utc_to_local,
+            split_emoji=None if hooks is None else hooks.split,
+            emoji_image=None if hooks is None else hooks.image)
         self.preview.text.configure(height=3)   # a request; the row stretches it
         self.preview.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
         # Shown in the Discord view only (_on_mode); width=1: it never sets the width.
@@ -744,6 +804,7 @@ class PingDialog:
         self._cancel("_save_id")
         if self._editor is not None:
             self._editor.close()
+        self._release_emoji()
         self._destroy()
 
     # -- lifetime ---------------------------------------------------------------------------
@@ -756,12 +817,13 @@ class PingDialog:
     def _on_destroy(self, event):
         # <Destroy> arrives for every child too; only the window's own counts. This is
         # a destroy from OUTSIDE (close() sets the flag first): the widgets are already
-        # gone, so nothing can be saved - only the timers are stopped.
+        # gone, so nothing can be saved - the timers are stopped and the emoji let go.
         if self._closed or event.widget is not self.win:
             return
         self._closed = True
         self._cancel("_tick_id")
         self._cancel("_save_id")
+        self._release_emoji()
 
     def _cancel(self, name):
         job = getattr(self, name)
@@ -835,8 +897,11 @@ class PingDialog:
         return bool(self._store.has_own_template(key))
 
     def _still(self, key) -> bool:
-        """Is the window still showing the doctrine it showed when a question was asked?"""
-        return self.alive() and self._loaded and self._doctrine_id == key
+        """Is the window still showing the doctrine it showed when a question was
+        asked - on a canvas that is still there? (A canvas whose Text has gone answers
+        an EMPTY document; acted on, "yes" would store ``[]``.)"""
+        return (self.alive() and self._loaded and self._doctrine_id == key
+                and self._canvas_alive())
 
     def _write(self, call, *args) -> bool:
         try:
@@ -917,6 +982,236 @@ class PingDialog:
             self.canvas.text.focus_set()
         except tk.TclError:
             pass
+
+    # -- emoji ------------------------------------------------------------------------------
+    # Everything here does nothing in a window without hooks (``self._emoji is None``).
+    def _make_emoji(self):
+        """Build the hooks, when the window was asked for emoji. The pack is read HERE,
+        once per window (the table, and the sheet through one probed tile). No pack,
+        a pack that cannot draw, or a factory that raises: the plain window."""
+        if not self._emoji_wanted:
+            return
+        try:
+            factory = self._emoji_factory
+            if not callable(factory):
+                import emoji_tiles          # here, never at the top (module docstring)
+                factory = emoji_tiles.make_hooks
+            made = factory(self.win)
+            if made is None:
+                return
+            hooks, tiles = made
+        except Exception as exc:            # the TYPE only: ASCII, and no path in the log
+            log.warning("ping dialog: no emoji in this window (%s)", type(exc).__name__)
+            return
+        self._emoji, self._emoji_tiles = hooks, tiles
+
+    def _canvas_emoji_options(self) -> dict:
+        """What the hooks add to the template canvas's construction."""
+        if self._emoji is None:
+            return {}
+        return {"emoji": self._emoji, "on_emoji_query": self._on_emoji_query}
+
+    def _bind_query_keys(self):
+        """Put the ``_QUERY_KEYS`` on a binding tag of the window's own, FIRST in the
+        template's tag order.
+
+        First, because Tk runs ONE binding per tag, tag by tag: this tag's handler
+        runs before anything the canvas or Tk bound for that key, and its ``break``
+        ends the key press there - the caret does not move, no line is added. When it
+        does not break, the key goes on down the tags untouched, so with no query
+        open the canvas behaves exactly as it does without this tag. (Bound on the
+        Text itself, a handler would either run AFTER the canvas's own for that key,
+        or - for the arrow keys, which the canvas hears through its general key
+        binding - REPLACE it, since the most specific binding of a tag wins.)
+
+        The command belongs to the Text (Tk deletes it with the widget); the tag's
+        bindings are taken off when the window closes (``_release_emoji``)."""
+        if self._emoji is None:
+            return
+        text = self.canvas.text
+        tag = "PingEmojiKeys" + str(text)
+        command = text.register(self._on_query_key)
+        for key in _QUERY_KEYS:
+            text.tk.call("bind", tag, "<%s>" % key,
+                         'if {"[%s %s]" == "break"} break' % (command, key))
+        text.bindtags((tag,) + tuple(text.bindtags()))
+        self._query_tag = tag
+
+    def _on_emoji_query(self, query, x_root=0, y_root=0):
+        """The canvas's word on its ``:`` query: the text after the colon and where
+        the caret is on screen, at every change - the picker opens there (or follows)
+        WITHOUT taking the keyboard - and ``None`` once the query has ended: the
+        picker it opened is closed."""
+        if self._closed:
+            return
+        if query is None:
+            picker = self._picker
+            if self._picker_for_query:
+                self._picker_for_query = False
+                if picker is not None:
+                    picker.close()
+            return
+        picker = self._emoji_picker()
+        if picker is None:
+            return
+        self._picker_for_query = True
+        picker.open_at(x_root, y_root, query=query, take_focus=False)
+
+    def _on_query_key(self, key):
+        """One of the ``_QUERY_KEYS`` was pressed in the template. ``"break"`` when
+        the picker took it - nothing else then acts on that key press - and ``""``
+        when it is not the picker's: no query open, or the picker is not up for one,
+        or (Return / Tab) nothing is highlighted to take."""
+        try:
+            picker = self._picker
+            if (self._closed or picker is None or not self._picker_for_query
+                    or not picker.is_open()):
+                return ""
+            # Asking can END a query the caret has silently left - and that closes
+            # the picker - so the picker is looked at again afterwards.
+            if not self.canvas.emoji_query_active() or not picker.is_open():
+                return ""
+            method, arguments = _QUERY_KEYS[key]
+            if getattr(picker, method)(*arguments) is False:
+                return ""
+            return "break"
+        except Exception as exc:            # never out into the key binding
+            log.warning("ping dialog: an emoji key failed (%s)", type(exc).__name__)
+            return ""
+
+    def _emoji_picker(self):
+        """The window's ONE picker, made on first use; None in a window without emoji
+        and once the window is gone. It draws through the same hooks as the canvas."""
+        if self._picker is None and self._emoji is not None and self.alive():
+            hooks = self._emoji
+            try:
+                import emoji_picker         # here, never at the top (module docstring)
+                self._picker = emoji_picker.EmojiPicker(
+                    self.win, tiles=hooks, on_pick=self._on_emoji_pick,
+                    on_close=self._on_emoji_closed,
+                    search=getattr(hooks, "search", None),
+                    groups=getattr(hooks, "groups", None))
+            except Exception as exc:        # (a button command must not raise into Tk)
+                log.warning("ping dialog: no emoji picker (%s)", type(exc).__name__)
+        return self._picker
+
+    def _on_emoji_button(self):
+        """The Emoji button: the picker, hung under the button. Pressed while the
+        picker it opened is up, it closes it."""
+        picker = self._emoji_picker()
+        button = self.emoji_button
+        if picker is None or button is None:
+            return
+        if picker.is_open() and not self._picker_for_query:
+            picker.close()
+            return
+        try:
+            x, y = button.winfo_rootx(), button.winfo_rooty() + button.winfo_height()
+        except tk.TclError:
+            return
+        self._picker_for_query = False
+        picker.open_at(x, y, take_focus=True)
+
+    def _on_emoji_pick(self, seq):
+        """The picker's choice goes into the template as CHARACTERS (the canvas draws
+        them as an image): at the caret - or, when the picker was the autocomplete of
+        a ``:`` query, in place of that query. (The picker has closed by now, and
+        ``_on_emoji_closed`` has already given the keyboard back to the template.)"""
+        for_query, self._picker_for_query = self._picker_for_query, False
+        if self._closed or not self._canvas_alive() or not isinstance(seq, str) or not seq:
+            return
+        if for_query:
+            # (With the query gone from the caret meanwhile, the canvas inserts the
+            # emoji at the caret and deletes nothing.)
+            self.canvas.accept_emoji_query(seq)
+        else:
+            self.canvas.insert_text_at_caret(seq)
+
+    def _on_emoji_closed(self):
+        """The picker has gone - picked from, dismissed, or closed because the focus
+        left it; it does not say which, and on a pick this runs BEFORE the pick is
+        handed over. So nothing here ends the template's ``:`` query (the canvas ends
+        it and says so itself): the keyboard goes back to the template, no more."""
+        if not self._closed:
+            self._focus_canvas()
+
+    def _focus_canvas(self):
+        """Give the keyboard back to the template after the picker closed.
+
+        ``focus_force``, because a plain focus request was measured leaving FCTool with
+        no focus widget at all once the picker's borderless window is gone. Three
+        cases need no force: the template still has the keyboard (the autocomplete
+        never took it); the user has meanwhile put the focus on another widget of
+        FCTool (it stays there); and another application is in front (the request is
+        only remembered - forcing would pull the keyboard out of that application)."""
+        if not self.alive() or not self._canvas_alive():
+            return
+        text = self.canvas.text
+        try:
+            holder = self._focus_name()
+            if holder and holder != str(self.win):
+                return                      # the template itself, or the user's choice
+            if self._other_app_in_front():
+                text.focus_set()
+            else:
+                text.focus_force()
+        except tk.TclError:
+            pass
+
+    def _focus_name(self) -> str:
+        """Tk path of the FCTool widget that has the keyboard focus; ``""`` when none
+        has (Tcl's ``focus -displayof``). Never raises."""
+        try:
+            return str(self.win.tk.call("focus", "-displayof", self.win._w))
+        except Exception:
+            return ""
+
+    def _other_app_in_front(self) -> bool:
+        """Is the window the user is working in another PROCESS's? One read-only look
+        at the foreground window; ``False`` whenever that cannot be told (no foreground
+        window, not Windows). Never raises."""
+        try:
+            import ctypes
+            from ctypes import wintypes
+            user32 = ctypes.WinDLL("user32")        # a private handle: its prototypes
+            user32.GetForegroundWindow.argtypes = ()    # are set for this call alone
+            user32.GetForegroundWindow.restype = wintypes.HWND
+            user32.GetWindowThreadProcessId.argtypes = (
+                wintypes.HWND, ctypes.POINTER(wintypes.DWORD))
+            user32.GetWindowThreadProcessId.restype = wintypes.DWORD
+            window = user32.GetForegroundWindow()
+            if not window:
+                return False
+            owner = wintypes.DWORD(0)
+            user32.GetWindowThreadProcessId(window, ctypes.byref(owner))
+            return owner.value not in (0, os.getpid())
+        except Exception:
+            return False
+
+    def _release_emoji(self):
+        """Close the picker, take the query keys off their tag and let the tiles go.
+        Runs when the window closes, however it closes; a second run does nothing.
+        Never raises."""
+        picker, self._picker = self._picker, None
+        tiles, self._emoji_tiles = self._emoji_tiles, None
+        tag, self._query_tag = self._query_tag, None
+        self._picker_for_query = False
+        if tag is not None:
+            # A binding on a tag outlives the widget it was made for (its command
+            # does not): each one is cleared, on the interpreter the window had.
+            for key in _QUERY_KEYS:
+                try:
+                    self.win.tk.call("bind", tag, "<%s>" % key, "")
+                except Exception:
+                    pass
+        for name, target in (("close", picker), ("release", tiles)):
+            if target is None:
+                continue
+            try:
+                getattr(target, name)()
+            except Exception as exc:
+                log.warning("ping dialog: emoji %s failed (%s)", name,
+                            type(exc).__name__)
 
     # -- the value rows ---------------------------------------------------------------------
     def _refresh_rows(self):
@@ -1180,8 +1475,11 @@ class PingDialog:
         if unix is not None:
             self._fill_when(unix)           # the same moment, shown in the other basis
         elif self.time_entry.get().strip():
-            self._when_shown = None         # nothing valid yet: read what is typed again
-            self._on_when_edit()
+            # Nothing valid yet: read what is typed again, in the new basis - and as
+            # leniently as a key release does. The radio takes no focus, so a field
+            # the user has not left is still being typed in.
+            self._when_shown = None
+            self._read_fields(lenient={"date", "time"} - self._left)
         else:
             self._prefill_date()
         self._refresh_echo()

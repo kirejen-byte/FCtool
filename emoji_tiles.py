@@ -416,15 +416,46 @@ class EmojiHooks:
     from_shortcode: object   # emoji_data.from_shortcode
 
 
+def _probe_seq() -> "str | None":
+    """The table's first entry - the sequence :func:`make_hooks` cuts to find
+    out whether the sheet is usable. None for a table that names no emoji."""
+    for _name, members in emoji_data.groups(include_tones=True):
+        for entry in members:
+            return entry.seq
+    return None
+
+
 def make_hooks(master) -> "tuple[EmojiHooks, EmojiTiles] | None":
     """Hooks drawing from the bundled pack, plus the :class:`EmojiTiles` behind
-    them (the caller ``release()``s it when its window closes); None when
-    ``emoji_data.available()`` is False.
+    them (the caller ``release()``s it when its window closes).
 
-    Loads the emoji table (that is what ``available`` means) but not the
-    sheet: nothing of it is read until the first ``hooks.image(...)``."""
-    if not emoji_data.available():
-        return None
-    tiles = EmojiTiles(master)
-    return (EmojiHooks(split=emoji_data.split, image=tiles.image,
-                       from_shortcode=emoji_data.from_shortcode), tiles)
+    None when the pack cannot DRAW: ``emoji_data.available()`` is False, or
+    the sprite sheet is missing, damaged or unreadable. A table without its
+    sheet must not hand out hooks - its owner would recognise every emoji and
+    then draw each one as text, which Tk does slowly (a picker page of 54
+    took 0.5-2 s); with no hooks the owner shows plain characters instead.
+
+    So this is where the pack is read, once, when a window that shows emoji
+    opens (nothing happens at import): the table, then the sheet, by cutting
+    ONE known tile - the table's first entry. A sheet that merely could not
+    be READ is tried again, ``_MAX_READ_ATTEMPTS`` tries in all, as
+    :meth:`EmojiTiles.image` would on later calls. The probed tile stays
+    cached. Never raises."""
+    try:
+        if not emoji_data.available():
+            return None
+        seq = _probe_seq()
+        if seq is None:
+            return None
+        tiles = EmojiTiles(master)
+        for _attempt in range(_MAX_READ_ATTEMPTS):
+            if tiles.image(seq) is not None:
+                return (EmojiHooks(split=emoji_data.split, image=tiles.image,
+                                   from_shortcode=emoji_data.from_shortcode),
+                        tiles)
+            if tiles._failed:           # the sheet is WRONG: no second try
+                break
+        tiles.release()
+    except Exception:
+        pass
+    return None
