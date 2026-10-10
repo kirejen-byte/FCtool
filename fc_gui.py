@@ -15437,17 +15437,23 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         Saved MOTD templates linked to ``old`` are re-linked only while their
         owner is certain - no other doctrine carries ``old`` or ``new`` (rename
         and new allow twins); otherwise none moves, and renaming back restores
-        every link by itself. ``shown`` (``old`` resolved to THIS doctrine, asked
-        before the rename): the composer's and the Fleet tab's combo and the
-        remembered Fleet pick follow when they held ``old``. Onto a name another
-        doctrine carries they then resolve the first match in library order -
-        the collision's own ambiguity, not settled here."""
+        every link by itself (renaming on to a THIRD name does not: they stay on
+        the dead old name). And never onto a (doctrine, template name) identity
+        a saved template already has - a deleted doctrine leaves its templates on
+        its name - that one stays on ``old`` too. ``shown`` (``old`` resolved to
+        THIS doctrine, asked before the rename): the composer's and the Fleet
+        tab's combo and the remembered Fleet pick follow when they held ``old``.
+        Onto a name another doctrine carries they then resolve the first match in
+        library order - the collision's own ambiguity, not settled here."""
         names = [(d.name or "") for d in self.fittings.list_doctrines()]
         wrote = False
         if old and old not in names and names.count(new) == 1:
-            for saved in self._saved_motds():
-                if isinstance(saved, dict) and saved.get("doctrine") == old:
+            motds = [m for m in self._saved_motds() if isinstance(m, dict)]
+            taken = [m.get("name") for m in motds if m.get("doctrine") == new]
+            for saved in motds:
+                if saved.get("doctrine") == old and saved.get("name") not in taken:
                     saved["doctrine"] = new
+                    taken.append(saved.get("name"))
                     wrote = True
         if old and shown:
             fleet = self.config.get("fleet")
