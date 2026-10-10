@@ -31,6 +31,10 @@ The rules the shell keeps:
 * **A save lands where it was loaded from.** The canvas is written under the doctrine it
   was filled for, never under whatever ``env()`` names at that moment; a changed doctrine
   is noticed by ``poll``, which saves the old one first and only then loads the new one.
+* **Nothing is saved from a canvas that is nobody's.** A load is all or nothing
+  (``_loaded``): until it has finished, and once the canvas widget is gone, ``flush``
+  writes nothing, and the next tick loads again. A question (reset, make basic) notes
+  the doctrine before it asks and does nothing if the answer comes after a change.
 * **Two timers, no more:** the one-second tick and the 400 ms save. ``close`` cancels
   both, and both do nothing once the window is gone. No variable trace is used anywhere.
 * **A typed time is read once.** Re-filling the date and time fields (a basis switch, a
@@ -41,6 +45,8 @@ Imports no ``fc_gui`` and nothing that talks to the network.
 """
 from __future__ import annotations
 
+import calendar
+import functools
 import logging
 import time
 from dataclasses import dataclass
@@ -55,10 +61,16 @@ log = logging.getLogger(__name__)
 
 _DOT = chr(0xB7)                # middle dot
 _ELLIPSIS = chr(0x2026)
+_DASH = chr(0x2014)             # em dash
 
 TITLE = "Discord ping"
 LIMIT = 2000                    # Discord's message limit, in UTF-16 units
 WARNINGS_SHOWN = 2
+#: Under the preview in "As Discord shows it" mode: it is a likeness, not Discord.
+CAPTION = ("Approximation %s times shown for your time zone; each viewer sees their own"
+           % _DASH)
+BASIC_IS_SHOWN = "This IS the basic template: doctrines without their own use it."
+MAKE_BASIC_TIP = "Copy this doctrine's template to the basic template."
 
 WHEN_NOW = "Now"
 WHEN_AT = "At a time" + _ELLIPSIS
@@ -135,29 +147,85 @@ def index_of(choices, value) -> int:
     return 0 if choices else -1
 
 
+@functools.lru_cache(maxsize=1)
+def _time_prefixes() -> frozenset:
+    """Every PROPER prefix of every time ``discord_time.parse_time`` accepts
+    (``HH:MM``, ``H:MM``, ``HHMM``) - a few hundred short strings, built once."""
+    valid = []
+    for hour in range(24):
+        for minute in range(60):
+            valid.append("%02d:%02d" % (hour, minute))
+            valid.append("%02d%02d" % (hour, minute))
+            if hour < 10:
+                valid.append("%d:%02d" % (hour, minute))
+    return frozenset(text[:cut] for text in valid for cut in range(len(text)))
+
+
+def _date_can_complete(text: str) -> bool:
+    """Is ``text`` the start of some date ``discord_time.parse_date`` accepts?"""
+    shape = "dddd-dd-dd"
+    if len(text) >= len(shape):
+        return False
+    for char, slot in zip(text, shape):
+        if (char not in "0123456789") if slot == "d" else (char != "-"):
+            return False
+    years = range(discord_time.MIN_YEAR, discord_time.MAX_YEAR + 1)
+    year, month, day = text[:4], text[5:7], text[8:10]
+    if len(year) < 4:
+        return any(str(candidate).startswith(year) for candidate in years)
+    if int(year) not in years:
+        return False
+    if len(month) < 2:
+        return any(("%02d" % candidate).startswith(month) for candidate in range(1, 13))
+    if not 1 <= int(month) <= 12:
+        return False
+    last = calendar.monthrange(int(year), int(month))[1]
+    return any(("%02d" % candidate).startswith(day) for candidate in range(1, last + 1))
+
+
+def incomplete(field: str, text) -> bool:
+    """Could ``text`` still BECOME a valid entry of ``field`` (``"date"`` / ``"time"``)
+    by typing more? ``""`` and ``19:`` could; ``25`` and ``2026-13`` never will. (Asked
+    only about an entry that is not valid as it stands.)"""
+    text = _clean(text)
+    if field == "time":
+        return text in _time_prefixes()
+    return field == "date" and _date_can_complete(text)
+
+
 @dataclass(frozen=True)
 class WhenEntry:
     """What the typed date and time came to. ``unix`` is None when they cannot be used;
     ``bad`` then names the field(s) at fault (``"date"`` / ``"time"``) and ``message``
-    says why, in ``discord_time``'s own words."""
+    says why, in ``discord_time``'s own words. ``waiting``: a field that is only
+    half-typed was let off (``read_when``'s ``lenient``), so the verdict is not final."""
     unix: "int | None"
     bad: tuple
     message: str
+    waiting: bool = False
 
 
-def read_when(date_text, time_text, basis, *, local_to_utc=None) -> WhenEntry:
+def read_when(date_text, time_text, basis, *, local_to_utc=None, lenient=()) -> WhenEntry:
     """Read the two typed fields. Never raises: ``discord_time`` only ever raises
-    ``ValueError``, and each one becomes a ``WhenEntry`` that names its field."""
-    bad, messages = [], []
+    ``ValueError``, and each one becomes a ``WhenEntry`` that names its field.
+
+    ``lenient`` names the fields still being typed: an entry there that is merely
+    ``incomplete`` is not counted as bad (one that can no longer become valid is)."""
+    bad, messages, waiting = [], [], False
     for field, parse, text in (("date", discord_time.parse_date, date_text),
                                ("time", discord_time.parse_time, time_text)):
         try:
             parse(text)
         except ValueError as exc:
+            if field in lenient and incomplete(field, text):
+                waiting = True
+                continue
             bad.append(field)
             messages.append(str(exc))
     if bad:
-        return WhenEntry(None, tuple(bad), messages[0])
+        return WhenEntry(None, tuple(bad), messages[0], waiting)
+    if waiting:
+        return WhenEntry(None, (), "", True)
     try:
         unix = discord_time.to_unix(date_text, time_text, basis, local_to_utc=local_to_utc)
     except ValueError as exc:               # the two fields are fine; together they are not
@@ -201,6 +269,15 @@ def reset_wording(doctrine_id) -> tuple:
                 "Throw away your basic template and go back to the built-in one?")
     return ("Reset to basic", "Reset this doctrine's template",
             "Throw away this doctrine's own template? It will use the basic template again.")
+
+
+def reset_tip(doctrine_id, has_own: bool) -> str:
+    """The reset button's tooltip; with nothing to reset it says why the button is off."""
+    if has_own:
+        return reset_wording(doctrine_id)[2].split("?")[0] + "."
+    if doctrine_key(doctrine_id) is None:
+        return "Nothing to reset: the built-in basic template is in use."
+    return "Nothing to reset: this doctrine uses the basic template."
 
 
 def make_basic_message(count) -> str:
@@ -347,11 +424,14 @@ class PingDialog:
         self._closed = False
         self._env = ping_compose.Env(None, "", "", "")
         self._doctrine_id = None            # the doctrine the canvas was LOADED for
+        self._loaded = False                # False while a load is unfinished or failed
         self._values = ping_doc.PingValues()
         self._now_seen = 0
         self._tick_id = None                # the two timers: at most one of each pending
         self._save_id = None
-        self._tick_failed = False
+        self._tick_failed = False           # each failure is logged once per window
+        self._env_failed = False
+        self._buttons_shown = None
         self._last_json = self._baseline = []
         self._inheriting = True
         self._rows_key = None
@@ -362,7 +442,8 @@ class PingDialog:
         self._at_time = False
         self._basis = "eve"
         self._when_seen = None              # when.unix as this window last showed it
-        self._when_shown = None             # (date, time, basis) last read or filled in
+        self._when_shown = None             # (date, time, basis) last settled or filled in
+        self._left = set()                  # the time fields the user has typed in and left
         self._bad = ()
         self._text_entry = None             # the Doctrine text field, while it is open
         self._editor = None                 # the one list editor
@@ -370,6 +451,7 @@ class PingDialog:
         self.pencils = {}
         self.pill_buttons = {}
         self.quick_buttons = {}
+        self.basis_buttons = {}
         self.mode_buttons = {}
 
         self.win = tk.Toplevel(parent)
@@ -472,9 +554,10 @@ class PingDialog:
         self.date_entry.pack(side=tk.LEFT)
         self.time_entry = _entry(top, 5)
         self.time_entry.pack(side=tk.LEFT, padx=(3, 0))
-        for entry in (self.date_entry, self.time_entry):
-            for sequence in ("<KeyRelease>", "<FocusOut>", "<Return>"):
-                entry.bind(sequence, self._on_when_edit, add="+")
+        for name, entry in (("date", self.date_entry), ("time", self.time_entry)):
+            entry.bind("<KeyRelease>", lambda _e, f=name: self._on_when_typed(f), add="+")
+            entry.bind("<FocusOut>", lambda _e, f=name: self._on_when_left(f), add="+")
+            entry.bind("<Return>", self._on_when_edit, add="+")
         for text, minutes in QUICK:
             button = _mini_button(top, text, lambda m=minutes: self._on_quick(m),
                                   font=_SMALL)
@@ -484,8 +567,9 @@ class PingDialog:
         basis.pack(fill=tk.X)
         self._basis_var = tk.StringVar(frame, value=self._basis)
         for value, text in BASIS_LABELS:
-            _radio(basis, text, value, self._basis_var, self._on_basis).pack(
-                side=tk.LEFT, padx=(0, 8))
+            button = _radio(basis, text, value, self._basis_var, self._on_basis)
+            button.pack(side=tk.LEFT, padx=(0, 8))
+            self.basis_buttons[value] = button
         self.format_combo = ttk.Combobox(
             frame, state="readonly", font=_FONT, width=12,
             values=[discord_time.PRESET_LABELS[p] for p in discord_time.PRESETS])
@@ -530,6 +614,10 @@ class PingDialog:
         self.preview = DiscordPreview(frame, utc_to_local=self._utc_to_local)
         self.preview.text.configure(height=3)   # a request; the row stretches it
         self.preview.pack(fill=tk.BOTH, expand=True, pady=(2, 0))
+        # Shown in the Discord view only (_on_mode); width=1: it never sets the width.
+        self.caption_label = _label(frame, CAPTION, font=_SMALL, fg=FG_DIM, anchor=tk.W,
+                                    width=1)
+        self.caption_label.pack(fill=tk.X)
         self.warning_label = _label(frame, font=_SMALL, anchor=tk.W, width=1,
                                     fg=_dimmed(frame, FG_YELLOW, BG_DARK))
         self.warning_label.pack(fill=tk.X)
@@ -549,6 +637,7 @@ class PingDialog:
         self.basic_button = ttk.Button(row, text="Make this my basic template",
                                        style="Dark.TButton", command=self._on_make_basic)
         self.basic_button.pack(side=tk.LEFT, padx=(6, 0))
+        attach_tooltip(self.basic_button, MAKE_BASIC_TIP)
         self.close_button = ttk.Button(row, text="Close", style="Dark.TButton",
                                        command=self.close)
         self.close_button.pack(side=tk.RIGHT)
@@ -581,8 +670,8 @@ class PingDialog:
         if not self.alive():
             return
         env = self._read_env()
-        if doctrine_key(env.doctrine_id) != self._doctrine_id:
-            self.flush()
+        if not self._loaded or doctrine_key(env.doctrine_id) != self._doctrine_id:
+            self.flush()                    # (refuses while nothing is loaded)
             self._load(env)
             return
         self._env = env
@@ -593,26 +682,34 @@ class PingDialog:
         self._refresh()
 
     def flush(self) -> None:
-        """Store the template now if it changed (``save_action``); stops the save timer."""
+        """Store the template now if it changed (``save_action``); stops the save timer.
+
+        Writes NOTHING unless the canvas really holds a loaded doctrine: a load that did
+        not finish leaves a canvas that belongs to no id, and a canvas whose Text has
+        been destroyed answers an EMPTY document - storing either would wreck a template.
+        """
         self._cancel("_save_id")
-        if not self.alive():
+        if not self.alive() or not self._canvas_alive():
             return
-        try:
-            cur = doc_to_json(self.canvas.get_doc())
-        except tk.TclError:
+        if not self._loaded:
+            self._show_saved(_NOT_SAVED)
             return
+        key = self._doctrine_id
+        cur = doc_to_json(self.canvas.get_doc())
         action = KEEP
         if cur != self._last_json:
             action = save_action(cur, self._last_json, self._baseline, self._inheriting,
-                                 self._has_own())
+                                 self._has_own(key))
         done = True
         if action == WRITE:
-            done = self._write(self._store.set_template, self._doctrine_id, cur)
+            done = self._write(self._store.set_template, key, cur)
         elif action == DROP:
-            done = self._write(self._store.reset_template, self._doctrine_id)
+            done = self._write(self._store.reset_template, key)
         if done:
             self._last_json = cur
         self._show_saved(_SAVED if done else _NOT_SAVED)
+        if action != KEEP:
+            self._refresh_buttons()         # there is, or is no longer, a copy to reset
 
     def focus_field(self, kind: str) -> None:
         if not self.alive():
@@ -635,11 +732,13 @@ class PingDialog:
     def close(self) -> None:
         if self._closed:
             return
-        try:
-            self._commit_doctrine_text()    # a text still being typed is stored too
-            self.flush()
-        except Exception:
-            log.warning("ping dialog: could not save on close", exc_info=True)
+        # Two guards, not one: a text commit that fails must not cost the template.
+        for save in (self._commit_doctrine_text,    # a text still being typed
+                     self.flush):                   # a template edit still pending
+            try:
+                save()
+            except Exception:
+                log.warning("ping dialog: could not save on close", exc_info=True)
         self._closed = True
         self._cancel("_tick_id")
         self._cancel("_save_id")
@@ -680,14 +779,26 @@ class PingDialog:
         self._tick_id = None
         if not self.alive():
             return
+        self._sync()                        # the tick never raises, and never stops
+        if self.alive():
+            self._arm_tick()
+
+    def _sync(self) -> bool:
+        """``poll`` for the window's own callbacks: nothing escapes into Tk (a failure is
+        logged once per window). True when a doctrine is loaded afterwards."""
         try:
             self.poll()
-        except Exception:                   # the tick never raises, and never stops
+        except Exception:
             if not self._tick_failed:
                 self._tick_failed = True
                 log.warning("ping dialog: the tick failed", exc_info=True)
-        if self.alive():
-            self._arm_tick()
+        return self._loaded and self.alive()
+
+    def _canvas_alive(self) -> bool:
+        try:
+            return bool(self.canvas.text.winfo_exists())
+        except tk.TclError:
+            return False
 
     def _arm_save(self):
         self._cancel("_save_id")
@@ -703,7 +814,9 @@ class PingDialog:
         try:
             env = self._env_fn()
         except Exception:
-            log.warning("ping dialog: env() failed", exc_info=True)
+            if not self._env_failed:        # once per window, not once per tick
+                self._env_failed = True
+                log.warning("ping dialog: env() failed", exc_info=True)
             return self._env
         return self._env if env is None else env
 
@@ -714,12 +827,16 @@ class PingDialog:
             pass                            # keep the last reading
         return self._now_seen
 
-    def _has_own(self) -> bool:
-        """Does the loaded doctrine have a template of its own in the store right now?
+    def _has_own(self, key) -> bool:
+        """Does doctrine ``key`` have a template of its own in the store right now?
         With no doctrine: is there a basic template (as against the built-in one)?"""
-        if self._doctrine_id is None:
+        if key is None:
             return self._store.template(None) is not None
-        return bool(self._store.has_own_template(self._doctrine_id))
+        return bool(self._store.has_own_template(key))
+
+    def _still(self, key) -> bool:
+        """Is the window still showing the doctrine it showed when a question was asked?"""
+        return self.alive() and self._loaded and self._doctrine_id == key
 
     def _write(self, call, *args) -> bool:
         try:
@@ -743,20 +860,35 @@ class PingDialog:
         """Show ``env``'s doctrine: its template (a silent load) and its picks. Whoever
         wants a pending edit kept calls ``flush`` first; a load throws it away."""
         self._cancel("_save_id")
-        self._env = env
-        self._doctrine_id = doctrine_key(env.doctrine_id)
+        # All or nothing. Until the last step below the window counts as NOT loaded:
+        # flush() refuses, and the next tick loads again. Were the id set first and
+        # set_doc then failed, the old canvas would be saved under the new doctrine.
+        self._loaded = False
+        key = doctrine_key(env.doctrine_id)
         self.canvas.set_doc(ping_compose.template_for(self._store, env))
-        self._rebase(doc_to_json(self.canvas.get_doc()))
+        cur = doc_to_json(self.canvas.get_doc())
+        inheriting = not self._has_own(key)
+        self._env, self._doctrine_id = env, key
+        self._last_json = self._baseline = cur
+        self._inheriting = inheriting
+        self._loaded = True
         self._show_saved(_SAVED)
         self._rows_key = self._preview_key = None
         self._refresh_rows()
         self._refresh_echo()
         self._refresh()
 
+    def _reload(self):
+        """Load the shown doctrine again, from a button: a failure is the tick's to retry."""
+        try:
+            self._load(self._env)
+        except Exception:
+            log.warning("ping dialog: could not reload the template", exc_info=True)
+
     def _rebase(self, cur):
         """``cur`` (canvas output) is now what is loaded: later saves compare with it."""
         self._last_json = self._baseline = cur
-        self._inheriting = not self._has_own()
+        self._inheriting = not self._has_own(self._doctrine_id)
 
     def _show_saved(self, state):
         try:
@@ -788,8 +920,11 @@ class PingDialog:
 
     # -- the value rows ---------------------------------------------------------------------
     def _refresh_rows(self):
-        """Fill the rows from the store and the environment - only when one changed."""
+        """Fill the rows from the store and the environment - only when one changed.
+        The rows always show what is STORED; a pick the store did not take is undone
+        here (``_on_pick`` forgets the key to force it)."""
         env, store, key = self._env, self._store, self._doctrine_id
+        self._refresh_buttons()
         picks = store.picks(key)
         lists = {kind: store.items(kind) for kind in LIST_KINDS}
         text = store.text("doctrine_text")
@@ -798,7 +933,7 @@ class PingDialog:
                  text, preset)
         if state == self._rows_key:
             return
-        self._rows_key = state
+        self._rows_key = None               # set again only once every row is filled
         self.win.title(title_for(env))
         fc = _clean(env.fc_name)
         self.fc_label.configure(text=fc or NO_FC, fg=FG_WHITE if fc else FG_DIM)
@@ -809,9 +944,23 @@ class PingDialog:
         self._fill("comms", [(i, i) for i in lists["comms"]], picks.comms)
         if preset in discord_time.PRESETS:
             self.format_combo.current(discord_time.PRESETS.index(preset))
-        label, _title, message = reset_wording(key)
-        self.reset_button.configure(text=label)
-        update_tooltip(self.reset_button, message.split("?")[0] + ".")
+        self.reset_button.configure(text=reset_wording(key)[0])
+        self._rows_key = state
+
+    def _refresh_buttons(self):
+        """Reset is on only while there is something to reset; "make this my basic
+        template" only for a doctrine (with none selected the canvas IS the basic one)."""
+        key = self._doctrine_id
+        state = (key is None, self._has_own(key))
+        if state == self._buttons_shown:
+            return
+        basic_shown, has_own = state
+        self.reset_button.configure(state=tk.NORMAL if has_own else tk.DISABLED)
+        update_tooltip(self.reset_button, reset_tip(key, has_own))
+        self.basic_button.configure(state=tk.DISABLED if basic_shown else tk.NORMAL)
+        update_tooltip(self.basic_button,
+                       BASIC_IS_SHOWN if basic_shown else MAKE_BASIC_TIP)
+        self._buttons_shown = state
 
     def _fill(self, field, choices, value):
         combo = self.combos[field]
@@ -838,7 +987,8 @@ class PingDialog:
         choices = self._choices.get(field) or []
         if 0 <= index < len(choices):
             self._write(self._store.set_pick, self._doctrine_id, field, choices[index][1])
-        self.poll()
+        self._rows_key = None               # show what the store holds, taken or not
+        self._sync()
 
     def _on_pencil(self, kind):
         if kind == "doctrine":
@@ -875,7 +1025,7 @@ class PingDialog:
         self._end_doctrine_text()
         if value is not None:
             self._write(self._store.set_text, "doctrine_text", value)
-        self.poll()
+        self._sync()
 
     def _end_doctrine_text(self):
         entry, self._text_entry = self._text_entry, None
@@ -897,7 +1047,7 @@ class PingDialog:
         self._editor = _ListEditor(self, kind)
 
     def _list_changed(self):
-        self.poll()
+        self._sync()
 
     def _completions(self) -> list:
         try:
@@ -942,11 +1092,12 @@ class PingDialog:
 
     def _set_fields(self, date_text, time_text):
         """Put text in the two fields WITHOUT it being read back: what is shown is
-        remembered, and ``_on_when_edit`` only reads fields that differ from it."""
+        remembered, and ``_read_fields`` only reads fields that differ from it."""
         for entry, text in ((self.date_entry, date_text), (self.time_entry, time_text)):
             entry.delete(0, tk.END)
             entry.insert(0, text)
         self._when_shown = (date_text, time_text, self._basis)
+        self._left = set()                  # nothing in them has been typed by the user
         self._set_bad(())
 
     def _fill_when(self, unix) -> bool:
@@ -975,19 +1126,45 @@ class PingDialog:
             entry.configure(highlightbackground=FG_RED if wrong else BORDER_COLOR,
                             highlightcolor=FG_RED if wrong else FG_ACCENT)
 
+    # A field is outlined when what it holds is WRONG - not while it is only half-typed.
+    # Half-typed is forgiven in the field being typed in and in a field the user has not
+    # been through yet; once a field is left (or Enter is pressed) it is judged as it
+    # stands. An entry that can no longer become valid is outlined at once.
+    def _on_when_typed(self, field):
+        """A key was released in the date or the time field."""
+        self._read_fields(lenient={field} | ({"date", "time"} - self._left))
+
+    def _on_when_left(self, field):
+        """The date or the time field lost the focus. A field that was only passed
+        through (it still holds what was last settled or filled in) is not judged."""
+        entry, index = ((self.date_entry, 0) if field == "date" else (self.time_entry, 1))
+        if self._when_shown is None or entry.get() != self._when_shown[index]:
+            self._left.add(field)
+        self._read_fields(lenient={"date", "time"} - self._left)
+
     def _on_when_edit(self, _event=None):
-        """The date or time field was typed in (or left). A usable entry becomes the
-        pending time; a bad one is outlined and explained, and the time stays as it was."""
+        """Enter in either field (and every read asked for from code): both fields are
+        judged as they stand."""
+        self._left.update(("date", "time"))
+        self._read_fields()
+
+    def _read_fields(self, lenient=()):
+        """Read the two fields if they changed. A usable entry becomes the pending time
+        at once; a bad one is outlined and explained, and the time stays as it was."""
         if not self.alive() or not self._at_time:
             return
         shown = (self.date_entry.get(), self.time_entry.get(), self._basis)
         if shown == self._when_shown:
-            return                          # nothing typed since it was read or filled in
-        self._when_shown = shown
-        entry = read_when(*shown, local_to_utc=self._local_to_utc)
+            return                          # nothing typed since it was settled or filled in
+        entry = read_when(*shown, local_to_utc=self._local_to_utc, lenient=lenient)
+        if not entry.waiting:
+            self._when_shown = shown        # settled; a half-typed entry is read again
         self._set_bad(entry.bad)
         if entry.unix is None:
-            self._echo(entry.message, FG_RED)
+            if entry.bad:
+                self._echo(entry.message, FG_RED)
+            else:
+                self._refresh_echo()        # nothing is wrong yet: the time in force
             return
         self._when.set(entry.unix)
         self._when_seen = entry.unix
@@ -1031,7 +1208,8 @@ class PingDialog:
             pass
         if 0 <= index < len(discord_time.PRESETS):
             self._write(self._store.set_when_format, discord_time.PRESETS[index])
-        self.poll()
+        self._rows_key = None               # show what the store holds, taken or not
+        self._sync()
 
     def _echo(self, text, colour):
         if (text, colour) != self._echo_shown:
@@ -1060,8 +1238,8 @@ class PingDialog:
     def _refresh(self):
         """Compose the ping as it would be copied; bring the chips, the warning line and -
         only when the text or the minute changed - the preview up to date."""
-        if not self.alive():
-            return
+        if not self.alive() or not self._loaded or not self._canvas_alive():
+            return                          # nothing trustworthy to compose from
         now = self._now()
         try:
             composed = ping_compose.compose(self._store, self._env, self._when.unix, now,
@@ -1086,8 +1264,13 @@ class PingDialog:
             self.warning_label.configure(text=text)
 
     def _on_mode(self):
+        mode = self._mode_var.get()
         try:
-            self.preview.set_mode(self._mode_var.get())
+            self.preview.set_mode(mode)
+            if mode == MODE_RENDERED:       # the caption belongs to the likeness only
+                self.caption_label.pack(fill=tk.X, before=self.warning_label)
+            else:
+                self.caption_label.pack_forget()
         except (ValueError, tk.TclError):
             pass
 
@@ -1095,27 +1278,38 @@ class PingDialog:
     def _on_copy(self):
         """Copy ping: bring the window up to date, store the template, then hand over to
         the app's ONE copy routine. No clipboard work happens here."""
-        self.poll()
+        self._sync()
         self.flush()
         try:
             self._copy()
         except Exception:
             log.warning("ping dialog: copy() failed", exc_info=True)
 
+    # Both questions below can stay up for a while, and the timers keep running under
+    # them: the doctrine is noted BEFORE asking, and an answer that arrives after the
+    # window moved on to another doctrine does nothing.
     def _on_reset(self):
-        self.poll()
-        _label_text, title, message = reset_wording(self._doctrine_id)
-        if not self._ask(title, message) or not self.alive():
+        if not self._sync():
             return
-        self._write(self._store.reset_template, self._doctrine_id)
-        self._load(self._env)               # (drops a pending edit with the template)
+        key = self._doctrine_id
+        if not self._has_own(key):
+            return                          # nothing to reset (the button is off)
+        _label_text, title, message = reset_wording(key)
+        if not self._ask(title, message) or not self._still(key):
+            return
+        self._write(self._store.reset_template, key)
+        self._reload()                      # (drops a pending edit with the template)
 
     def _on_make_basic(self):
-        self.poll()
+        if not self._sync():
+            return
+        key = self._doctrine_id
+        if key is None:
+            return                          # the canvas IS the basic template (button off)
         self.flush()
         if not self._ask("Basic template", make_basic_message(self._inheriting_count())):
             return
-        if not self.alive():
+        if not self._still(key):
             return
         cur = doc_to_json(self.canvas.get_doc())
         if self._write(self._store.make_basic, cur):
@@ -1175,6 +1369,9 @@ class _ListEditor:
         self.entry.pack(side=tk.LEFT)
         # add="+": the autocomplete entry has its own <Return> (take the suggestion).
         self.entry.bind("<Return>", lambda _e: self.add(), add="+")
+        # NOT add="+": this replaces the autocomplete entry's own <Escape>, which closed
+        # the suggestions and then let the same key close the whole editor.
+        self.entry.bind("<Escape>", self._on_escape)
         for name, command in (("Add", self.add), ("Rename", self.rename)):
             self.buttons[name] = _mini_button(row, name, command)
             self.buttons[name].pack(side=tk.LEFT, padx=(4, 0))
@@ -1210,6 +1407,26 @@ class _ListEditor:
             self.win.destroy()
         except tk.TclError:
             pass
+
+    def suggesting(self) -> bool:
+        """Is the entry's suggestion list up? (Only the Locations entry has one.)"""
+        return getattr(self.entry, "_listbox", None) is not None
+
+    def _close_suggestions(self):
+        closer = getattr(self.entry, "_close_dropdown", None)
+        if callable(closer):
+            try:
+                closer()
+            except tk.TclError:
+                pass
+
+    def _on_escape(self, _event=None):
+        """Escape in the entry: the first one closes the suggestions and stops there;
+        with none showing it goes on to the window, which closes the editor."""
+        if self.suggesting():
+            self._close_suggestions()
+            return "break"
+        return None
 
     def items(self) -> list:
         return self._owner._store.items(self.kind)
@@ -1253,6 +1470,9 @@ class _ListEditor:
         self._owner._list_changed()
 
     def add(self) -> None:
+        # The suggestions go first: left up, the next Enter would add whichever system
+        # happened to be highlighted in them.
+        self._close_suggestions()
         text = self.entry.get().strip()
         items = self.items()
         if not text:
