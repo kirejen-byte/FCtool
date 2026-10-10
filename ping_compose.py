@@ -27,13 +27,16 @@ from discord_time import eve_label, format_when
 from ping_store import STAGING
 
 __all__ = ["Env", "Composed", "WhenSession", "values_for", "template_for", "compose",
-           "summary"]
+           "summary", "tooltip_text"]
 
 _DASH = chr(0x2014)          # em dash, built at runtime: the source stays pure ASCII
 _DOT = chr(0xB7)             # middle dot
+_ELLIPSIS = chr(0x2026)
 _NAME_MODE = "name"          # the doctrine pick that shows the doctrine's own name
 
 _NOTHING_TO_COPY = "Nothing to copy %s the template is empty" % _DASH
+_WHEN_RESETS = "When resets to Now after this copy"
+TOOLTIP_LINE_CHARS = 80      # the widest line a tooltip shows before it is cut
 
 
 @dataclass(frozen=True)
@@ -159,3 +162,26 @@ def summary(composed: Composed, *, consumed_when, now_unix: int) -> tuple:
         parts.append("1 more warning" if more == 1 else "%d more warnings" % more)
         level = "warn"
     return "Ping copied %s %s" % (_DASH, separator.join(parts)), level
+
+
+def _cut(text: str, limit: int) -> str:
+    """``text`` in at most ``limit`` characters (at least one); a cut ends in an ellipsis."""
+    limit = max(1, limit)
+    return text if len(text) <= limit else text[:limit - 1] + _ELLIPSIS
+
+
+def tooltip_text(composed: Composed, *, pending: bool, max_lines: int = 14,
+                 max_chars: int = 600) -> str:
+    """What the one-click button's tooltip shows: the ping a click would copy, bounded.
+
+    The first ``max_lines`` lines, each cut to ``TOOLTIP_LINE_CHARS``, the whole then cut
+    to ``max_chars``; every cut ends in an ellipsis. With ``pending`` (a time is set and
+    this copy will use it up) one more line says so, after the cut - it is never lost.
+    An empty ping is its own sentence and resets nothing, so it gets no such line.
+    """
+    text = composed.text if isinstance(composed.text, str) else ""
+    if not text:
+        return _NOTHING_TO_COPY
+    lines = [_cut(line, TOOLTIP_LINE_CHARS) for line in text.splitlines()[:max(1, max_lines)]]
+    shown = _cut("\n".join(lines), max_chars)
+    return shown + "\n" + _WHEN_RESETS if pending else shown
