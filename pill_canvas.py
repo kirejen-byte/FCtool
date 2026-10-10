@@ -118,7 +118,10 @@ def _post_menu_at(menu, x_root, y_root) -> None:
 # "-" and "+" start an index modifier.
 _EMOJI_NAME = "emoji:"
 _EMOJI_MARK = "pc_emoji"            # scratch mark: where the next piece is drawn
-_KEY_NOT_TYPING = 0x4 | 0x20000     # Tk state bits: Control, Alt (Windows)
+_EMOJI_WINDOW = 24                  # most elements one re-cluster looks back over
+_ZWJ = chr(0x200D)
+# Tk state bits that mean "not typing" (Control, Alt) - the one shared definition.
+_KEY_NOT_TYPING = markup_editor.KEY_NOT_TYPING
 
 
 def _emoji_name(seq: str) -> str:
@@ -176,13 +179,18 @@ class PillCanvas(MarkupEditor):
       (:data:`PARAM_EDITOR_KINDS`): double-click, Return with the caret against
       the selected pill, or the chip menu's Edit entry. Replaces the read-only
       info window for those kinds; kinds WITH an editor are unaffected.
+    * ``param_editors=False`` - NO kind opens a built-in parameter editor (it
+      takes a Tk grab): every activation goes to ``on_pill_activate``, or does
+      nothing when there is none, and a freshly inserted incomplete pill is not
+      prompted for.
     * ``emoji`` - a provider with ``split(text) -> [(is_emoji, chunk), ...]``
       (lossless), ``image(seq) -> PhotoImage | None`` and
       ``from_shortcode(name) -> str | None`` (duck-typed; this module imports
       no emoji module). Each sequence that has an image is drawn as ONE inline
       image, typed pieces are re-clustered, and a typed ``:name:`` converts.
       The MODEL does not change - an emoji is still plain characters in a
-      ``TextRun``. See the ``emoji`` section near the end of the class.
+      ``TextRun``. A falsy value (None, False) means no provider. See the
+      ``emoji`` section near the end of the class.
     """
 
     def __init__(self, master, resolve_label: Callable,
@@ -197,6 +205,7 @@ class PillCanvas(MarkupEditor):
                  style_toolbar: bool = True,
                  kind_glyphs: dict | None = None,
                  on_pill_activate: Callable[[str, dict], None] | None = None,
+                 param_editors: bool = True,
                  emoji=None,
                  **kw):
         super().__init__(master, height=height, on_change=on_change,
@@ -211,11 +220,15 @@ class PillCanvas(MarkupEditor):
         # Opt-in host seams. Empty overlay + no callback = the MOTD composer.
         self._kind_glyphs = dict(kind_glyphs or {})
         self._on_pill_activate = on_pill_activate
-        # The emoji provider (None = no emoji code runs), the images this canvas
-        # has embedded (sequence -> PhotoImage, kept referenced) and the
-        # post-class bindtag of the typed path.
-        self._emoji = emoji
+        self._param_editors = param_editors
+        # The emoji provider (None = no emoji code runs; any falsy argument is
+        # None), the images this canvas has embedded (image NAME -> PhotoImage,
+        # kept referenced), the sequences Tk refused to embed, whether a
+        # provider fault has been logged, and the typed path's post-class bindtag.
+        self._emoji = emoji or None
         self._emoji_imgs: dict = {}
+        self._emoji_bad: set = set()
+        self._emoji_logged = False
         self._emoji_tag = None
 
         # name (embedded-window pathname) -> TokenRun / chip Frame
@@ -223,7 +236,8 @@ class PillCanvas(MarkupEditor):
         self._pill_frames: dict = {}
         self._selected_pill = None
 
-        # Own undo/redo: each entry is (doc_json, caret_index).
+        # Own undo/redo: each entry is (doc_json, caret) - the caret a Tk index,
+        # or with an emoji provider a count of model characters (_emoji_caret).
         self._undo_stack: list = []
         self._redo_stack: list = []
         self._burst_open = False           # a text-typing burst is in progress
@@ -252,7 +266,7 @@ class PillCanvas(MarkupEditor):
 
         self._add_undo_buttons()
         self._bind_canvas_events()
-        if emoji is not None:
+        if self._emoji is not None:
             self._emoji_bind()
 
     # ── construction ────────────────────────────────────────────────────────
@@ -602,13 +616,15 @@ class PillCanvas(MarkupEditor):
         item (``kind="channel"``) or a ``channel_line`` that already carries a
         name is complete and never prompts. Document-load paths (``set_doc`` /
         undo / redo / paste) go through ``_rebuild`` / ``_insert_runs_at_caret``,
-        not here, so they never prompt."""
+        not here, so they never prompt. Nor does a canvas built with
+        ``param_editors=False``: it opens no built-in editor at all."""
         if name is None:
             return
         run = self._pills.get(name)
         if run is None:
             return
-        if run.kind == "channel_line" and not (run.params or {}).get("name"):
+        if (run.kind == "channel_line" and not (run.params or {}).get("name")
+                and self._param_editors):
             self._open_param_editor(name, fresh_insert=True)
 
     def _cancel_fresh_insert(self, name) -> None:
@@ -731,6 +747,10 @@ class PillCanvas(MarkupEditor):
             caret = self.text.index("insert")
         except tk.TclError:
             caret = "1.0"
+        if self._emoji is not None:
+            # A Tk index does not survive a rebuild that regroups emoji: the
+            # caret travels as a count of MODEL characters instead.
+            caret = self._emoji_caret()
         return (doc_to_json(self.get_doc()), caret)
 
     def _push_undo(self, cap):
@@ -749,6 +769,8 @@ class PillCanvas(MarkupEditor):
     def _rebuild_from_capture(self, cap):
         doc_json, caret = cap
         self._rebuild(doc_from_json(doc_json))
+        if self._emoji is not None:
+            caret = self._emoji_caret_index(caret)
         try:
             self.text.mark_set("insert", caret)
             self.text.see("insert")
@@ -854,7 +876,7 @@ class PillCanvas(MarkupEditor):
     def _is_printable_insert(event) -> bool:
         return (bool(event.char) and len(event.char) == 1
                 and event.char.isprintable()
-                and not (event.state & (0x4 | 0x8 | 0x20000)))
+                and not (event.state & _KEY_NOT_TYPING))
 
     def _on_keypress(self, event):
         ks = event.keysym
@@ -1024,7 +1046,12 @@ class PillCanvas(MarkupEditor):
         ``(kind, dict(params))`` - a copy, so the host cannot edit the document
         through it - and no window is opened; every other pill still gets its
         editor. A raising callback is logged, never propagated into the Tk
-        binding (the ``on_trigger`` precedent)."""
+        binding (the ``on_trigger`` precedent).
+
+        Built with ``param_editors=False`` the canvas opens NO editor: every
+        kind goes to the callback, and with no callback nothing happens."""
+        if not self._param_editors:
+            return self._activate_without_editor(name)
         callback = self._on_pill_activate
         if callback is not None:
             run = self._pills.get(name)
@@ -1035,6 +1062,17 @@ class PillCanvas(MarkupEditor):
                     _LOG.exception("on_pill_activate callback raised")
                 return None
         return self._open_param_editor(name)
+
+    def _activate_without_editor(self, name):
+        """:meth:`_activate_pill` for a ``param_editors=False`` canvas."""
+        callback = self._on_pill_activate
+        run = self._pills.get(name)
+        if callback is not None and run is not None:
+            try:
+                callback(run.kind, dict(run.params or {}))
+            except Exception:
+                _LOG.exception("on_pill_activate callback raised")
+        return None
 
     def _chip_double(self, event, name):
         self._chip_drag = None
@@ -1542,13 +1580,15 @@ class PillCanvas(MarkupEditor):
         merged. A provider that raises, or whose split is not lossless, costs
         the pictures and never a character: the text comes back as one chunk."""
         provider = self._emoji
+        bad = self._emoji_bad
         try:
-            pieces = [(provider.image(chunk) if is_emoji else None, chunk)
+            pieces = [(provider.image(chunk)
+                       if is_emoji and chunk not in bad else None, chunk)
                       for is_emoji, chunk in provider.split(text)]
             if "".join(chunk for _img, chunk in pieces) != text:
                 raise ValueError("emoji split lost or changed text")
         except Exception:
-            _LOG.exception("emoji provider failed; text kept as characters")
+            self._emoji_fault("emoji provider failed; text kept as characters")
             return [(None, text)] if text else []
         out: list = []
         for img, chunk in pieces:
@@ -1557,6 +1597,13 @@ class PillCanvas(MarkupEditor):
             elif chunk:
                 out.append((img, chunk))
         return out
+
+    def _emoji_fault(self, message):
+        """Log a provider fault ONCE per canvas (it would otherwise repeat on
+        every key press). Call from inside the ``except`` block."""
+        if not self._emoji_logged:
+            self._emoji_logged = True
+            _LOG.exception(message)
 
     def _emoji_draw(self, index, text, tags=None, pieces=None):
         """Insert ``text`` at ``index``, each emoji that has a tile as an image.
@@ -1568,14 +1615,26 @@ class PillCanvas(MarkupEditor):
             # would not follow what is inserted.
             t.mark_set(_EMOJI_MARK, "end-1c")
         for img, chunk in (self._emoji_pieces(text) if pieces is None else pieces):
+            if img is not None:
+                try:
+                    name = t.image_create(_EMOJI_MARK, image=img,
+                                          name=_emoji_name(chunk))
+                except tk.TclError:
+                    # Not an image Tk will embed: this sequence is text from
+                    # now on - never a raise that truncates the document.
+                    self._emoji_bad.add(chunk)
+                    self._emoji_fault("emoji image refused by Tk; drawn as text")
+                    img = None
             if img is None:
                 if tags is None:
                     t.insert(_EMOJI_MARK, chunk)
                 else:
                     t.insert(_EMOJI_MARK, chunk, tags)
                 continue
-            self._emoji_imgs[chunk] = img       # Tk shows a collected image blank
-            t.image_create(_EMOJI_MARK, image=img, name=_emoji_name(chunk))
+            # Keyed by the element's own name (Tk's "#N" included): a provider
+            # may answer a new object per call, and Tk shows a collected image
+            # blank.
+            self._emoji_imgs[name] = img
             if tags is not None:                # an image takes the tags AROUND it
                 at = t.index(_EMOJI_MARK + "-1c")
                 for tag in t.tag_names(at):
@@ -1583,6 +1642,50 @@ class PillCanvas(MarkupEditor):
                         t.tag_remove(tag, at)
                 for tag in tags:
                     t.tag_add(tag, at)
+
+    def _emoji_caret(self) -> int:
+        """The caret as a count of MODEL characters before it (a pill = 1)."""
+        count = 0
+        try:
+            for key, value, _index in self.text.dump(
+                    "1.0", "insert", text=True, window=True, image=True):
+                if key == "text":
+                    count += len(value)
+                elif key == "window":
+                    count += 1
+                else:
+                    count += len(_emoji_seq(value) or "")
+        except tk.TclError:
+            pass
+        return count
+
+    def _emoji_caret_index(self, count) -> str:
+        """The Tk index that has ``count`` model characters before it in the
+        widget AS IT IS NOW - always an element boundary, so the insert mark is
+        never put between the two halves of a raw astral character (a mark
+        there makes ``get_doc`` return lone surrogates). A count that falls
+        inside an image lands after it."""
+        t = self.text
+        try:
+            if not isinstance(count, int):      # defensive: an old-style index
+                return t.index("%s +1c -1c" % count)
+            seen = 0
+            for key, value, index in t.dump("1.0", "end-1c", text=True,
+                                            window=True, image=True):
+                if key == "text":
+                    size = len(value)
+                elif key == "window":
+                    size = 1
+                else:
+                    size = len(_emoji_seq(value) or "")
+                if seen + size >= count:
+                    if key == "text":
+                        return t.index("%s + %d chars" % (index, count - seen))
+                    return index if count <= seen else t.index(index + " +1c")
+                seen += size
+            return t.index("end-1c")
+        except tk.TclError:
+            return "1.0"
 
     @staticmethod
     def _emoji_as_text(dump) -> list:
@@ -1607,17 +1710,21 @@ class PillCanvas(MarkupEditor):
         The window is the contiguous run of emoji images and joinable raw
         characters ending there, plus the ONE raw character directly before
         that run (a text heart or a digit is plain text until its VS16 / keycap
-        arrives). It is flattened, re-split and redrawn only if the split
-        changed - so a flag typed as two letters, a thumb followed by a tone or
-        a family arriving code point by code point ends up as ONE image. A pill
-        or a change of style ends the window: regrouping never alters the model
-        (the same characters in the same styles before and after)."""
+        arrives). A raw character directly preceded by a ZWJ does NOT end the
+        window: it is glued to what comes before it (every "person ZWJ symbol
+        VS16" and hair form of the real table). The window is flattened,
+        re-split and redrawn only if the split changed - so a flag typed as two
+        letters, a thumb followed by a tone or a family arriving code point by
+        code point ends up as ONE image. A pill or a change of style ends the
+        window, and it never holds more than :data:`_EMOJI_WINDOW` elements:
+        regrouping never alters the model (the same characters in the same
+        styles before and after) and its cost per key press is bounded."""
         t = self.text
         try:
             end = start = t.index(index)
-            parts: list = []                    # newest first: (is_image, chars)
+            parts: list = []            # newest first: (is_image, chars, selected)
             tags = None
-            while True:
+            while len(parts) < _EMOJI_WINDOW:
                 prev = t.index(start + "-1c")
                 if t.compare(prev, "==", start):
                     break                       # the start of the document
@@ -1628,25 +1735,27 @@ class PillCanvas(MarkupEditor):
                 chars = _emoji_seq(item[0][1]) if is_image else item[0][1]
                 if not chars:
                     break
-                here = self._emoji_tags_at(prev)
+                names = t.tag_names(prev)
+                here = tuple(tag for tag in names if tag != "sel")
                 if tags is None:
                     tags = here
                 elif here != tags:
                     break
-                parts.append((is_image, chars))
+                parts.append((is_image, chars, "sel" in names))
                 start = prev
-                if not (is_image or _emoji_joinable(chars)):
+                if (not (is_image or _emoji_joinable(chars))
+                        and t.get(start + "-1c", start) != _ZWJ):
                     break                       # the one raw character before the run
             if not parts:
                 return
             parts.reverse()
             drawn: list = []
-            for is_image, chars in parts:
+            for is_image, chars, _selected in parts:
                 if not is_image and drawn and not drawn[-1][0]:
                     drawn[-1] = (False, drawn[-1][1] + chars)
                 else:
                     drawn.append((is_image, chars))
-            flat = "".join(chars for _is_image, chars in parts)
+            flat = "".join(chars for _is_image, chars, _selected in parts)
             pieces = self._emoji_pieces(flat)
             if [(img is not None, chunk) for img, chunk in pieces] == drawn:
                 return
@@ -1656,8 +1765,39 @@ class PillCanvas(MarkupEditor):
                 return                          # never delete what is not put back
             t.delete(start, end)
             self._emoji_draw(start, flat, tags, pieces)
+            if any(selected for _is_image, _chars, selected in parts):
+                self._emoji_reselect(start, [
+                    selected for _is_image, chars, selected in parts for _ch in chars])
+            self._emoji_forget_gone()
         except tk.TclError:
             pass
+
+    def _emoji_reselect(self, start, flags):
+        """Put the selection highlight back on what a redraw just replaced
+        (``start`` .. :data:`_EMOJI_MARK`); ``flags`` says, per character of the
+        redrawn text, whether it was selected. An image is one element: it is
+        selected when any of its characters was."""
+        t = self.text
+        at = 0
+        for key, value, index in t.dump(start, _EMOJI_MARK, text=True, image=True):
+            if key == "image":
+                size = len(_emoji_seq(value) or "")
+                if any(flags[at:at + size]):
+                    t.tag_add("sel", index)
+            else:
+                size = len(value)
+                for n in range(size):
+                    if flags[at + n:at + n + 1] == [True]:
+                        t.tag_add("sel", "%s + %d chars" % (index, n))
+            at += size
+
+    def _emoji_forget_gone(self):
+        """Drop the references to images no longer embedded (a redraw replaces
+        elements, and Tk never reuses a ``#N`` name)."""
+        live = {value for key, value, _index
+                in self.text.dump("1.0", "end-1c", image=True) if key == "image"}
+        for name in [name for name in self._emoji_imgs if name not in live]:
+            del self._emoji_imgs[name]
 
     def _emoji_bind(self):
         """Hook typed input: a bindtag directly AFTER Tk's ``Text`` class, so the
@@ -1672,6 +1812,58 @@ class PillCanvas(MarkupEditor):
         self.tk.call("bind", tag, "<KeyPress>",
                      self.register(self._emoji_after_key) + " %A %s")
         self.bind("<Destroy>", self._emoji_unbind, add="+")
+        # Middle-click and the Insert key paste Tk's PRIMARY selection, whose
+        # text omits every image: both are routed through the canvas instead.
+        self.text.bind("<<PasteSelection>>", self._emoji_paste_selection, add="+")
+        self.text.bind("<Insert>", lambda event: self._emoji_paste_selection(),
+                       add="+")
+
+    def _emoji_paste_selection(self, click=None):
+        """``<<PasteSelection>>`` (middle-click; ``click`` is its event) and the
+        Insert key, with a provider. The canvas's OWN selection is pasted as
+        model runs (emoji as characters, pills as pills); a selection owned by
+        another widget as text through the splitter. One undo step; always
+        ``"break"``, so Tk's class binding never inserts the image-less text."""
+        t = self.text
+        if click is not None:
+            try:        # Tk's own rule: a middle-button drag scans, it does not paste
+                if int(self.tk.call("set", "::tk::Priv(mouseMoved)")):
+                    return "break"
+            except (tk.TclError, TypeError, ValueError):
+                pass
+        rng = self._selection_range()
+        runs, text = [], ""
+        try:
+            if rng is not None:
+                runs = self._runs_in_range(rng[0], rng[1])
+            else:
+                text = t.selection_get()
+        except tk.TclError:
+            pass
+        if not runs and not text:
+            return "break"
+        where = "insert"
+        if click is not None:
+            try:
+                where = self.tk.call("tk::TextClosestGap", t, click.x, click.y)
+            except (tk.TclError, AttributeError):
+                where = "insert"
+        self._snapshot()
+        try:
+            t.mark_set("insert", where)
+        except tk.TclError:
+            pass
+        if runs:
+            self._insert_runs_at_caret(runs)
+        else:
+            self._put_text("insert", text)
+        self._after_mutation()
+        if click is not None:
+            try:
+                t.focus_set()
+            except tk.TclError:
+                pass
+        return "break"
 
     def _emoji_unbind(self, event=None):
         if event is not None and getattr(event, "widget", None) is not self:
@@ -1717,15 +1909,24 @@ class PillCanvas(MarkupEditor):
             self._emoji_recluster("insert")
             if char == ":":
                 self._emoji_shortcode()
+            if self._pending_armed:
+                # MarkupEditor applies an armed typing style at key RELEASE,
+                # from the index it noted at key press. A redraw above may have
+                # moved everything: re-aim it at the element just typed, so the
+                # tag never starts inside a raw astral character.
+                self._pending_press_idx = t.index("insert-1c")
         except tk.TclError:
             pass
 
     def _emoji_shortcode(self):
         """The caret follows a just-typed ``:``. Replace ``:name:`` by its emoji
-        (one undo step) when the name has no whitespace, the opening colon is at
-        the line start or NOT preceded by a letter, digit or underscore (an
-        image or a pill before it is none of those), the span is not inside a
-        ``<...>`` token, and the provider knows the name."""
+        (one undo step) when the name has no whitespace and no ``<`` / ``>``,
+        the opening colon is at the line start or NOT preceded by a letter,
+        digit or underscore (an image or a pill before it is none of those),
+        the span is not inside a ``<...>`` token being typed, and the provider
+        knows the name. A token holds no whitespace, so an unclosed ``<``
+        followed by whitespace ("ETA <10 min", "a < b") is not one - the rule
+        of ``emoji_data.replace_shortcodes``."""
         t = self.text
         close = t.index("insert-1c")
         line = t.index("insert linestart")
@@ -1733,7 +1934,7 @@ class PillCanvas(MarkupEditor):
         if not opening:
             return
         name = t.get(opening + "+1c", close)
-        if not name or any(ch.isspace() for ch in name):
+        if not name or any(ch.isspace() or ch in "<>" for ch in name):
             return
         if t.dump(opening, close, window=True, image=True):
             return                              # a pill or an image in the name
@@ -1741,12 +1942,14 @@ class PillCanvas(MarkupEditor):
         if before.isalnum() or before == "_":
             return
         head = t.get(line, opening)
-        if head.rfind("<") > head.rfind(">"):
+        opened = head.rfind("<")
+        if (opened > head.rfind(">")
+                and not any(ch.isspace() for ch in head[opened:])):
             return                              # inside a <...> token
         try:
             seq = self._emoji.from_shortcode(name)
         except Exception:
-            _LOG.exception("emoji provider failed; shortcode left as typed")
+            self._emoji_fault("emoji provider failed; shortcode left as typed")
             return
         if not seq or not isinstance(seq, str):
             return

@@ -67,6 +67,14 @@ _SIZES = (10, 12, 14, 18)
 _BASE_FAMILY = "Consolas"
 _BASE_SIZE = 11
 
+# The Tk ``event.state`` bits that mean "this key press is NOT typing": Control
+# (0x4) and Alt (0x20000 on Windows Tk, the only Tk this app runs on, natively
+# or under Wine). The ONE definition - ``pill_canvas`` uses it too. The lock keys
+# are deliberately absent: measured on this Tk, NumLock is 0x8, CapsLock 0x2 and
+# ScrollLock 0x20 (Shift is 0x1). An earlier mask included 0x8 as "Alt on X11",
+# so with NumLock ON nothing typed counted as typing.
+KEY_NOT_TYPING = 0x4 | 0x20000
+
 
 class MarkupEditor(tk.Frame):
     """A toolbar + ``tk.Text`` widget that edits EVE markup as formatted text.
@@ -295,13 +303,14 @@ class MarkupEditor(tk.Frame):
 
     def _pending_keypress(self, e):
         # Arm only when a style is pending AND this key is a real self-inserting
-        # printable char (not a modifier/navigation/control combo). e.state bits:
-        # Control=0x4, Mod1/Alt(X11)=0x8, Alt(Windows)=0x20000.
+        # printable char (not a modifier/navigation/control combo): no Control
+        # and no Alt in e.state (KEY_NOT_TYPING; NumLock and the other locks
+        # do not count).
         if not self._pending_tags:
             self._pending_armed = False
             return
         is_insert = (bool(e.char) and len(e.char) == 1 and e.char.isprintable()
-                     and not (e.state & (0x4 | 0x8 | 0x20000)))
+                     and not (e.state & KEY_NOT_TYPING))
         if is_insert:
             self._pending_press_idx = self.text.index("insert")
             self._pending_armed = True
