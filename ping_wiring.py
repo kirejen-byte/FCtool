@@ -30,7 +30,8 @@ Rules
 * The store is handed ``lambda: self.config``, never the dict or a part of it.
 * Nothing fails silently. The shipped exe has no stderr, so a failure writes one status
   line and one log line. The log names the exception's TYPE and the ``file:line`` it was
-  raised at - never its message, which can carry a character's name or template text.
+  raised at (``via`` this module's own line when that is a library's) - never its
+  message, which can carry a character's name or template text.
 * No input hold, no thread, no timer, no variable trace. The editor window is built by
   ``ping_dialog``; the opener only keeps it to one window.
 """
@@ -54,13 +55,25 @@ _DASH = chr(0x2014)          # em dash, built at runtime: the source stays pure 
 
 
 def _where(exc) -> str:
-    """``file.py:line`` of the frame that raised ``exc`` - a place, never the message."""
+    """Where ``exc`` was raised - places, never the message: ``file.py:line`` of the
+    deepest frame and, when that frame is not this module's (a ``TclError`` is raised
+    inside tkinter), `` via ping_wiring.py:line`` - this module's own deepest line on
+    the way there. Base names only: a full path would carry the Windows user name."""
     trace = getattr(exc, "__traceback__", None)
     if trace is None:
         return "?"
-    while trace.tb_next is not None:
+    own = None
+    while True:
+        if trace.tb_frame.f_globals.get("__name__") == __name__:
+            own = trace
+        if trace.tb_next is None:
+            break
         trace = trace.tb_next
-    return "%s:%d" % (os.path.basename(trace.tb_frame.f_code.co_filename), trace.tb_lineno)
+    place = "%s:%d" % (os.path.basename(trace.tb_frame.f_code.co_filename), trace.tb_lineno)
+    if own is None or own is trace:
+        return place
+    return "%s via %s:%d" % (place, os.path.basename(own.tb_frame.f_code.co_filename),
+                             own.tb_lineno)
 
 
 class PingWiringMixin:

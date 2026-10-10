@@ -13235,11 +13235,15 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         if new_name is None:
             return
         new_name = new_name.strip()
-        if not new_name or new_name == doctrine.name:
+        old_name = doctrine.name
+        if not new_name or new_name == old_name:
             return
         doctrine.name = new_name
-        self.fittings.update_doctrine(doctrine)
+        if not self.fittings.update_doctrine(doctrine):
+            doctrine.name = old_name        # the library no longer holds it
+            return
         self.fittings.save()
+        self._motd_follow_doctrine_rename(old_name, new_name)
         self._refresh_doctrine_list()
         self._show_doctrine_detail(doctrine_id)
 
@@ -14512,11 +14516,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         link_row = tk.Frame(right, bg=BG_PANEL)
         link_row.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 4))
         self._motd_link_var = tk.BooleanVar(value=self._motd_link_enabled)
-        tk.Checkbutton(
+        _link_chk = tk.Checkbutton(
             link_row, text="Auto-update MOTD", variable=self._motd_link_var,
             font=("Consolas", 9), fg=FG_TEXT, bg=BG_PANEL, selectcolor=BG_ENTRY,
             activebackground=BG_PANEL, activeforeground=FG_YELLOW,
-            command=self._motd_toggle_link).pack(side=tk.LEFT, padx=(0, 2))
+            command=self._motd_toggle_link)
+        _link_chk.pack(side=tk.LEFT, padx=(0, 2))
         tk.Label(link_row, text="every", font=("Consolas", 8), fg=FG_DIM,
                  bg=BG_PANEL).pack(side=tk.LEFT, padx=(6, 1))
         self._motd_link_interval_var = tk.IntVar(value=self._motd_link_interval_s())
@@ -14554,12 +14559,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # long). One pixel short of 29 characters: no line of the notice is
         # wider than the widest other state (28 characters), and that state
         # keeps most of a character of room before it would wrap itself.
+        # Its OWN line under the checkboxes (packed BOTTOM, ahead of them in the
+        # packing order): beside them the row asked for 544 px (611 at tk scaling
+        # 1.51) of the 543 it gets at the 1000x700 minimum and pack cut the
+        # indicator, the last slave, to 22 px. Borderless: the pill canvas pays
+        # for the line and has 16 px to spare at tk scaling 1.51.
         self._motd_link_indicator = tk.Label(
             link_row, text="○ not linked", font=("Consolas", 8), fg=FG_DIM,
-            bg=BG_PANEL, cursor="question_arrow", justify=tk.LEFT,
+            bg=BG_PANEL, cursor="question_arrow", justify=tk.LEFT, bd=0, pady=0,
             wraplength=tkfont.Font(root=link_row,
                                    font=("Consolas", 8)).measure("0" * 29) - 1)
-        self._motd_link_indicator.pack(side=tk.LEFT, padx=2)
+        self._motd_link_indicator.pack(side=tk.BOTTOM, anchor=tk.W, padx=2,
+                                       before=_link_chk)
         _link_tip = ("When ON, re-checks the MOTD every N seconds (adjustable) "
                      "and re-pushes it to your fleet whenever the composition/"
                      "deltas change. The counter is seconds since the last "
@@ -15408,6 +15419,39 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # the user's own switches, so without this the MOTD Refits ▾ button
         # would not appear until the FC changed doctrine by hand.
         self._refits_update_buttons()
+
+    def _motd_follow_doctrine_rename(self, old, new):
+        """A doctrine was renamed in the library: what knows it BY NAME follows.
+        Saved MOTD templates linked to ``old`` and the remembered Fleet-tab pick
+        are re-linked (ONE ``_save_config``, only when something was written), a
+        doctrine combo that showed ``old`` (composer, Fleet tab) shows ``new``,
+        the composer's two lists are re-filled. NOT a doctrine switch: no dirty
+        mark, no discard prompt, no template auto-apply, no canvas load, no push
+        (the baseline holds no doctrine, so clean stays clean). While a twin
+        still carries ``old`` (rename / new allow one) it still resolves and
+        nothing is moved."""
+        if old and not any((d.name or "") == old
+                           for d in self.fittings.list_doctrines()):
+            wrote = False
+            for saved in self._saved_motds():
+                if isinstance(saved, dict) and saved.get("doctrine") == old:
+                    saved["doctrine"] = new
+                    wrote = True
+            fleet = self.config.get("fleet")
+            if isinstance(fleet, dict) and fleet.get("active_doctrine") == old:
+                fleet["active_doctrine"] = new
+                wrote = True
+            if wrote:
+                self._save_config()
+            fvar = getattr(self, "_fleet_doctrine_var", None)
+            if fvar is not None and fvar.get() == old:
+                fvar.set(new)
+            mvar = getattr(self, "_motd_doctrine_var", None)
+            if mvar is not None and mvar.get() == old:
+                mvar.set(new)
+                self._motd_doctrine_prev = new
+        self._motd_refresh_doctrines()
+        self._motd_refresh_saved_dropdown()
 
     def _motd_refresh_fc_choices(self):
         """Fill the FC/Anchor dropdown with authed characters + '(leave blank)'.
