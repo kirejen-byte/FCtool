@@ -532,6 +532,8 @@ class PingDialog:
         self._picker = None                 # the ONE picker, made on first use
         self._picker_for_query = False      # it was opened by the template's ':' query
         self._query_tag = None              # the binding tag of the query keys
+        self._query_check_id = None         # the one look after the picker closed
+        self._button_tag = None             # the Emoji button's tag after Tk's class
         self._emoji_press_closed = False    # this click's press closed the picker
         self._emoji_warned = set()          # the emoji failures already logged
         self.emoji_button = None
@@ -644,6 +646,7 @@ class PingDialog:
             attach_tooltip(self.emoji_button, "Pick an emoji for the template")
             # add="+": the tooltip has bindings on this button too.
             self.emoji_button.bind("<ButtonPress-1>", self._on_emoji_press, add="+")
+            self._bind_emoji_release()
         return panel
 
     def _build_when(self, parent):
@@ -1102,6 +1105,7 @@ class PingDialog:
         if self._closed:
             return
         if query is None:
+            self._cancel("_query_check_id")     # the canvas has ended it itself
             picker = self._picker
             if self._picker_for_query:
                 self._picker_for_query = False
@@ -1174,6 +1178,30 @@ class PingDialog:
         self._emoji_press_closed = True
         picker.close()
 
+    def _bind_emoji_release(self):
+        """Forget "this click's press closed the picker" when that click's button is
+        let go - on a binding tag of the window's own, placed AFTER Tk's ``Button``
+        class in the button's tag order.
+
+        After, because the class binding is what runs the button's command for a
+        release ON the button, and the command has to find the flag still set (bound
+        on the button itself this would run first, and the click would reopen the
+        picker it has just closed). A release OFF the button runs no command at all:
+        the flag then outlived its click and swallowed the next ``invoke()``. No
+        timer. The command belongs to the button (Tk deletes it with the widget);
+        the tag's binding is taken off when the window closes (``_release_emoji``)."""
+        button = self.emoji_button
+        tag = "PingEmojiButton" + str(button)
+        tags = list(button.bindtags())
+        tags.insert(tags.index("Button") + 1 if "Button" in tags else len(tags), tag)
+        button.bindtags(tuple(tags))
+        button.tk.call("bind", tag, "<ButtonRelease-1>",
+                       button.register(self._on_emoji_release))
+        self._button_tag = tag
+
+    def _on_emoji_release(self):
+        self._emoji_press_closed = False
+
     def _on_emoji_button(self):
         """The Emoji button (the release of a click, or its keyboard / code
         equivalent): the picker, hung under the button. With the picker it opened
@@ -1199,6 +1227,7 @@ class PingDialog:
         a ``:`` query, in place of that query. (The picker has closed by now, and
         ``_on_emoji_closed`` has already given the keyboard back to the template.)"""
         for_query, self._picker_for_query = self._picker_for_query, False
+        self._cancel("_query_check_id")     # a pick: there is nothing left to look at
         if self._closed or not self._canvas_alive() or not isinstance(seq, str) or not seq:
             return
         if for_query:
@@ -1211,10 +1240,37 @@ class PingDialog:
     def _on_emoji_closed(self):
         """The picker has gone - picked from, dismissed, or closed because the focus
         left it; it does not say which, and on a pick this runs BEFORE the pick is
-        handed over. So nothing here ends the template's ``:`` query (the canvas ends
-        it and says so itself): the keyboard goes back to the template, no more."""
-        if not self._closed:
-            self._focus_canvas()
+        handed over. So the template's ``:`` query is not ended HERE (a pick would
+        then find no name to replace): the keyboard goes back to the template, and
+        when the picker was up for a query ONE look is left for the next idle
+        moment (``_on_query_check``)."""
+        if self._closed:
+            return
+        self._focus_canvas()
+        if self._picker_for_query and self._query_check_id is None:
+            try:
+                self._query_check_id = self.win.after_idle(self._on_query_check)
+            except tk.TclError:
+                pass
+
+    def _on_query_check(self):
+        """The idle moment after the picker closed while it was up for a ``:`` query.
+        A pick has cleared ``_picker_for_query`` by now, and so has the canvas when
+        it ended the query itself; typing on has brought the picker back. What is
+        left is a picker that closed by itself: the canvas still holds the query and
+        would take the next Esc with nothing on screen - it is told to end it. (The
+        name stays live: the next character typed there brings the popup back.)"""
+        self._query_check_id = None
+        picker = self._picker
+        if (not self.alive() or not self._picker_for_query
+                or (picker is not None and picker.is_open())):
+            return
+        self._picker_for_query = False
+        try:
+            if self._canvas_alive():
+                self.canvas.dismiss_emoji_query()
+        except Exception as exc:            # never out into the idle callback
+            self._emoji_warn("an emoji query could not be ended", exc)
 
     def _focus_canvas(self):
         """Give the keyboard back to the template after the picker closed.
@@ -1263,15 +1319,19 @@ class PingDialog:
         picker, self._picker = self._picker, None
         tiles, self._emoji_tiles = self._emoji_tiles, None
         tag, self._query_tag = self._query_tag, None
+        button_tag, self._button_tag = self._button_tag, None
         self._picker_for_query = False
-        if tag is not None:
-            # A binding on a tag outlives the widget it was made for (its command
-            # does not): each one is cleared, on the interpreter the window had.
-            for key in _QUERY_KEYS:
-                try:
-                    self.win.tk.call("bind", tag, "<%s>" % key, "")
-                except Exception:
-                    pass
+        self._cancel("_query_check_id")
+        # A binding on a tag outlives the widget it was made for (its command does
+        # not): each one is cleared, on the interpreter the window had.
+        bound = [(tag, "<%s>" % key) for key in _QUERY_KEYS if tag is not None]
+        if button_tag is not None:
+            bound.append((button_tag, "<ButtonRelease-1>"))
+        for name, sequence in bound:
+            try:
+                self.win.tk.call("bind", name, sequence, "")
+            except Exception:
+                pass
         for name, target in (("close", picker), ("release", tiles)):
             if target is None:
                 continue

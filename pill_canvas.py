@@ -119,6 +119,11 @@ def _post_menu_at(menu, x_root, y_root) -> None:
 _EMOJI_NAME = "emoji:"
 _EMOJI_MARK = "pc_emoji"            # scratch mark: where the next piece is drawn
 _EMOJI_WINDOW = 24                  # most elements one re-cluster looks back over
+# The longest ':' query that is still a query. No shipped shortcode is longer
+# (the longest has 76 characters - tests/test_pill_canvas_emoji_trigger.py
+# holds this number against the table), so a longer unbroken run of letters
+# after a colon is prose, not a name.
+_EMOJI_QUERY_MAX = 80
 _ZWJ = chr(0x200D)
 # Tk state bits that mean "not typing" (Control, Alt) - the one shared definition.
 _KEY_NOT_TYPING = markup_editor.KEY_NOT_TYPING
@@ -195,8 +200,9 @@ class PillCanvas(MarkupEditor):
       with the text after a typed ``:`` (from two characters on, at every
       change) and the caret's screen position, and with ``None`` once when
       that query ends. The popup's owner answers with
-      :meth:`accept_emoji_query` and asks :meth:`emoji_query_active` before
-      it takes a key. See the ``':' emoji query`` section.
+      :meth:`accept_emoji_query`, asks :meth:`emoji_query_active` before it
+      takes a key, and ends a query whose popup went away by itself with
+      :meth:`dismiss_emoji_query`. See the ``':' emoji query`` section.
     """
 
     def __init__(self, master, resolve_label: Callable,
@@ -713,6 +719,7 @@ class PillCanvas(MarkupEditor):
         """
         if self._emoji_q is not None:        # an open ':' query ends here
             self._emoji_query_end()
+        self._emoji_q_shut = None            # (an index, stale after a rebuild)
         self._selected_pill = None
         for _name, frame in list(self._pill_frames.items()):
             try:
@@ -2002,10 +2009,13 @@ class PillCanvas(MarkupEditor):
     # ``None`` exactly once when it ends. A query OPENS only on an edit at the
     # caret (a typed character or BackSpace) - moving the caret into a name
     # opens nothing - and ENDS when the text before the caret is no longer
-    # the reported query: a character that is not one, fewer than two left, the
-    # caret moved, a click, Esc, a pill selected, the document rebuilt, the
-    # canvas destroyed. ``self._emoji_q`` is the open query as ``(colon index,
-    # text)``; nothing below is bound, and it stays None, without BOTH arguments.
+    # the reported query: a character that is not one, fewer than two left or
+    # more than :data:`_EMOJI_QUERY_MAX`, the caret moved, a click, Esc, a pill
+    # selected, the document rebuilt, the canvas destroyed, the owner's
+    # :meth:`dismiss_emoji_query`. A query never changes its colon: a paste
+    # that leaves the caret at ANOTHER name ends it and opens nothing.
+    # ``self._emoji_q`` is the open query as ``(colon index, text)``; nothing
+    # below is bound, and it stays None, without BOTH arguments.
 
     def emoji_query_active(self) -> bool:
         """True while a ``:`` query is open AT THE CARET. A query the caret has
@@ -2018,6 +2028,17 @@ class PillCanvas(MarkupEditor):
             return True
         self._emoji_query_end()
         return False
+
+    def dismiss_emoji_query(self) -> bool:
+        """End the open ``:`` query on the word of the popup's owner (its popup
+        went away for a reason the canvas never saw): ``None`` is reported,
+        once, and True is returned. Unlike Esc this does not silence the name
+        - the next query character typed there reports it again. False, and
+        nothing happens, when no query is open (always, without the seam)."""
+        if self._emoji_q is None:
+            return False
+        self._emoji_query_end()
+        return True
 
     def accept_emoji_query(self, seq: str) -> None:
         """Replace the open ``:query`` span (colon included) with the emoji
@@ -2057,7 +2078,7 @@ class PillCanvas(MarkupEditor):
         widgets; nothing is scheduled."""
         t = self.text
         t.bind("<Escape>", self._emoji_query_escape, add="+")
-        t.bind("<Button-1>", lambda event: self._emoji_query_end(), add="+")
+        t.bind("<Button-1>", self._emoji_query_click, add="+")
         # Tk's <Tab> class binding inserts the tab and BREAKS, so the
         # post-class hook never hears of it: the release settles what is left.
         t.bind("<KeyRelease>", lambda event: self._emoji_query_sync(), add="+")
@@ -2113,11 +2134,15 @@ class PillCanvas(MarkupEditor):
         found = self._emoji_query_find()
         if shut is not None and (found is None or found[0] != shut):
             self._emoji_q_shut = shut = None    # the caret left the dismissed name
-        if found is not None and (len(found[1]) < 2 or found[0] == shut):
+        if found is not None and (found[0] == shut or not (
+                2 <= len(found[1]) <= _EMOJI_QUERY_MAX)):
             found = None
         if found == cur:
             return
-        if found is None or not edit:
+        if (found is None or not edit
+                or (cur is not None and found[0] != cur[0])):
+            # (A query never changes its colon: what a paste or an insert left
+            # at ANOTHER name ends this one and opens nothing - typing does.)
             self._emoji_query_end()
             return
         self._emoji_q = found
@@ -2135,12 +2160,16 @@ class PillCanvas(MarkupEditor):
 
     def _emoji_query_tell(self, query):
         """Call ``on_emoji_query(query, x_root, y_root)`` with the bottom-left
-        of the caret on screen (the Text's own corner while the caret has no
-        box: not mapped, scrolled out of view). A raising callback is logged
-        once per canvas and never reaches the key binding."""
+        of the caret on screen. A live query first brings the caret into view
+        (a paste that keeps it open scrolls nothing itself); the END of one
+        scrolls nothing, and while the caret has no box (not mapped, scrolled
+        out of view) the point is the Text's own corner. A raising callback is
+        logged once per canvas and never reaches the key binding."""
         x = y = 0
         try:
             x, y = self.text.winfo_rootx(), self.text.winfo_rooty()
+            if query is not None:
+                self.text.see("insert")
             box = self.text.bbox("insert")
             if box:
                 x, y = x + box[0], y + box[1] + box[3]
@@ -2160,6 +2189,13 @@ class PillCanvas(MarkupEditor):
             return None
         self._emoji_query_end(shut=True)
         return "break"
+
+    def _emoji_query_click(self, event=None):
+        """A click in the text: the caret is about to be put somewhere. An
+        open query ends, and a name Esc dismissed is released - as it is when
+        the caret keys take the caret away and back."""
+        self._emoji_query_end()
+        self._emoji_q_shut = None
 
     def _emoji_query_gone(self, event=None):
         if event is not None and getattr(event, "widget", None) is not self:
