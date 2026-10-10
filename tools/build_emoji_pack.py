@@ -40,6 +40,7 @@ fetches or reads the cache -- which is why this is ONE self-contained file
     py -3.12 -I tools/build_emoji_pack.py --fetch    # download into tools/_cache/emoji/
     py -3.12 -I tools/build_emoji_pack.py --build [--palette 256|rgba] [--out DIR]
                                           [--no-skin-tones]   # the over-budget fallback
+                                          [--strict]          # refuse changed inputs
     py -3.12 -I tools/build_emoji_pack.py --compare <out.png>
 
 SHEET ENCODING -- part of the contract.  The sheet is ALWAYS an 8-bit palette PNG
@@ -79,7 +80,8 @@ import threading
 import time
 import zlib
 from collections import namedtuple
-from concurrent.futures import ThreadPoolExecutor
+import textwrap
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
 
@@ -103,7 +105,13 @@ COMPARE_BACKGROUND = (0x31, 0x33, 0x38)          # Discord's dark chat backgroun
 # --palette 256: how the 256 entries are shared out (see quantise_sheet)
 PALETTE_OPAQUE = 144             # + entry 0 (transparent) + the edge entries = 256
 PALETTE_EDGES = 111
-ALPHA_SNAP_LOW = 4               # alpha at or below this becomes fully transparent
+ALPHA_SNAP_LOW = 4               # alpha at or below this is zeroed BEFORE quantising.
+#   This is NOT the floor of what survives.  The edge octree is also handed every
+#   zeroed pixel, so its "transparent" entry swallows the faintest edges as well.
+#   Measured on the shipped sheet (2026-10-09): every pixel up to alpha 8 becomes
+#   0, so do 99.6% of alpha 9-16, 78% of 17-24 and 46% of 25-32; the highest
+#   alpha that became 0 is 31, and the faintest alpha left in the sheet is 25.
+#   Read "alpha below about 32 may become fully transparent".
 ALPHA_SNAP_HIGH = 251            # alpha at or above this becomes fully opaque
 
 # ---------------------------------------------------------------------------
@@ -504,6 +512,11 @@ def check_url(url):
     return parts
 
 
+class ShortBody(http.client.HTTPException):
+    """A response body shorter than its ``Content-Length`` -- retried like any
+    other transport failure."""
+
+
 class Net:
     """A small polite HTTPS client: one keep-alive connection per thread and host,
     retries with backoff, every URL and redirect checked against the host list."""
@@ -512,13 +525,16 @@ class Net:
     REDIRECT_STATUSES = (301, 302, 303, 307, 308)
 
     def __init__(self, user_agent=USER_AGENT, timeout=HTTP_TIMEOUT_S,
-                 attempts=HTTP_ATTEMPTS, sleep=time.sleep):
+                 attempts=HTTP_ATTEMPTS, sleep=time.sleep, connect=None):
         self._user_agent = user_agent
         self._timeout = timeout
         self._attempts = attempts
         self._sleep = sleep
         self._local = threading.local()
         self._context = ssl.create_default_context()
+        # ``connect(host)`` -> a connection object; the tests pass a stub here
+        self._connect = connect or (lambda host: http.client.HTTPSConnection(
+            host, timeout=self._timeout, context=self._context))
 
     # -- connections -------------------------------------------------------
     def _pool(self):
@@ -541,8 +557,7 @@ class Net:
         pool = self._pool()
         reused = host in pool
         if not reused:
-            pool[host] = http.client.HTTPSConnection(
-                host, timeout=self._timeout, context=self._context)
+            pool[host] = self._connect(host)
         conn = pool[host]
         target = (parts.path or "/") + ("?" + parts.query if parts.query else "")
         try:
@@ -560,6 +575,12 @@ class Net:
                 self._drop(host)
                 raise BuildError("refusing an oversize response (> %d bytes) from %s"
                                  % (max_bytes, url))
+            # ``read(n)`` hands back a cut-short body without complaint: a
+            # connection that dies mid-file must not pass for the whole file
+            stated = headers.get("content-length", "").strip()
+            if (method != "HEAD" and re.fullmatch(r"[0-9]{1,12}", stated)
+                    and len(body) != int(stated)):
+                raise ShortBody("got %d of %s bytes" % (len(body), stated))
             return resp.status, headers, body, reused
         except (OSError, http.client.HTTPException) as exc:
             self._drop(host)
@@ -796,12 +817,20 @@ def format_plan(items) -> str:
     return "\n".join(out)
 
 
+def _utf8(data, what) -> str:
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise BuildError("%s in the cache is not UTF-8 (%s) -- delete it and run "
+                         "--fetch again" % (what, exc)) from exc
+
+
 def _cached_test_lines(cache_dir):
     """Parsed ``emoji-test.txt`` when it is already in the cache, else None."""
     path = Path(cache_dir) / CACHE_EMOJI_TEST
     if not path.is_file():
         return None
-    return parse_emoji_test(path.read_bytes().decode("utf-8"))
+    return parse_emoji_test(_utf8(path.read_bytes(), CACHE_EMOJI_TEST))
 
 
 # ---------------------------------------------------------------------------
@@ -820,18 +849,41 @@ def _atomic_write(path, data) -> None:
     os.replace(part, path)
 
 
-def _cached_or_get(net, url, path, max_bytes, check=None) -> tuple:
-    """``(bytes, downloaded?)`` -- the cached file when it passes ``check``."""
+def _cached_or_get(net, url, path, max_bytes, check) -> tuple:
+    """``(bytes, downloaded?)`` -- the cached file when it passes ``check``.
+
+    ``check(bytes) -> bool`` is asked about a cached file (a bad one is fetched
+    again, so a cut-short download cannot stick) and about a fresh download
+    BEFORE it is written: nothing unverified ever reaches the cache.
+    """
     path = Path(path)
     if path.is_file():
         data = path.read_bytes()
-        if check is None or check(data):
+        if check(data):
             return data, False
     data = net.get(url, max_bytes)
-    if check is not None and not check(data):
-        raise BuildError("%s does not match its published checksum" % url)
+    if not check(data):
+        raise BuildError("the download of %s is incomplete or is not the file that "
+                         "was expected -- nothing was written to the cache" % url)
     _atomic_write(path, data)
     return data, True
+
+
+def emoji_test_complete(data) -> bool:
+    """True for a whole ``emoji-test.txt``: UTF-8, and its last line is ``#EOF``."""
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return text.rstrip().endswith("\n#EOF")
+
+
+def listing_complete(data) -> bool:
+    """True for well-formed JSON that is the pinned tag's listing and names PNGs."""
+    try:
+        return bool(twemoji_png_listing(_json(data, "the Twemoji file listing")))
+    except BuildError:
+        return False
 
 
 def _tarball_check(dist):
@@ -873,7 +925,7 @@ def fetch(net, cache_dir=CACHE_DIR, out=print) -> dict:
     cache_dir.mkdir(parents=True, exist_ok=True)
 
     test_bytes, fresh = _cached_or_get(net, EMOJI_TEST_URL, cache_dir / CACHE_EMOJI_TEST,
-                                       EMOJI_TEST_MAX_BYTES)
+                                       EMOJI_TEST_MAX_BYTES, emoji_test_complete)
     out("emoji-test.txt      %10s bytes  %s" % (format(len(test_bytes), ","),
                                                "downloaded" if fresh else "cached"))
     lines = parse_emoji_test(test_bytes.decode("utf-8"))
@@ -883,7 +935,7 @@ def fetch(net, cache_dir=CACHE_DIR, out=print) -> dict:
                          % (fully_qualified, EXPECTED_FULLY_QUALIFIED))
 
     listing_bytes, fresh = _cached_or_get(net, TWEMOJI_LISTING_URL, cache_dir / CACHE_LISTING,
-                                          LISTING_MAX_BYTES)
+                                          LISTING_MAX_BYTES, listing_complete)
     out("Twemoji listing     %10s bytes  %s (metadata)"
         % (format(len(listing_bytes), ","), "downloaded" if fresh else "cached"))
     pngs = twemoji_png_listing(_json(listing_bytes, "the Twemoji file listing"))
@@ -899,14 +951,35 @@ def fetch(net, cache_dir=CACHE_DIR, out=print) -> dict:
     out("discord-emoji tgz   %10s bytes  %s" % (format(len(tarball), ","),
                                                "downloaded" if fresh else "cached"))
 
-    png_dir = cache_dir / CACHE_PNG_DIR
+    fetched_files, fetched_bytes = fetch_pngs(net, names, pngs, cache_dir / CACHE_PNG_DIR, out)
+    out("Twemoji PNGs        %10s bytes in %d files (%d downloaded now, %s bytes)"
+        % (format(png_total, ","), len(names), fetched_files, format(fetched_bytes, ",")))
+    return {"png_files": len(names), "png_bytes": png_total,
+            "emoji_test_bytes": len(test_bytes), "tarball_bytes": len(tarball)}
+
+
+def fetch_pngs(net, names, pngs, png_dir, out=print) -> tuple:
+    """Make every named PNG present and verified: ``(files, bytes)`` downloaded now.
+
+    The FIRST failure stops the run: the worker that fails raises the flag
+    itself, the queued files are never requested, and the error is re-raised.
+    (At most ``MAX_CONNECTIONS - 1`` requests already in flight still finish.)
+    """
+    png_dir = Path(png_dir)
     png_dir.mkdir(parents=True, exist_ok=True)
     done = [0, 0, 0]                 # files, bytes downloaded, files downloaded
     lock = threading.Lock()
+    stop = threading.Event()
 
     def work(name):
-        size, digest = pngs[name]
-        got = _fetch_png(net, name, size, digest, png_dir)
+        if stop.is_set():
+            return
+        try:
+            size, digest = pngs[name]
+            got = _fetch_png(net, name, size, digest, png_dir)
+        except BaseException:
+            stop.set()
+            raise
         with lock:
             done[0] += 1
             done[1] += got
@@ -915,19 +988,32 @@ def fetch(net, cache_dir=CACHE_DIR, out=print) -> dict:
                 out("Twemoji PNGs        %d / %d" % (done[0], len(names)))
 
     with ThreadPoolExecutor(max_workers=MAX_CONNECTIONS) as pool:
-        for _result in pool.map(work, names):
-            pass
-    out("Twemoji PNGs        %10s bytes in %d files (%d downloaded now, %s bytes)"
-        % (format(png_total, ","), len(names), done[2], format(done[1], ",")))
-    return {"png_files": len(names), "png_bytes": png_total,
-            "emoji_test_bytes": len(test_bytes), "tarball_bytes": len(tarball)}
+        futures = [pool.submit(work, name) for name in names]
+        try:
+            for future in as_completed(futures):
+                future.result()
+        except BaseException:
+            stop.set()
+            for future in futures:
+                future.cancel()
+            raise
+    return done[2], done[1]
 
 
 # ---------------------------------------------------------------------------
 # the shortcode source: read as TEXT, never run
 # ---------------------------------------------------------------------------
 
-_JS_PAIR = re.compile(r'^\s*"([^"\\\s:]{1,100})"\s*:\s*"([^"\\]{1,40})"\s*,?\s*$')
+_JS_PAIR = re.compile(r'^\s*"([^"\\]{1,100})"\s*:\s*"([^"\\]{1,40})"\s*,?\s*$')
+# What a shortcode may be made of: an ALLOW-list, plus the one name Discord
+# spells with a non-ASCII letter (n with tilde) -- named here, so a second such
+# name is a build failure to look at, not something that slips through.
+_SHORTCODE_NAME = re.compile(r"[a-z0-9_+\-]{1,100}")
+NON_ASCII_SHORTCODES = frozenset({"pi" + chr(0xF1) + "ata"})
+
+
+def shortcode_name_ok(name) -> bool:
+    return bool(_SHORTCODE_NAME.fullmatch(name)) or name in NON_ASCII_SHORTCODES
 _JS_FRAME = re.compile(
     r'^\s*(?://.*|/\*.*\*/|const [a-z]+ = \{|\};|export \{[a-z, ]+\};)?\s*$')
 
@@ -942,7 +1028,8 @@ def parse_shortcode_module(text) -> dict:
 
     The file is a list of ``const <category> = { "name": "<emoji>", ... };``
     blocks.  It is matched line by line as text; a line of any other shape is a
-    hard failure (so is a name given to two different emoji).  Names keep the
+    hard failure (so is a name given to two different emoji, and a name that is
+    not on the allow-list -- ``shortcode_name_ok``).  Names keep the
     file's order: the first one listed for an emoji is the one shown.
     """
     out = {}
@@ -955,6 +1042,10 @@ def parse_shortcode_module(text) -> dict:
             raise BuildError("the shortcode module's line %d is not understood: %r"
                              % (number, line[:120]))
         name, key = hit.group(1), text_key(hit.group(2))
+        if not shortcode_name_ok(name):
+            raise BuildError("the shortcode module's line %d names an emoji %s, which "
+                             "is outside the allowed characters [a-z0-9_+-]"
+                             % (number, ascii(name)))
         if owner.setdefault(name, key) != key:
             raise BuildError("the shortcode %r names two different emoji" % (name,))
         names = out.setdefault(key, [])
@@ -984,7 +1075,10 @@ def load_inputs(cache_dir) -> Inputs:
     """Everything ``--build`` needs, read (and re-checked) from the download cache."""
     cache_dir = Path(cache_dir)
     test_bytes = _read_cached(cache_dir, CACHE_EMOJI_TEST)
-    lines = parse_emoji_test(test_bytes.decode("utf-8"))
+    if not emoji_test_complete(test_bytes):
+        raise BuildError("%s in the cache is cut short or is not UTF-8 -- delete it "
+                         "and run --fetch again" % CACHE_EMOJI_TEST)
+    lines = parse_emoji_test(_utf8(test_bytes, CACHE_EMOJI_TEST))
     fully_qualified = sum(1 for ln in lines if ln.status == "fully-qualified")
     if fully_qualified != EXPECTED_FULLY_QUALIFIED:
         raise BuildError("emoji-test.txt has %d fully-qualified lines, expected %d"
@@ -1000,8 +1094,9 @@ def load_inputs(cache_dir) -> Inputs:
         if member not in members:
             raise BuildError("the %s tarball has no %s" % (SHORTCODE_PACKAGE, member))
     module = members[SHORTCODE_MEMBER]
-    shortcodes = merge_extra_shortcodes(parse_shortcode_module(module.decode("utf-8")))
-    license_text = members[SHORTCODE_LICENSE_MEMBER].decode("utf-8")
+    shortcodes = merge_extra_shortcodes(
+        parse_shortcode_module(_utf8(module, SHORTCODE_MEMBER)))
+    license_text = _utf8(members[SHORTCODE_LICENSE_MEMBER], SHORTCODE_LICENSE_MEMBER)
     license_text = license_text.replace("\r\n", "\n").replace("\r", "\n").strip()
     if (len(license_text) > 4000 or not license_text.isascii()
             or not all(ch == "\n" or ch.isprintable() for ch in license_text)
@@ -1033,10 +1128,14 @@ def load_inputs(cache_dir) -> Inputs:
 
 def _pillow():
     """Pillow, imported only here (a build-time tool; the app never imports it)."""
-    import PIL
-    from PIL import Image, ImageChops, ImageDraw, features
+    try:
+        import PIL
+        from PIL import Image, ImageChops, ImageDraw
+    except ImportError as exc:
+        raise BuildError("--build and --compare need Pillow in this interpreter "
+                         "(py -3.12 -m pip install pillow): %s" % exc) from exc
     Image.MAX_IMAGE_PIXELS = 4_000_000
-    return PIL, Image, ImageChops, ImageDraw, features
+    return PIL, Image, ImageChops, ImageDraw
 
 
 def render_sheet(table, tile_names, pngs, png_dir) -> tuple:
@@ -1046,7 +1145,7 @@ def render_sheet(table, tile_names, pngs, png_dir) -> tuple:
     before it is decoded.  ``manifest_sha256`` is the sha256 of the sorted lines
     ``"<name>.png <sha256>\\n"`` -- one checksum that pins every tile's input.
     """
-    _pil, Image, _chops, _draw, _features = _pillow()
+    _pil, Image, _chops, _draw = _pillow()
     owners = tile_owners(table)
     sheet = Image.new("RGBA", sheet_size(len(owners)), (0, 0, 0, 0))
     manifest = {}
@@ -1104,7 +1203,10 @@ def quantise_sheet(sheet):
     (2026-10-09, rms error per channel): 9.4 for that, 6.3 for this, which treats
     the three kinds of pixel separately:
 
-      entry 0            fully transparent (alpha <= ALPHA_SNAP_LOW becomes 0);
+      entry 0            fully transparent.  Alpha <= ALPHA_SNAP_LOW is zeroed
+                         first, but the real floor is about 32: see the note
+                         at ALPHA_SNAP_LOW (the edge octree's own transparent
+                         entry takes most pixels fainter than that);
       next 144 entries   opaque colours (alpha >= ALPHA_SNAP_HIGH becomes 255),
                          picked by median cut + k-means over the opaque pixels;
       last 111 entries   the antialiased edges, picked by the octree in
@@ -1112,9 +1214,10 @@ def quantise_sheet(sheet):
                          colour counts for as little as it shows.
 
     So a transparent pixel stays exactly transparent and an opaque one exactly
-    opaque -- both are checked by the caller.
+    opaque -- both are checked by the caller.  (A FAINT pixel may also end up
+    transparent, as above; that is by measurement, not by promise.)
     """
-    _pil, Image, ImageChops, _draw, _features = _pillow()
+    _pil, Image, ImageChops, _draw = _pillow()
     low, high = ALPHA_SNAP_LOW, ALPHA_SNAP_HIGH
     alpha = sheet.getchannel("A").point(
         [0 if v <= low else 255 if v >= high else v for v in range(256)])
@@ -1200,7 +1303,7 @@ def encode_sheet(sheet, palette) -> tuple:
     1 px ring between tiles depends on it) and an opaque pixel must still be
     opaque.  ``rgba`` exists for the size and quality comparison only.
     """
-    _pil, Image, ImageChops, _draw, _features = _pillow()
+    _pil, Image, ImageChops, _draw = _pillow()
     if palette == "rgba":
         buf = io.BytesIO()
         sheet.save(buf, format="PNG", optimize=True)
@@ -1322,7 +1425,7 @@ def notice_text(shortcode_license, palette) -> str:
         "Full text of the graphics licence:",
         "https://github.com/jdecked/twemoji/blob/v%s/LICENSE-GRAPHICS" % TWEMOJI_VERSION,
         "",
-        changes,
+    ] + textwrap.wrap(changes, 79) + [
         "",
         "",
         "2. Emoji names and sequences - Unicode emoji-test.txt %s (Unicode License v3)"
@@ -1353,9 +1456,71 @@ def _source_text(source) -> str:
     return json.dumps(source, indent=2, sort_keys=True) + "\n"
 
 
-def build(cache_dir, out_root, palette="256", skin_tone_tiles=True, out=print) -> dict:
-    """Build the pack from the cache and write its four files under ``out_root``."""
-    pil, _image, _chops, _draw, _features = _pillow()
+def _inside(path, root) -> bool:
+    try:
+        Path(path).resolve().relative_to(Path(root).resolve())
+    except ValueError:
+        return False
+    return True
+
+
+#: The input checksums ``--build`` compares with the committed SOURCE.json:
+#: (section, key, what to call it).
+PINNED_INPUT_HASHES = (
+    ("emoji_test", "sha256", "emoji-test.txt"),
+    ("shortcodes", "sha256", "the discord-emoji tarball"),
+    ("shortcodes", "member_sha256", "the shortcode module inside the tarball"),
+    ("twemoji", "listing_sha256", "the Twemoji file listing"),
+    ("twemoji", "manifest_sha256", "the Twemoji PNGs"),
+)
+
+
+def changed_inputs(record, committed) -> list:
+    """Sentences naming every input whose checksum differs from ``committed``
+    (the parsed SOURCE.json of the pack in the repository); ``[]`` when all match.
+
+    The inputs are pinned by URL and version only -- a CDN could serve other
+    bytes under the same name.  This is what notices.
+    """
+    out = []
+    old_inputs = committed.get("inputs") if isinstance(committed, dict) else None
+    if not isinstance(old_inputs, dict):
+        return ["the committed SOURCE.json records no inputs to compare with"]
+    for section, key, label in PINNED_INPUT_HASHES:
+        old = old_inputs.get(section)
+        old = old.get(key) if isinstance(old, dict) else None
+        new = record[section][key]
+        if old != new:
+            out.append("%s changed: the committed pack was built from %s, the cache "
+                       "holds %s" % (label, old, new))
+    return out
+
+
+def _committed_source(repo_root):
+    """The repository's SOURCE.json parsed, None when there is none yet."""
+    path = Path(repo_root) / REL_SOURCE
+    if not path.is_file():
+        return None
+    try:
+        return json.loads(path.read_bytes().decode("utf-8"))
+    except (UnicodeDecodeError, ValueError):
+        return {}
+
+
+def build(cache_dir, out_root, palette="256", skin_tone_tiles=True, out=print,
+          strict=False, repo_root=REPO_ROOT) -> dict:
+    """Build the pack from the cache and write its four files under ``out_root``.
+
+    ``rgba`` is a comparison build and is refused anywhere inside the repository
+    (the shipped sheet is always the palette PNG).  The cache's checksums are
+    compared with the repository's SOURCE.json: a difference is a WARNING that
+    names the input -- or, with ``strict``, a refusal before anything is written.
+    """
+    out_root = Path(out_root)
+    if palette == "rgba" and _inside(out_root, repo_root):
+        raise BuildError("--palette rgba is a comparison build and never goes into the "
+                         "repository: give --out a directory outside %s" % repo_root)
+    pil, _image, _chops, _draw = _pillow()
     inputs = load_inputs(cache_dir)
     table = build_table(inputs.lines, inputs.shortcodes, skin_tone_tiles=skin_tone_tiles)
     if table["count"] != EXPECTED_COUNT:
@@ -1379,6 +1544,20 @@ def build(cache_dir, out_root, palette="256", skin_tone_tiles=True, out=print) -
 
     record = dict(inputs.record)
     record["twemoji"] = dict(record["twemoji"], **twemoji)
+    committed = _committed_source(repo_root)
+    if committed is None:
+        out("note: no %s in the repository yet -- nothing to compare the inputs with"
+            % REL_SOURCE)
+    else:
+        changed = changed_inputs(record, committed)
+        for sentence in changed:
+            out("WARNING: " + sentence)
+        if changed and strict:
+            raise BuildError("--strict: %d input(s) differ from the committed %s -- "
+                             "nothing was written" % (len(changed), REL_SOURCE))
+        if not changed:
+            out("inputs: all %d checksums match the committed %s"
+                % (len(PINNED_INPUT_HASHES), REL_SOURCE))
     source = {
         "tool": "tools/build_emoji_pack.py",
         "tool_version": TOOL_VERSION,
@@ -1408,7 +1587,6 @@ def build(cache_dir, out_root, palette="256", skin_tone_tiles=True, out=print) -
         },
     }
 
-    out_root = Path(out_root)
     _atomic_write(out_root / REL_SHEET, sheet_bytes)
     _atomic_write(out_root / REL_TABLE, table_bytes)
     _atomic_write(out_root / REL_NOTICE,
@@ -1451,7 +1629,7 @@ COMPARE_NAMES = (
 def compare_image(rgba_sheet, palette_sheet, table, caption=""):
     """A contact sheet on Discord's dark background: for each sample tile the
     256-colour version beside the RGBA one, at 4x (nearest) and at true size."""
-    _pil, Image, _chops, ImageDraw, _features = _pillow()
+    _pil, Image, _chops, ImageDraw = _pillow()
     by_name = {}
     for row in table["emoji"]:
         for name in row[2]:
@@ -1522,7 +1700,10 @@ def main(argv) -> int:
     mode.add_argument("--build", action="store_true", help="build the pack")
     mode.add_argument("--compare", metavar="OUT.png",
                       help="write a 256-colour vs RGBA contact sheet")
-    parser.add_argument("--palette", choices=("256", "rgba"), default="256")
+    parser.add_argument(
+        "--palette", choices=("256", "rgba"), default="256",
+        help="256 is the shipped format; rgba is for comparison and needs --out "
+             "outside the repository")
     parser.add_argument(
         "--cache", default=str(CACHE_DIR), metavar="DIR",
         help="download cache (default tools/_cache/emoji/). It holds about 3,800 "
@@ -1534,6 +1715,10 @@ def main(argv) -> int:
     parser.add_argument(
         "--no-skin-tones", action="store_true",
         help="--build: the over-budget fallback -- a toned emoji reuses its base tile")
+    parser.add_argument(
+        "--strict", action="store_true",
+        help="--build: refuse (instead of warn) when an input's checksum differs "
+             "from the committed assets/emoji/SOURCE.json")
     args = parser.parse_args(argv)
 
     try:
@@ -1543,13 +1728,17 @@ def main(argv) -> int:
             fetch(Net(), args.cache)
         elif args.build:
             build(args.cache, args.out, args.palette,
-                  skin_tone_tiles=not args.no_skin_tones)
+                  skin_tone_tiles=not args.no_skin_tones, strict=args.strict)
         else:
             compare(args.cache, args.compare)
         return 0
     except BuildError as exc:
         print("build_emoji_pack: ERROR - %s" % exc, file=sys.stderr)
         return 2
+    except Exception as exc:        # a dev tool ends in one line, never a traceback
+        print("build_emoji_pack: ERROR - unexpected %s: %s" % (type(exc).__name__, exc),
+              file=sys.stderr)
+        return 3
 
 
 if __name__ == "__main__":

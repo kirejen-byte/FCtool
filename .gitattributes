@@ -1,5 +1,6 @@
 *.gz binary
 *.json.gz binary
+*.png binary
 # vendor/x11helper.zip is byte-reproducible (tools/build_x11helper_zip.py); any
 # eol/text munging would break that contract.
 *.zip binary

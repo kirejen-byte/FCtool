@@ -28,7 +28,9 @@ and its LICENSE file names the copyright holders:
 Full text of the graphics licence:
 https://github.com/jdecked/twemoji/blob/v16.0.1/LICENSE-GRAPHICS
 
-Changes made: every 72x72 graphic was resized to 22x22 pixels and all of them were combined into one sprite sheet, which was then reduced to one shared 256-colour palette.
+Changes made: every 72x72 graphic was resized to 22x22 pixels and all of them
+were combined into one sprite sheet, which was then reduced to one shared
+256-colour palette.
 
 
 2. Emoji names and sequences - Unicode emoji-test.txt 16.0 (Unicode License v3)
