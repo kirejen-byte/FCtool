@@ -22,20 +22,37 @@ Rules the shell keeps
 ``make_modal(grab=False, center=False)`` -- not centred, because it hangs from
 the point it was opened at.
 
-**The grid is virtual.**  The 54 cell widgets are made once per popup and
-re-used for every page, category and query; a category of 500 emoji scrolls
-through them (wheel, the two arrows, the arrow keys, PageUp / PageDown).  Only
-the visible cells ask ``tiles.image(seq)``; nothing is preloaded.  A cell whose
-tile is None -- or a picker given ``tiles=None`` -- shows the raw character.
+**The grid is virtual, and it is ONE canvas.**  The 54 cells are items on a
+single ``tk.Canvas`` -- an image item and a text item per cell, plus one
+highlight rectangle -- made once per popup and re-used for every page,
+category and query; a category of 500 emoji scrolls through them (wheel, the
+two arrows, the arrow keys, PageUp / PageDown).  Nothing is created per emoji.
+(54 Label widgets were measured mapping 2.3x slower than one canvas with the
+same content, and the popup opens while the user is typing.)  Only the cells
+whose content changed ask ``tiles.image(seq)``; nothing is preloaded.  A cell
+whose tile is None, raises, or is not an image -- or a picker given
+``tiles=None`` -- shows the raw character, cell by cell; a press picks only
+what a cell actually shows.
 
 **When it closes.**  On Esc, on a pick, and when the keyboard focus has left
-both the popup and (``take_focus=False``) the widget that was driving it.  The
-last one is decided ``_FOCUS_SETTLE_MS`` after a ``<FocusOut>``, never on the
-event itself: Windows takes the focus from the old window BEFORE it gives it to
-the new one, so a hand-off inside the app first reads as "no focus".  A press
-anywhere inside the popup cancels a pending decision (the ``motd_palette``
-rule), and a popup that never had the focus is never closed for that alone --
-no ``<FocusOut>`` ever reaches it.
+both the popup and (``take_focus=False``) the widget that was driving it -- the
+OWNER, the widget that had the focus when the popup opened; the popup also
+closes when the owner is destroyed.  The focus rule is decided
+``_FOCUS_SETTLE_MS`` after a ``<FocusOut>``, never on the event itself: Windows
+takes the focus from the old window BEFORE it gives it to the new one, so a
+hand-off inside the app first reads as "no focus".  A press anywhere inside the
+popup cancels a pending decision (the ``motd_palette`` rule), and a popup that
+never had the focus is never closed for that alone -- no ``<FocusOut>`` ever
+reaches it.  **Limit:** the picker's ``<FocusOut>`` binding on the owner is
+added after the owner's own; an owner whose own ``<FocusOut>`` handler returns
+``"break"`` ends the chain before it and so suppresses the picker's check --
+such an owner must call :meth:`EmojiPicker.close` itself.
+
+**Callbacks never raise into Tk.**  ``on_pick`` and ``on_close`` run inside a
+key or mouse binding (or inside the editor's own key handler, when it forwards
+Return); a raise in either is swallowed and logged -- the exception TYPE only,
+in ASCII.  ``on_close`` is called exactly once after the popup is gone,
+however it closed; on a pick it runs BEFORE ``on_pick``.
 
 **A pick is dispatched on the PRESS**, not the release: in autocomplete mode
 the press moves the focus out of the editor, and whatever the editor's owner
@@ -50,13 +67,14 @@ therefore taken only while the application has the focus, and the popup closes
 when the application loses it (the focus rule above).
 
 **Lifetime.**  ``close()`` destroys the popup, cancels the one ``after`` this
-module ever schedules, removes the search variable's trace and the binding on
-the driving widget; twice is harmless.  A popup destroyed from outside (its
+module ever schedules, removes the search variable's trace and the two
+bindings on the owner; twice is harmless.  A popup destroyed from outside (its
 parent went away) tears down the same way through ``<Destroy>``.
 
 Test seams (all on the instance): ``_focus_name`` (which widget has the
 focus), ``_work_area`` (the monitor's usable rectangle) and the widget
-attributes ``_win``, ``_entry``, ``_var``, ``_cells``, ``_strip``,
+attributes ``_win``, ``_entry``, ``_var``, ``_canvas`` (with its item ids
+``_image_items``, ``_text_items``, ``_highlight``), ``_strip``,
 ``_name_label``, ``_code_label``, ``_range_label``, ``_page_up``,
 ``_page_down``.
 """
@@ -69,7 +87,7 @@ from ui_helpers import make_modal
 from ui_theme import (BG_ENTRY, BG_PANEL, BG_SELECT, BORDER_COLOR, FG_ACCENT,
                       FG_DIM, FG_TEXT)
 
-#: The grid. 9 x 6 = 54 cells is the whole budget of cell widgets.
+#: The grid. 9 x 6 = 54 cells is the whole budget of cells.
 COLS = 9
 ROWS = 6
 PAGE = COLS * ROWS
@@ -270,20 +288,41 @@ _MOVE_KEYS = (("<Up>", 0, -1), ("<Down>", 0, 1),
               ("<Prior>", 0, -ROWS), ("<Next>", 0, ROWS))
 
 
+def _log_raise(what: str, exc) -> None:
+    """One WARNING saying which callback raised and the exception's TYPE --
+    never its message, which may carry anything (and this box's console is
+    cp1252: a non-ASCII log line prints a "Logging error" traceback).  The
+    logger is fetched HERE, never at import.  Never raises."""
+    try:
+        from app_log import get_logger
+        kind = type(exc).__name__.encode("ascii", "backslashreplace")
+        get_logger(__name__).warning("[Emoji] picker %s raised %s", what,
+                                     kind.decode("ascii"))
+    except Exception:
+        pass
+
+
 class EmojiPicker:
     """The picker. One object serves many openings; the popup itself exists
-    only between :meth:`open_at` and :meth:`close`.
+    only between :meth:`open_at` and :meth:`close`.  Tk-thread only.
 
-    ``parent``  any widget of the window the popup belongs to.
-    ``tiles``   an ``emoji_tiles.EmojiTiles`` (``image(seq)``), or None.
-    ``on_pick`` called with the chosen sequence, AFTER the popup is closed.
+    ``parent``   any widget of the window the popup belongs to.
+    ``tiles``    an ``emoji_tiles.EmojiTiles`` (``image(seq)``), or None.
+    ``on_pick``  called with the chosen sequence, AFTER the popup is closed.
+    ``on_close`` called with no argument, exactly once after the popup is
+                 gone, however it closed (the caller puts the focus back in
+                 its editor); on a pick it runs before ``on_pick``.
     ``search`` / ``groups`` default to ``emoji_data``'s (injectable for tests).
+
+    A raise in ``on_pick`` / ``on_close`` is swallowed and logged.
     """
 
-    def __init__(self, parent, *, tiles, on_pick, search=None, groups=None):
+    def __init__(self, parent, *, tiles, on_pick, search=None, groups=None,
+                 on_close=None):
         self._parent = parent
         self._tiles = tiles
         self._on_pick = on_pick
+        self._on_close = on_close
         self._search = search if callable(search) else emoji_data.search
         self._groups_fn = groups if callable(groups) else emoji_data.groups
         self._model = GridModel()
@@ -298,10 +337,13 @@ class EmojiPicker:
         self._var = None
         self._trace_id = None
         self._muted = False             # set_query is writing the variable
-        self._blank = None              # the 1 px image every cell is sized by
-        self._cells = []
+        self._canvas = None             # the grid: ONE widget
+        self._image_items = []          # canvas item ids, one pair per cell
+        self._text_items = []
+        self._highlight = None          # the one highlight rectangle
         self._cell_seq = []             # what each cell shows right now
         self._lit = -1                  # the cell painted as highlighted
+        self._cursor = ""               # the canvas cursor as last set
         self._strip = []
         self._groups = []
         self._name_label = None
@@ -315,7 +357,7 @@ class EmojiPicker:
         self._takes_focus = True
         self._focus_after = None        # the one ``after`` this module arms
         self._owner = None              # take_focus=False: the driving widget
-        self._owner_bind = None
+        self._owner_binds = []          # [(sequence, funcid)] on the owner
         self._pointer = None            # where the pointer was last seen
 
     # ==================================================================== #
@@ -328,11 +370,15 @@ class EmojiPicker:
         showing ``query``'s results (the remembered category when empty).
 
         ``take_focus=False`` leaves the keyboard where it is. Called on an
-        open popup it moves it and applies ``query``; nothing is rebuilt."""
-        x, y = int(x_root), int(y_root)
+        open popup it moves it (and raises it) and applies ``query``; nothing
+        is rebuilt. A coordinate that is no number falls back to the pointer's
+        position -- never an exception."""
+        x, y = self._anchor(x_root, y_root)
         take_focus = bool(take_focus)
         if self._win is not None and take_focus != self._takes_focus:
-            self.close()
+            # Another mode needs another popup. The caller still has a picker
+            # open when this returns, so this is not a close it is told about.
+            self._teardown(True, notify=False)
         fresh = self._win is None
         if fresh and not self._build():
             return
@@ -366,20 +412,43 @@ class EmojiPicker:
             self._render()
 
     def accept(self) -> bool:
-        """Pick the highlighted emoji: close, then ``on_pick(seq)``. False --
-        and nothing happens -- when there is none."""
+        """Pick the highlighted emoji: close (``on_close``), then
+        ``on_pick(seq)``. False -- and nothing happens -- when there is none.
+        True even when ``on_pick`` raised: the pick was made, the raise is
+        logged and never reaches the key or mouse binding that called this."""
         if self._win is None:
             return False
         seq = getattr(self._model.selected(), "seq", None)
         if not seq:
             return False
         self.close()
-        self._on_pick(seq)
+        self._call("on_pick", self._on_pick, seq)
         return True
 
     def close(self) -> None:
-        """Destroy the popup and everything it armed. Harmless when closed."""
+        """Destroy the popup and everything it armed, then ``on_close``.
+        Harmless when closed (``on_close`` is not called again)."""
         self._teardown(True)
+
+    def _call(self, what: str, callback, *args) -> None:
+        """Run a caller's callback; a raise is logged, never let out."""
+        if not callable(callback):
+            return
+        try:
+            callback(*args)
+        except Exception as exc:
+            _log_raise(what, exc)
+
+    def _anchor(self, x_root, y_root) -> tuple:
+        try:
+            return (int(x_root), int(y_root))
+        except (TypeError, ValueError, OverflowError):
+            pass
+        try:
+            x, y = self._parent.winfo_pointerxy()
+            return (int(x), int(y))
+        except Exception:
+            return (0, 0)
 
     # ==================================================================== #
     # build / teardown                                                     #
@@ -413,7 +482,7 @@ class EmojiPicker:
                           max(1, win.winfo_reqheight()))
             self._flip_gap = max(0, self._entry.winfo_reqheight())
         except tk.TclError:
-            self._teardown(True)
+            self._teardown(True, notify=False)      # it never opened
             return False
         return True
 
@@ -466,25 +535,29 @@ class EmojiPicker:
 
         middle = tk.Frame(body, bg=BG_PANEL)
         middle.pack(padx=4, pady=2)
-        grid = tk.Frame(middle, bg=BG_PANEL)
-        grid.pack(side=tk.LEFT)
-        # Every cell ALWAYS carries an image -- its tile, or this blank one
-        # under the character -- because a Label with an image reads width /
-        # height in pixels: that is what keeps the grid a fixed size.
-        self._blank = tk.PhotoImage(master=win, width=1, height=1)
+        # The grid is ONE widget. Every cell is an image item (its tile) and
+        # a text item (the character, when there is no tile) at the cell's
+        # centre; both exist from the start and are only ever reconfigured.
+        canvas = tk.Canvas(middle, width=COLS * CELL_PX, height=ROWS * CELL_PX,
+                           bg=BG_PANEL, bd=0, highlightthickness=0)
+        canvas.pack(side=tk.LEFT)
+        self._canvas = canvas
+        # Created first, so it is drawn under every cell.
+        self._highlight = canvas.create_rectangle(
+            0, 0, CELL_PX, CELL_PX, fill=BG_SELECT, outline="", state="hidden")
         for index in range(PAGE):
-            cell = tk.Label(grid, image=self._blank, text="",
-                            compound="center", width=CELL_PX, height=CELL_PX,
-                            bd=0, padx=0, pady=0, highlightthickness=0,
-                            bg=BG_PANEL, fg=FG_TEXT, font=_CELL_FONT)
-            cell.grid(row=index // COLS, column=index % COLS)
-            # Bound once; the handlers read what the cell shows NOW.
-            cell.bind("<Button-1>",
-                      lambda _e, i=index: self._on_cell_press(i))
-            cell.bind("<Motion>",
-                      lambda event, i=index: self._on_cell_motion(i, event))
-            self._cells.append(cell)
+            cx = (index % COLS) * CELL_PX + CELL_PX // 2
+            cy = (index // COLS) * CELL_PX + CELL_PX // 2
+            self._image_items.append(
+                canvas.create_image(cx, cy, state="hidden"))
+            self._text_items.append(
+                canvas.create_text(cx, cy, text="", font=_CELL_FONT,
+                                   fill=FG_TEXT, state="hidden"))
         self._cell_seq = [None] * PAGE
+        # Bound once, on the canvas; the handlers work out the cell from the
+        # event's position and read what that cell shows NOW.
+        canvas.bind("<Button-1>", self._on_canvas_press)
+        canvas.bind("<Motion>", self._on_canvas_motion)
 
         pager = tk.Frame(middle, bg=BG_PANEL)
         pager.pack(side=tk.LEFT, fill=tk.Y, padx=(2, 0))
@@ -530,7 +603,10 @@ class EmojiPicker:
         except tk.TclError:
             return self._parent
 
-    def _teardown(self, destroy: bool) -> None:
+    def _teardown(self, destroy: bool, notify: bool = True) -> None:
+        """The ONE way a popup ends. ``destroy`` False when Tk is already
+        destroying it; ``notify`` False when the caller never had, or still
+        has, an open picker (a failed build, a change of mode)."""
         win = self._win
         if win is None:
             return
@@ -548,6 +624,8 @@ class EmojiPicker:
             except tk.TclError:
                 pass
         self._reset()
+        if notify:
+            self._call("on_close", self._on_close)
 
     def _on_destroy(self, event) -> None:
         # <Destroy> reaches the popup's bindings for every descendant too.
@@ -634,37 +712,56 @@ class EmojiPicker:
             return
         visible = self._model.visible()
         count = len(visible)
-        try:
-            for index, cell in enumerate(self._cells):
-                seq = None
-                if index < count:
-                    seq = getattr(visible[index], "seq", None) or None
-                if seq == self._cell_seq[index]:
-                    continue
-                if seq is None:
-                    cell.configure(image=self._blank, text="", cursor="")
-                else:
-                    image = self._tile(seq)
-                    if image is None:
-                        cell.configure(image=self._blank, text=seq,
-                                       cursor="hand2")
-                    else:
-                        cell.configure(image=image, text="", cursor="hand2")
+        for index in range(len(self._cell_seq)):
+            seq = None
+            if index < count:
+                seq = getattr(visible[index], "seq", None) or None
+            if seq == self._cell_seq[index]:
+                continue
+            # Guarded PER CELL: one bad tile must not blank the cells after it.
+            try:
+                self._paint_cell(index, seq)
                 self._cell_seq[index] = seq
+            except tk.TclError:
+                self._cell_seq[index] = None    # shows nothing: not pickable
+        try:
             self._restyle_selection()
             self._update_footer()
         except tk.TclError:
             pass
 
+    def _paint_cell(self, index: int, seq) -> None:
+        """Show ``seq`` in cell ``index``: its tile, else the character."""
+        canvas = self._canvas
+        image_item = self._image_items[index]
+        text_item = self._text_items[index]
+        if seq is None:
+            canvas.itemconfigure(image_item, image="", state="hidden")
+            canvas.itemconfigure(text_item, text="", state="hidden")
+            return
+        image = self._tile(seq)
+        if image is not None:
+            try:
+                canvas.itemconfigure(image_item, image=image, state="normal")
+                canvas.itemconfigure(text_item, text="", state="hidden")
+                return
+            except tk.TclError:
+                pass        # not an image: this cell falls back to the text
+        canvas.itemconfigure(image_item, image="", state="hidden")
+        canvas.itemconfigure(text_item, text=seq, state="normal")
+
     def _restyle_selection(self) -> None:
         lit = self._model.selected_cell()
         if lit == self._lit:
             return
-        cells = self._cells
-        if 0 <= self._lit < len(cells):
-            cells[self._lit].configure(bg=BG_PANEL)
-        if 0 <= lit < len(cells):
-            cells[lit].configure(bg=BG_SELECT)
+        canvas = self._canvas
+        if 0 <= lit < PAGE:
+            x = (lit % COLS) * CELL_PX
+            y = (lit // COLS) * CELL_PX
+            canvas.coords(self._highlight, x, y, x + CELL_PX, y + CELL_PX)
+            canvas.itemconfigure(self._highlight, state="normal")
+        else:
+            canvas.itemconfigure(self._highlight, state="hidden")
         self._lit = lit
 
     def _restyle_strip(self) -> None:
@@ -729,7 +826,8 @@ class EmojiPicker:
                 win.wm_deiconify()
                 win.lift()
             else:
-                win.update_idletasks()      # apply the move now
+                win.update_idletasks()      # apply the move now ...
+                win.lift()                  # ... and come back to the front
         except tk.TclError:
             pass
 
@@ -757,10 +855,41 @@ class EmojiPicker:
         except (tk.TclError, AttributeError):
             return None
 
+    @staticmethod
+    def _cell_at(x, y) -> int:
+        """The cell under canvas point ``(x, y)``, or -1."""
+        try:
+            col, row = int(x) // CELL_PX, int(y) // CELL_PX
+        except (TypeError, ValueError):
+            return -1
+        if 0 <= col < COLS and 0 <= row < ROWS:
+            return row * COLS + col
+        return -1
+
+    def _on_canvas_press(self, event):
+        return self._on_cell_press(
+            self._cell_at(getattr(event, "x", None), getattr(event, "y", None)))
+
+    def _on_canvas_motion(self, event) -> None:
+        index = self._cell_at(getattr(event, "x", None),
+                              getattr(event, "y", None))
+        filled = 0 <= index < len(self._cell_seq) and self._cell_seq[index]
+        cursor = "hand2" if filled else ""
+        if cursor != self._cursor and self._canvas is not None:
+            self._cursor = cursor
+            try:
+                self._canvas.configure(cursor=cursor)
+            except tk.TclError:
+                pass
+        self._on_cell_motion(index, event)
+
     def _on_cell_press(self, index: int):
         """A press on a cell picks its emoji (see the module docstring for
-        why the press, not the release). An empty cell is not a pick."""
-        if self._win is None or not self._model.has_cell(index):
+        why the press, not the release). A cell that SHOWS nothing -- empty,
+        or one that could not be painted -- is not a pick."""
+        if (self._win is None or not 0 <= index < len(self._cell_seq)
+                or not self._cell_seq[index]
+                or not self._model.has_cell(index)):
             return None
         self._model.select_cell(index)
         self.accept()
@@ -826,30 +955,49 @@ class EmojiPicker:
 
     def _watch_owner(self) -> None:
         """``take_focus=False``: remember which widget is driving the popup
-        and hear about it losing the focus. The popup itself holds no focus
-        in this mode, so no ``<FocusOut>`` of its own could ever close it."""
+        and hear about it losing the focus or being destroyed. The popup
+        itself holds no focus in this mode, so no ``<FocusOut>`` of its own
+        could ever close it."""
         name = self._focus_name()
         if not name or self._inside(name):
             return
         try:
             owner = self._win.nametowidget(name)
-            funcid = owner.bind("<FocusOut>", self._on_focus_out, add="+")
         except (KeyError, tk.TclError):
             return
+        binds = []
+        try:
+            for sequence, handler in (("<FocusOut>", self._on_focus_out),
+                                      ("<Destroy>", self._on_owner_destroy)):
+                binds.append((sequence, owner.bind(sequence, handler, add="+")))
+        except tk.TclError:
+            pass
         self._owner = owner
-        self._owner_bind = funcid
+        self._owner_binds = binds
 
     def _release_owner(self) -> None:
-        owner, funcid = self._owner, self._owner_bind
+        owner, binds = self._owner, self._owner_binds
         self._owner = None
-        self._owner_bind = None
-        if owner is None or not funcid:
+        self._owner_binds = []
+        if owner is None:
             return
-        try:
-            # funcid-scoped: the owner's own <FocusOut> handlers stay.
-            owner.unbind("<FocusOut>", funcid)
-        except Exception:
-            pass
+        for sequence, funcid in binds:
+            try:
+                # funcid-scoped: the owner's own handlers stay.
+                owner.unbind(sequence, funcid)
+            except Exception:
+                pass
+
+    def _on_owner_destroy(self, event) -> None:
+        """The driving widget is being destroyed while the popup's own
+        parent may live on: nothing is left to drive the popup."""
+        if (self._owner is None
+                or getattr(event, "widget", None) is not self._owner):
+            return
+        # Its bindings die with it; unbinding a widget mid-destroy is noise.
+        self._owner = None
+        self._owner_binds = []
+        self.close()
 
     def _on_focus_out(self, _event=None) -> None:
         """The popup, something in it, or the driving widget lost the focus.
