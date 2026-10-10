@@ -13238,13 +13238,24 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         old_name = doctrine.name
         if not new_name or new_name == old_name:
             return
+        # Did the old name resolve to THIS doctrine (first match, the way the two
+        # doctrine combos resolve it)? Asked while it still carries the name.
+        shown = next((d for d in self.fittings.list_doctrines()
+                      if (d.name or "") == old_name), None) is doctrine
         doctrine.name = new_name
-        if not self.fittings.update_doctrine(doctrine):
-            doctrine.name = old_name        # the library no longer holds it
+        renamed = False
+        try:
+            if self.fittings.update_doctrine(doctrine):
+                self.fittings.save()
+                renamed = True
+        finally:
+            if not renamed:                 # refused, or the save raised
+                doctrine.name = old_name
+        if not renamed:
             return
-        self.fittings.save()
-        self._motd_follow_doctrine_rename(old_name, new_name)
+        self._motd_follow_doctrine_rename(old_name, new_name, shown)
         self._refresh_doctrine_list()
+        self._refit_refresh_library_views()     # a fit's detail names its doctrines
         self._show_doctrine_detail(doctrine_id)
 
     def _duplicate_doctrine(self, doctrine_id):
@@ -14554,21 +14565,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             "Auto-update MOTD to resume). Your remembered on/off choice is "
             "left alone, so restarting FCTool resumes it too. Does nothing if "
             "no staging system is set.")
-        # wraplength: only the group-import notice is longer than 28 characters;
-        # it wraps instead of widening the row past the pane (it is 81 characters
-        # long). One pixel short of 29 characters: no line of the notice is
-        # wider than the widest other state (28 characters), and that state
-        # keeps most of a character of room before it would wrap itself.
-        # Its OWN line under the checkboxes (packed BOTTOM, ahead of them in the
+        # Its OWN line under the controls (packed BOTTOM, ahead of them in the
         # packing order): beside them the row asked for 544 px (611 at tk scaling
         # 1.51) of the 543 it gets at the 1000x700 minimum and pack cut the
-        # indicator, the last slave, to 22 px. Borderless: the pill canvas pays
-        # for the line and has 16 px to spare at tk scaling 1.51.
+        # indicator, the last slave, to 22 px. Borderless: the pill canvas, the
+        # panel's one weighted row, pays for every pixel of this line.
+        # wraplength = what the five controls above ask for: only the group-import
+        # notice (81 characters) is wider, and it wraps on two lines instead of
+        # widening the row past the pane; every other state (28 at most) fits.
         self._motd_link_indicator = tk.Label(
             link_row, text="○ not linked", font=("Consolas", 8), fg=FG_DIM,
             bg=BG_PANEL, cursor="question_arrow", justify=tk.LEFT, bd=0, pady=0,
-            wraplength=tkfont.Font(root=link_row,
-                                   font=("Consolas", 8)).measure("0" * 29) - 1)
+            wraplength=sum(w.winfo_reqwidth() for w in link_row.pack_slaves()))
         self._motd_link_indicator.pack(side=tk.BOTTOM, anchor=tk.W, padx=2,
                                        before=_link_chk)
         _link_tip = ("When ON, re-checks the MOTD every N seconds (adjustable) "
@@ -15420,29 +15428,32 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # would not appear until the FC changed doctrine by hand.
         self._refits_update_buttons()
 
-    def _motd_follow_doctrine_rename(self, old, new):
-        """A doctrine was renamed in the library: what knows it BY NAME follows.
-        Saved MOTD templates linked to ``old`` and the remembered Fleet-tab pick
-        are re-linked (ONE ``_save_config``, only when something was written), a
-        doctrine combo that showed ``old`` (composer, Fleet tab) shows ``new``,
-        the composer's two lists are re-filled. NOT a doctrine switch: no dirty
-        mark, no discard prompt, no template auto-apply, no canvas load, no push
-        (the baseline holds no doctrine, so clean stays clean). While a twin
-        still carries ``old`` (rename / new allow one) it still resolves and
-        nothing is moved."""
-        if old and not any((d.name or "") == old
-                           for d in self.fittings.list_doctrines()):
-            wrote = False
+    def _motd_follow_doctrine_rename(self, old, new, shown):
+        """A doctrine was renamed in the library: what knows it BY NAME follows
+        (ONE ``_save_config``, only when something was written). NOT a doctrine
+        switch: no dirty mark, no discard prompt, no template auto-apply, no
+        canvas load, no push (the baseline holds no doctrine: clean stays clean).
+
+        Saved MOTD templates linked to ``old`` are re-linked only while their
+        owner is certain - no other doctrine carries ``old`` or ``new`` (rename
+        and new allow twins); otherwise none moves, and renaming back restores
+        every link by itself. ``shown`` (``old`` resolved to THIS doctrine, asked
+        before the rename): the composer's and the Fleet tab's combo and the
+        remembered Fleet pick follow when they held ``old``. Onto a name another
+        doctrine carries they then resolve the first match in library order -
+        the collision's own ambiguity, not settled here."""
+        names = [(d.name or "") for d in self.fittings.list_doctrines()]
+        wrote = False
+        if old and old not in names and names.count(new) == 1:
             for saved in self._saved_motds():
                 if isinstance(saved, dict) and saved.get("doctrine") == old:
                     saved["doctrine"] = new
                     wrote = True
+        if old and shown:
             fleet = self.config.get("fleet")
             if isinstance(fleet, dict) and fleet.get("active_doctrine") == old:
                 fleet["active_doctrine"] = new
                 wrote = True
-            if wrote:
-                self._save_config()
             fvar = getattr(self, "_fleet_doctrine_var", None)
             if fvar is not None and fvar.get() == old:
                 fvar.set(new)
@@ -15450,6 +15461,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             if mvar is not None and mvar.get() == old:
                 mvar.set(new)
                 self._motd_doctrine_prev = new
+        if wrote:
+            self._save_config()
         self._motd_refresh_doctrines()
         self._motd_refresh_saved_dropdown()
 
