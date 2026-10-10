@@ -142,6 +142,10 @@ import motd_markup
 import motd_doc
 import motd_palette
 import pill_canvas
+# Discord ping ("Copy ping", MOTD builder): config store, pure composer, editor.
+import ping_store
+import ping_compose
+import ping_dialog
 import system_coords
 from markup_editor import MarkupEditor
 from eveo_tracker import find_thumbs, preview_running, reset_process_cache
@@ -350,7 +354,7 @@ from ui_theme import (
 from ui_helpers import (make_modal, attach_tooltip, update_tooltip,
                         relift_topmost_tooltips, center_over,
                         make_glyph_button, normalize_hex_color,
-                        make_color_swatch)
+                        make_color_swatch, make_split_button)
 
 # Update awareness. app_version owns the released version string (and the one
 # tag parser); update_check owns the single GitHub /releases/latest call and the
@@ -3245,6 +3249,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
                          font=self._btn_font_bold, padding=(8, 4))
         style.map("Red.TButton",
                   background=[("active", "#882233")])
+        style.configure("Yellow.TButton", background="#c9a400", foreground="#101010",
+                         font=self._btn_font_bold, padding=(8, 4))
+        style.map("Yellow.TButton",
+                  background=[("active", "#e0b800")],
+                  foreground=[("active", "#101010"), ("disabled", "#101010")])
         style.configure("Dark.TNotebook", background=BG_DARK, borderwidth=0)
         style.configure("Dark.TNotebook.Tab", background=BG_PANEL,
                          foreground=FG_TEXT, font=("Consolas", 10),
@@ -13261,6 +13270,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         if new_id is None:
             return
         self.fittings.save()
+        try:    # the Discord ping entry travels with the copy; never blocks it
+            self._ping_store().copy_doctrine(doctrine_id, new_id)
+        except Exception as exc:
+            log.warning("ping: copy_doctrine failed (%s)", type(exc).__name__)
         self._doctrine_selected_id = new_id
         self._refresh_doctrine_list()
         self._motd_refresh_doctrines()
@@ -13292,6 +13305,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
             return
         self.fittings.delete_doctrine(doctrine_id)
         self.fittings.save()
+        try:    # ... and its Discord ping entry goes with it
+            self._ping_store().drop_doctrine(doctrine_id)
+        except Exception as exc:
+            log.warning("ping: drop_doctrine failed (%s)", type(exc).__name__)
         if self._doctrine_selected_id == doctrine_id:
             self._doctrine_selected_id = None
         self._refresh_doctrine_list()
@@ -14253,6 +14270,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         # "field still holds the global default" from "user/template owns it".
         self._motd_staging_autofilled_value = (
             self.config.get("zkillboard", {}).get("staging_system", "") or "").strip()
+        # Discord ping: the pending "When" (never persisted) + the one editor.
+        self._ping_when = ping_compose.WhenSession()
+        self._ping_dialog = None
 
         # Linked-MOTD auto-push state. The on/off choice is REMEMBERED across
         # restarts (config["fittings"]["motd_link"]); everything else here is
@@ -14473,13 +14493,29 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
                    command=self._copy_motd).pack(side=tk.LEFT, padx=2)
         ttk.Button(act_row, text="Clear MOTD", style="Red.TButton",
                    command=self._clear_motd).pack(side=tk.LEFT, padx=2)
-        ttk.Button(act_row, text="Refresh fleet", style="Dark.TButton",
+        # Second row: with "Copy ping" one row asked for 607 px (672 at tk scaling
+        # 1.51) of the 543 it gets at the 1000x700 minimum, and pack clips the rest.
+        act_row2 = tk.Frame(right, bg=BG_PANEL)
+        act_row2.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 8))
+        ttk.Button(act_row2, text="Refresh fleet", style="Dark.TButton",
                    command=self._motd_refresh_fleet_status).pack(
                        side=tk.LEFT, padx=2)
+        # Discord ping: main = copy, arrow = the editor. The <Enter> refresh is bound
+        # BEFORE attach_tooltip (both add="+"): the tip opens on the fresh text.
+        ping_btn = make_split_button(
+            act_row2, "Copy ping", style="Yellow.TButton",
+            command=self._copy_discord_ping, arrow_command=self._open_ping_dialog,
+            arrow_tooltip="Edit this doctrine's ping")
+        ping_btn.pack(side=tk.LEFT, padx=2)
+
+        def _ping_tip(_event=None):
+            update_tooltip(ping_btn.main, self._ping_preview_text())
+        ping_btn.main.bind("<Enter>", _ping_tip, add="+")
+        attach_tooltip(ping_btn.main, "")
         # Auto-update controls on their own row so the interval ("every N s")
         # and the link indicator are never clipped when the window is narrow.
         link_row = tk.Frame(right, bg=BG_PANEL)
-        link_row.grid(row=4, column=0, sticky="ew", padx=8, pady=(0, 4))
+        link_row.grid(row=5, column=0, sticky="ew", padx=8, pady=(0, 4))
         self._motd_link_var = tk.BooleanVar(value=self._motd_link_enabled)
         tk.Checkbutton(
             link_row, text="Auto-update MOTD", variable=self._motd_link_var,
@@ -14542,7 +14578,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
         self._motd_fleet_status = tk.Label(
             right, text="", font=("Consolas", 8), fg=FG_DIM, bg=BG_PANEL,
             anchor=tk.W, justify=tk.LEFT, wraplength=380)
-        self._motd_fleet_status.grid(row=5, column=0, sticky="ew", padx=8,
+        self._motd_fleet_status.grid(row=6, column=0, sticky="ew", padx=8,
                                      pady=(0, 8))
 
         # Populate dropdowns, load the default document, then first preview. The
@@ -17263,6 +17299,78 @@ class FCToolGUI(group_wiring.GroupConfigMixin):
                 text="Markup copied to clipboard.", fg=FG_GREEN)
         except Exception as e:
             messagebox.showerror("Copy failed", f"Could not copy markup:\n{e}", parent=getattr(self, "root", None))
+
+    # -- Discord ping: the yellow "Copy ping" split button (ping_*.py) ----------
+
+    def _ping_store(self):
+        """The discord_ping block's reader/writer. It is handed ``lambda:
+        self.config``, never the dict: Save Settings REPLACES self.config."""
+        return ping_store.PingStore(lambda: self.config, self._save_config)
+
+    def _ping_env(self):
+        """What a ping takes from the app right now: doctrine, FC, staging."""
+        doctrine = self._motd_selected_doctrine()
+        auth = self._motd_selected_fc_auth() or getattr(self, "esi_auth", None)
+        return ping_compose.Env(
+            getattr(doctrine, "id", None), getattr(doctrine, "name", None) or "",
+            getattr(auth, "character_name", None) or "",
+            (self.config.get("zkillboard", {}).get("staging_system") or "").strip())
+
+    def _ping_preview_text(self):
+        """The main button's tooltip: what a click would copy. Never raises."""
+        try:
+            now = int(time.time())
+            composed = ping_compose.compose(self._ping_store(), self._ping_env(),
+                                            self._ping_when.unix, now)
+            if not composed.text:
+                return ping_compose.summary(composed, consumed_when=None, now_unix=now)[0]
+            lines = composed.text.splitlines()[:14]
+            if composed.when_unix is not None:
+                lines.append("When resets to Now after this copy")
+            return "\n".join(lines)
+        except Exception:
+            return ""
+
+    def _copy_discord_ping(self):
+        """THE one ping copy -- the main button and the editor's button both end
+        here. A pending time is used up by a copy that SUCCEEDED, never else."""
+        dialog = getattr(self, "_ping_dialog", None)
+        editing = dialog is not None and dialog.alive()
+        if editing:
+            dialog.flush()          # a template edit still pending is copied too
+        now = int(time.time())
+        composed = ping_compose.compose(self._ping_store(), self._ping_env(),
+                                        self._ping_when.unix, now)
+        consumed = None
+        if composed.text:
+            try:
+                self.root.clipboard_clear()
+                self.root.clipboard_append(composed.text)
+            except Exception as e:
+                messagebox.showerror("Copy failed", f"Could not copy the ping:\n{e}",
+                                     parent=getattr(self, "root", None))
+                return
+            consumed = self._ping_when.consume()
+            if editing:
+                dialog.refresh_when()
+        text, level = ping_compose.summary(composed, consumed_when=consumed, now_unix=now)
+        self._motd_fleet_status.config(
+            text=text, fg=FG_GREEN if level == "ok" else FG_YELLOW)
+
+    def _open_ping_dialog(self):
+        """The arrow: open the ping editor, or lift the one already open."""
+        dialog = getattr(self, "_ping_dialog", None)
+        if dialog is not None and dialog.alive():
+            dialog.lift()
+            return
+        self._ping_dialog = ping_dialog.PingDialog(
+            self.root, store=self._ping_store(), env=self._ping_env,
+            when=self._ping_when, copy=self._copy_discord_ping,
+            system_names=lambda: list(getattr(self, "_system_names", []) or []),
+            confirm=lambda title, message: bool(messagebox.askyesno(
+                title, message, parent=getattr(self._ping_dialog, "win", self.root))),
+            emoji=False,
+            doctrine_ids=lambda: [d.id for d in self.fittings.list_doctrines()])
 
     # ── MOTD: import current MOTD + template persistence (Task 7.3) ────────────
 
@@ -39686,6 +39794,12 @@ $bmp.Dispose()
             hud = getattr(self, "_info_tiles", None)
             if hud is not None:
                 hud.shutdown()
+        except Exception:
+            pass
+        # The Discord ping editor stores a pending template edit as it closes.
+        try:
+            if getattr(self, "_ping_dialog", None) is not None:
+                self._ping_dialog.close()
         except Exception:
             pass
         # Cancel the market elapsed-ticker after() if a scan is mid-flight at
