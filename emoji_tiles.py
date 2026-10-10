@@ -42,8 +42,12 @@ trap), so the object holds every image it has handed out until
 :meth:`EmojiTiles.release`.
 
 A missing, corrupt or wrongly encoded sheet is never an exception and never a
-dialog: ``image()`` answers None, ONE warning is logged per ``EmojiTiles``
-object, and the file is not tried again until ``release()``.
+dialog: ``image()`` answers None and ONE warning is logged per ``EmojiTiles``
+object.  A sheet that is WRONG (damaged, wrongly encoded, too small, a layout
+this module will not cut) is not tried again until ``release()``.  A sheet
+that could not be READ (an ``OSError`` on the open or the read -- this box has
+a history of transient opens) is tried again by the next calls, three attempts
+in all, exactly as ``emoji_data`` treats its table.
 
 Tk-thread only, like every image: a ``PhotoImage`` belongs to the interpreter
 that made it, and its ``__del__`` calls back into Tcl -- create, use and
@@ -69,6 +73,13 @@ _IHDR = struct.Struct(">IIBBBBB")   # width, height, depth, colour type,
 #: Sanity bound on either side of a sheet: the inflated rows are
 #: ``(1 + width) * height`` bytes, and nothing is inflated past that.
 _MAX_SIDE = 8192
+#: The largest tile this module will cut.  "Tk never sees the sheet" holds only
+#: while a tile is small: a table declaring one huge tile would otherwise hand
+#: Tk most of the sheet in a single image (the real tiles are 22 px).
+_MAX_TILE_PX = 64
+#: How many times a sheet that could not be READ is tried (one try per
+#: ``image()`` call) before the failure sticks -- ``emoji_data``'s number.
+_MAX_READ_ATTEMPTS = 3
 
 
 def _sheet_path():
@@ -169,13 +180,33 @@ def _parse_sheet(data: bytes) -> _Sheet:
     return sheet
 
 
-def _read_sheet(path) -> _Sheet:
-    """Read and inflate the sheet at ``path``. Raises on a missing, damaged
-    or wrongly encoded file; :meth:`EmojiTiles._load` turns that into "no
-    tiles". The ONE loader, split out so read-once can be spied on in tests."""
+def _read_bytes(path) -> bytes:
+    """The file's raw bytes. The ONLY disk access of a load, kept apart from
+    :func:`_parse_sheet` so that an ``OSError`` here means "could not read"
+    (worth another try) and never "bad content".  Also the seam the read-once
+    and retry contracts are spied on through."""
     with open(path, "rb") as fh:
-        data = fh.read()
-    return _parse_sheet(data)
+        return fh.read()
+
+
+def _check_layout(layout) -> None:
+    """Raise unless ``layout`` is a grid this module will cut tiles from:
+    whole numbers, a tile of 1..``_MAX_TILE_PX`` px that fits its cell, at
+    least one column and one tile.  (No layout at all raises too.)"""
+    values = (layout.tile_px, layout.cell_px, layout.cols, layout.tiles)
+    if not all(isinstance(value, int) and not isinstance(value, bool)
+               for value in values):
+        raise ValueError("tile_px, cell_px, cols, tiles must be whole "
+                         "numbers, got %r" % (values,))
+    tile_px, cell_px, cols, tiles = values
+    if not 1 <= tile_px <= _MAX_TILE_PX:
+        raise ValueError("tile_px is %d; a tile must be 1..%d px"
+                         % (tile_px, _MAX_TILE_PX))
+    if tile_px > cell_px:
+        raise ValueError("tile_px %d exceeds cell_px %d" % (tile_px, cell_px))
+    if cols < 1 or tiles < 1:
+        raise ValueError("cols is %d and tiles is %d; both must be at least 1"
+                         % (cols, tiles))
 
 
 def _ascii(value) -> str:
@@ -185,12 +216,12 @@ def _ascii(value) -> str:
     return str(value).encode("ascii", "backslashreplace").decode("ascii")
 
 
-def _warn(message, *args) -> None:
-    """One WARNING through the house logger -- fetched HERE, never at import,
+def _log(level: str, message, *args) -> None:
+    """One line through the house logger -- fetched HERE, never at import,
     because its first call opens the log file.  Never raises."""
     try:
         from app_log import get_logger
-        get_logger(__name__).warning(message, *args)
+        getattr(get_logger(__name__), level)(message, *args)
     except Exception:
         pass
 
@@ -221,7 +252,8 @@ class EmojiTiles:
         self._layout = None         # the layout the sheet was checked against
         self._head = b""            # a tile PNG up to its IDAT chunk
         self._cache = {}            # tile number -> PhotoImage (the keep-alive)
-        self._failed = False        # the sheet was tried and is unusable
+        self._failed = False        # the sheet is unusable; do not try again
+        self._attempts = 0          # reads tried since the last release()
         self._warned = False        # the one WARNING has been logged
 
     def image(self, seq: str) -> "tk.PhotoImage | None":
@@ -229,17 +261,19 @@ class EmojiTiles:
         or None for an unknown sequence or an unusable sheet.
 
         The same object for the same sequence until :meth:`release`; entries
-        that share a tile share the object.  Never raises."""
-        entry = emoji_data.lookup(seq)
-        if entry is None:
-            return None
-        tile = entry.tile
-        cached = self._cache.get(tile)
-        if cached is not None:
-            return cached
-        if self._sheet is None and not self._load():
-            return None
+        that share a tile share the object.  Never raises -- not even when
+        ``emoji_data`` or Tk does (a destroyed interpreter): that is None for
+        this call."""
         try:
+            entry = emoji_data.lookup(seq)
+            if entry is None:
+                return None
+            tile = entry.tile
+            cached = self._cache.get(tile)
+            if cached is not None:
+                return cached
+            if self._sheet is None and not self._load():
+                return None
             image = self._make_tile(tile)
         except Exception:
             return None
@@ -253,7 +287,8 @@ class EmojiTiles:
 
     def release(self) -> None:
         """Drop the sheet's rows and every cached tile; a later :meth:`image`
-        reloads (and tries a sheet that failed before once more).
+        reloads (and tries a sheet that failed before afresh -- the WARNING
+        stays one per object).
 
         Images already on screen go blank -- Tk deletes an image when its last
         Python reference goes -- so call this when the window that shows them
@@ -263,56 +298,83 @@ class EmojiTiles:
         self._layout = None
         self._head = b""
         self._failed = False
+        self._attempts = 0
 
     # -- internals ---------------------------------------------------------
 
     def _load(self) -> bool:
-        """Read the sheet once. False -- after ONE warning -- when it is
-        missing, damaged, wrongly encoded or too small for the layout; the
-        failure sticks until :meth:`release` so a redraw does not re-read a
-        bad file per emoji.  Never raises."""
+        """Make the sheet ready, or answer False after ONE warning. Never
+        raises.
+
+        A layout this module will not cut, a damaged or wrongly encoded sheet
+        and a sheet too small for the layout are WRONG: the failure sticks
+        until :meth:`release`, so a redraw does not re-read a bad file per
+        emoji.  An ``OSError`` on the open or the read may be transient: the
+        next call tries again, ``_MAX_READ_ATTEMPTS`` tries in all."""
         if self._failed:
             return False
-        path = self._sheet_arg
         try:
             layout = self._layout_arg
             if layout is None:
                 layout = emoji_data.sheet_layout()
-            if layout is None:
-                return self._fail("[Emoji] no emoji table, so no tile layout; "
-                                  "emoji are shown as plain characters")
+            _check_layout(layout)
+        except Exception as exc:
+            return self._fail(True, "[Emoji] the emoji tile layout is "
+                              "unusable (%s: %s); emoji are shown as plain "
+                              "characters", type(exc).__name__, _ascii(exc))
+
+        self._attempts += 1
+        path = self._sheet_arg
+        try:
             if path is None:
                 path = _sheet_path()
             if not path:
-                return self._fail("[Emoji] %s not found; emoji are shown as "
-                                  "plain characters", SHEET_FILE)
-            sheet = _read_sheet(path)
+                raise FileNotFoundError("not found beside the app")
+            data = _read_bytes(path)
+        except OSError as exc:
+            # ``strerror`` alone: the full text would repeat the path.
+            return self._fail(
+                self._attempts >= _MAX_READ_ATTEMPTS,
+                "[Emoji] %s could not be read (%s: %s); emoji are shown as "
+                "plain characters", _ascii(path or SHEET_FILE),
+                type(exc).__name__, _ascii(exc.strerror or exc))
+        except Exception as exc:                # a path that is no path at all
+            return self._fail(True, "[Emoji] %s could not be located (%s: "
+                              "%s); emoji are shown as plain characters",
+                              SHEET_FILE, type(exc).__name__, _ascii(exc))
+
+        try:
+            sheet = _parse_sheet(data)
             need_w, need_h = _needed_size(layout)
             if sheet.width < need_w or sheet.height < need_h:
-                return self._fail(
-                    "[Emoji] %s is %dx%d but the emoji table needs at least "
-                    "%dx%d; emoji are shown as plain characters",
-                    _ascii(path), sheet.width, sheet.height, need_w, need_h)
+                raise ValueError("is %dx%d but the emoji table needs at least "
+                                 "%dx%d" % (sheet.width, sheet.height,
+                                            need_w, need_h))
             size = layout.tile_px
             head = (_PNG_SIGNATURE
                     + _chunk(b"IHDR", _IHDR.pack(size, size, 8, 3, 0, 0, 0))
                     + _chunk(b"PLTE", sheet.plte)
                     + _chunk(b"tRNS", sheet.trns))
         except Exception as exc:
-            return self._fail("[Emoji] %s is unusable (%s: %s); emoji are "
-                              "shown as plain characters", _ascii(path),
+            return self._fail(True, "[Emoji] %s is unusable (%s: %s); emoji "
+                              "are shown as plain characters", _ascii(path),
                               type(exc).__name__, _ascii(exc))
+        if self._attempts > 1:
+            _log("info", "[Emoji] %s read on attempt %d", _ascii(path),
+                 self._attempts)
         self._sheet = sheet
         self._layout = layout
         self._head = head
         return True
 
-    def _fail(self, message, *args) -> bool:
-        """Record the failure, log the one WARNING, answer False."""
-        self._failed = True
+    def _fail(self, settled: bool, message, *args) -> bool:
+        """Log the one WARNING and answer False; ``settled`` makes the
+        failure stick until :meth:`release`."""
+        if settled:
+            self._failed = True
         if not self._warned:
             self._warned = True
-            _warn(message, *args)
+            _log("warning", message, *args)
         return False
 
     def _make_tile(self, tile):
