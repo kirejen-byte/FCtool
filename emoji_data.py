@@ -18,6 +18,11 @@ exception: the module logs ONE warning and then answers "no emoji" everywhere
 (``available()`` False, ``split`` returns the text as one text chunk, lookups
 return None) until :func:`set_data_file` points it somewhere else.
 
+A table that cannot be READ (the file is not there, or the open / read raises
+``OSError`` -- this box has a history of transient opens) is tried again by
+later calls, at most three attempts in all.  A table that was read but is not a
+valid table is given up on at once.  Either way there is at most one WARNING.
+
 Wire encoding (gzip, UTF-8 JSON)::
 
     {"version": 1, "emoji_version": "16.0",
@@ -67,15 +72,48 @@ _VS16 = chr(0xFE0F)
 _TONE_FIRST, _TONE_LAST = 0x1F3FB, 0x1F3FF          # skin-tone modifiers 1..5
 _TONE_RE = re.compile("[%s-%s]" % (chr(_TONE_FIRST), chr(_TONE_LAST)))
 
+#: What separates an emoji from its toned forms: the modifiers and VS16.
+_DETONE_RE = re.compile("[%s-%s%s]" % (chr(_TONE_FIRST), chr(_TONE_LAST), _VS16))
+
 #: ``name::skin-tone-N`` -- Discord's long spelling of a toned emoji.
 _TONE_SUFFIX_RE = re.compile(r"skin-tone-([1-5])")
-#: The same suffix as it follows a ``:name:`` in running text.
-_TONE_TAIL_RE = re.compile(r":skin-tone-([1-5]):", re.IGNORECASE)
 
 #: One step of :func:`replace_shortcodes`: a ``<...>`` token (a Discord
 #: timestamp, mention or custom emoji -- never touched) or a ``:name:``
 #: candidate.  A token holds no whitespace, so ``1 < 2 :x: 3 > 2`` is not one.
-_CODE_RE = re.compile(r"<[^<>\s]+>|:([^\s:<>]+):")
+#: A candidate's opening colon is at the start of the text or follows anything
+#: but a letter, a digit or an underscore (``\w`` is Unicode-aware here) -- the
+#: table has one- and two-letter names (``x``, ``b``, ``ok``, ``on``, ``up``),
+#: so ``Comms:x:``, ``a:b:c``, a clock time and a URL must not be read as
+#: shortcodes, while ``**:x:**``, ``(:x:)`` and ``:x::x:`` are.
+_CODE_RE = re.compile(r"<[^<>\s]+>|(?<!\w):([^\s:<>]+):")
+#: The ``:skin-tone-N:`` that may follow a ``:name:`` directly.
+_TONE_TAIL_RE = re.compile(r":skin-tone-([1-5]):", re.IGNORECASE)
+
+#: :func:`search`'s cap when the caller passes none, or one that is no positive int.
+_DEFAULT_LIMIT = 40
+
+#: Read attempts before a table that cannot be read is given up on.
+_MAX_READ_ATTEMPTS = 3
+
+#: Apostrophes dropped by :func:`_fold` (straight, and the two curly ones CLDR
+#: names use -- "man's shoe", "twelve o'clock").
+_APOSTROPHES = {ord("'"): None, 0x2018: None, 0x2019: None}
+
+
+def _fold(text: str) -> str:
+    """``text`` for searching: lower-case, accents and apostrophes dropped, so
+    ``pinata`` finds the n-tilde name and ``cote d'ivoire`` its flag.
+
+    ``unicodedata`` is imported here, on the rare non-ASCII string, so that
+    importing this module loads nothing extra."""
+    text = text.lower()
+    if text.isascii():
+        return text.replace("'", "") if "'" in text else text
+    import unicodedata
+    text = "".join(ch for ch in unicodedata.normalize("NFKD", text)
+                   if not unicodedata.combining(ch))
+    return text.translate(_APOSTROPHES)
 
 
 @dataclass(frozen=True)
@@ -115,11 +153,21 @@ def _is_int(value) -> bool:
 
 
 def _start_pattern(chars):
-    """A compiled character class matching exactly ``chars`` (code points
-    folded into ranges), used to jump straight to the next position where an
-    emoji could start."""
+    """A compiled character class used to jump straight to the next position
+    where an emoji could start.
+
+    It matches every code point of ``chars`` and may match MORE: the ones
+    above U+FFFF are folded into one range, first to last.  ``re`` tests a
+    class's astral ranges one by one for every character it rejects, so the
+    exact class (some hundred ranges on the real table) made plain text three
+    times slower to scan than this superset; :func:`split` discards the few
+    false candidates with one dict lookup."""
     points = sorted(ord(ch) for ch in chars)
+    astral = [point for point in points if point > 0xFFFF]
+    points = [point for point in points if point <= 0xFFFF]
     parts = []
+    if astral:
+        parts.append(re.escape(chr(astral[0])) + "-" + re.escape(chr(astral[-1])))
     i = 0
     while i < len(points):
         j = i
@@ -136,9 +184,10 @@ def _build(table) -> _Index:
     problem; :func:`_load` turns that into "unavailable"."""
     if not isinstance(table, dict):
         raise ValueError("top level is %s, expected object" % type(table).__name__)
-    if table.get("version") != _TABLE_VERSION:
+    version = table.get("version")
+    if not _is_int(version) or version != _TABLE_VERSION:
         raise ValueError("table version is %r, expected %d"
-                         % (table.get("version"), _TABLE_VERSION))
+                         % (version, _TABLE_VERSION))
     for key in ("tile_px", "cell_px", "cols", "tiles"):
         if not _is_int(table.get(key)) or table[key] <= 0:
             raise ValueError("%r is %r, expected a positive integer"
@@ -149,7 +198,8 @@ def _build(table) -> _Index:
         raise ValueError("'emoji' is missing or empty")
     if not isinstance(raw_alt, dict):
         raise ValueError("'alt' is missing or not an object")
-    if "count" in table and table["count"] != len(raw):
+    if "count" in table and not (_is_int(table["count"])
+                                 and table["count"] == len(raw)):
         raise ValueError("'count' is %r but there are %d entries"
                          % (table["count"], len(raw)))
 
@@ -196,8 +246,8 @@ def _build(table) -> _Index:
     groups_plain = {}
     for entry in entries:
         toned = _TONE_RE.search(entry.seq) is not None
-        rows.append((entry, tuple(code.lower() for code in entry.shortcodes),
-                     entry.name.lower(), toned))
+        rows.append((entry, tuple(_fold(code) for code in entry.shortcodes),
+                     _fold(entry.name), toned))
         groups_all.setdefault(entry.group, []).append(entry)
         if not toned:
             groups_plain.setdefault(entry.group, []).append(entry)
@@ -226,12 +276,16 @@ def _build(table) -> _Index:
 
 _UNSET = object()
 
-#: ``_UNSET`` until the first call that needs the table; afterwards the
-#: :class:`_Index`, or None when the table could not be used.  Rebound as a
-#: whole (never mutated), so a reader needs no lock.
+#: ``_UNSET`` until the table's fate is settled; afterwards the :class:`_Index`,
+#: or None when the table could not be used.  Rebound as a whole (never
+#: mutated), so a reader needs no lock.
 _cache = _UNSET
 #: :func:`set_data_file`'s path, or None for the bundled copy.
 _override = None
+#: Loads tried since the last :func:`set_data_file` (see ``_MAX_READ_ATTEMPTS``).
+_attempts = 0
+#: Whether the one WARNING has been logged since the last :func:`set_data_file`.
+_warned = False
 _lock = threading.Lock()
 
 
@@ -245,60 +299,100 @@ def _data_path():
     return resolve_data_file(DATA_FILE, prefer="bundle")
 
 
-def _decode(path):
-    """Read + gunzip + parse. Raises on any I/O or JSON problem; :func:`_load`
-    is the layer that turns that into "unavailable". Split out so the
-    load-once contract can be spied on in tests."""
-    with gzip.open(path, "rt", encoding="utf-8") as fh:
-        return json.load(fh)
+def _read_bytes(path) -> bytes:
+    """The file's raw bytes. The ONLY disk access of a load, kept apart from
+    :func:`_parse` so that an ``OSError`` here means "could not read" (worth
+    another try) and never "bad content" -- ``gzip.BadGzipFile`` is itself an
+    ``OSError`` and would blur the two.  Also the seam the load-once and retry
+    contracts are spied on through."""
+    with open(path, "rb") as fh:
+        return fh.read()
 
 
-def _warn(message, *args) -> None:
-    """The one WARNING, through the house logger -- fetched HERE, never at
-    import, because its first call opens the log file.  Never raises."""
+def _parse(data: bytes):
+    """Gunzip + decode + parse. Raises on anything that is not a gzip of UTF-8
+    JSON (a truncated stream included)."""
+    return json.loads(gzip.decompress(data).decode("utf-8"))
+
+
+def _log(level: str, message: str, *args) -> None:
+    """One line through the house logger -- fetched HERE, never at import,
+    because its first call opens the log file.  Never raises."""
     try:
         from app_log import get_logger
-        get_logger(__name__).warning(message, *args)
+        getattr(get_logger(__name__), level)(message, *args)
     except Exception:
         pass
 
 
+def _warn_once(message: str, *args) -> None:
+    """The one WARNING of a run; later problems are silent."""
+    global _warned
+    if _warned:
+        return
+    _warned = True
+    _log("warning", message, *args)
+
+
 def _load():
-    """Decode and index the table, or warn once and answer None. Never raises.
-    Called with ``_lock`` held."""
+    """One load attempt -> ``(index or None, settled)``. Never raises. Called
+    with ``_lock`` held.
+
+    ``settled`` False means "could not read it, a later call may try again";
+    it turns True on the last allowed attempt."""
+    global _attempts
+    _attempts += 1
+    settled = _attempts >= _MAX_READ_ATTEMPTS
     try:
         path = _data_path()
         if not path:
-            _warn("[Emoji] %s not found; emoji are shown as plain characters",
-                  DATA_FILE)
-            return None
-        return _build(_decode(path))
+            raise FileNotFoundError("not found beside the app")
+        data = _read_bytes(path)
+    except OSError as exc:
+        _warn_once("[Emoji] %s could not be read (%s: %s); emoji are shown as "
+                   "plain characters", DATA_FILE, type(exc).__name__, exc)
+        return None, settled
+    except Exception as exc:                  # a path that is no path at all
+        _warn_once("[Emoji] %s could not be located (%s: %s); emoji are shown "
+                   "as plain characters", DATA_FILE, type(exc).__name__, exc)
+        return None, True
+    try:
+        index = _build(_parse(data))
     except Exception as exc:
-        _warn("[Emoji] %s is unusable (%s: %s); emoji are shown as plain "
-              "characters", DATA_FILE, type(exc).__name__, exc)
-        return None
+        _warn_once("[Emoji] %s is unusable (%s: %s); emoji are shown as plain "
+                   "characters", DATA_FILE, type(exc).__name__, exc)
+        return None, True
+    if _attempts > 1:
+        _log("info", "[Emoji] %s read on attempt %d", DATA_FILE, _attempts)
+    return index, True
 
 
 def _table():
-    """The index, loading it on first use; None when there is no usable table."""
+    """The index, loading it on first use; None when there is no usable table
+    (or not yet -- see :func:`_load`)."""
     global _cache
     cache = _cache
     if cache is not _UNSET:
         return cache
     with _lock:
-        if _cache is _UNSET:
-            _cache = _load()
-        return _cache
+        if _cache is not _UNSET:
+            return _cache
+        index, settled = _load()
+        if settled:
+            _cache = index
+        return index
 
 
 def set_data_file(path) -> None:
     """Test seam: read the table from ``path`` instead of the bundled copy
     (``None`` restores the bundled copy) and forget whatever was loaded.
     Reads nothing itself -- the next call that needs the table does."""
-    global _cache, _override
+    global _cache, _override, _attempts, _warned
     with _lock:
         _override = None if path is None else os.fspath(path)
         _cache = _UNSET
+        _attempts = 0
+        _warned = False
 
 
 def available() -> bool:
@@ -340,7 +434,7 @@ def split(text: str) -> list:
         if hit is None:
             break
         at = hit.start()
-        for length in lengths[text[at]]:
+        for length in lengths.get(text[at], ()):
             chunk = text[at:at + length]
             if chunk in match:
                 if pending < at:
@@ -375,15 +469,20 @@ def _toned(index, base: str, tone: int) -> "str | None":
     """The sequence for shortcode ``base`` (lower-case) in skin tone 1..5, or
     None when the table has no such emoji.
 
-    Discord's own ``<base>_tone<N>`` name first; failing that the sequence is
-    built -- modifier after the first code point, a VS16 there dropped -- and
+    Discord's own ``<base>_tone<N>`` name first -- but ONLY when that entry is
+    a toned form of ``base``'s own emoji (the same sequence once modifiers and
+    VS16 are removed).  The names do not guarantee it: ``kiss`` is the lips
+    while ``kiss_tone3`` is a couple, and answering the couple would swap what
+    the user wrote for a different emoji.  Failing that the sequence is built
+    -- modifier after the first code point, a VS16 there dropped -- and
     accepted only if it is a table entry."""
-    seq = index.by_code.get("%s_tone%d" % (base, tone))
-    if seq is not None:
-        return seq
     plain = index.by_code.get(base)
     if plain is None:
         return None
+    named = index.by_code.get("%s_tone%d" % (base, tone))
+    if (named is not None and named != plain
+            and _DETONE_RE.sub("", named) == _DETONE_RE.sub("", plain)):
+        return named
     rest = plain[1:]
     if rest.startswith(_VS16):
         rest = rest[1:]
@@ -416,27 +515,34 @@ def shortcodes(seq: str) -> tuple:
 
 
 def replace_shortcodes(text: str) -> str:
-    """``text`` with every KNOWN ``:name:`` replaced by its characters.
+    """``text`` with every KNOWN ``:name:`` replaced by its characters, in one
+    left-to-right pass.
 
-    ``:name::skin-tone-N:`` becomes the one toned emoji when the table has it.
-    Unknown names (a server's custom emoji) are left exactly as written, and
-    nothing inside a ``<...>`` token is touched -- ``<t:100:R>`` is a
-    timestamp, ``<:name:123>`` a custom emoji."""
+    A ``:name:`` counts only when its opening colon is at the start of the text
+    or does NOT follow a letter, a digit or an underscore.  So ``Comms:x:``,
+    ``a:b:c``, ``19:00:skull:``, ``:nope:skull:`` and a URL are left alone,
+    while ``**:skull:**``, ``(:skull:)``, shortcodes written back to back and
+    one straight after a ``<...>`` token convert, as Discord does.
+    ``:name::skin-tone-N:`` becomes the one toned emoji when the table has it
+    (else ``:name:`` alone is replaced).  Unknown names (a server's custom
+    emoji) are left exactly as written, and nothing inside a ``<...>`` token
+    is touched -- ``<t:100:R>`` is a timestamp, ``<:name:123>`` a custom emoji."""
     if not text or ":" not in text:
         return text
     index = _table()
     if index is None:
         return text
     by_code = index.by_code
+    find = _CODE_RE.search
     out = []
     pos = 0
     while True:
-        hit = _CODE_RE.search(text, pos)
+        hit = find(text, pos)
         if hit is None:
             break
         name = hit.group(1)
         end = hit.end()
-        if name is None:                       # a <...> token: copy it through
+        if name is None:                       # a <...> token: as written
             out.append(text[pos:end])
             pos = end
             continue
@@ -450,7 +556,10 @@ def replace_shortcodes(text: str) -> str:
         if seq is None:
             seq = by_code.get(key)
         if seq is None:
-            # Unknown: keep it, and let its closing colon open the next one.
+            # Unknown: keep it and look again FROM its closing colon. Whether
+            # that colon may open a shortcode is the same question as for any
+            # other: not after the letter that ends ``:nope:``, but yes after
+            # the bracket that ends ``:-):``.
             out.append(text[pos:end - 1])
             pos = end - 1
             continue
@@ -468,38 +577,47 @@ def replace_shortcodes(text: str) -> str:
 def search(query: str, limit: int = 40) -> list:
     """Up to ``limit`` entries matching ``query``, best first.
 
-    Case-insensitive. Shortcodes that START with the query come first, then
-    shortcodes that contain it, then names that contain it; table order within
-    each. Skin-tone variants are left out unless the query contains ``tone``.
-    A space in the query matches an underscore in a shortcode and the other
-    way round for names; surrounding colons are ignored. Empty query: ``[]``."""
+    Case-insensitive; accents and apostrophes are ignored on both sides. An
+    entry whose shortcode IS the query comes first (``fire`` is the fire, not
+    the fire engine), then shortcodes that start with it, then shortcodes that
+    contain it, then names that contain it; table order within each. Skin-tone
+    variants are left out unless the query contains ``tone``. A space in the
+    query matches an underscore in a shortcode and the other way round for
+    names; surrounding colons are ignored. Empty query: ``[]``. A ``limit``
+    that is not a positive int behaves as 40."""
+    if not _is_int(limit) or limit <= 0:
+        limit = _DEFAULT_LIMIT
     index = _table()
-    if index is None or not isinstance(query, str) or limit <= 0:
+    if index is None or not isinstance(query, str):
         return []
-    wanted = query.strip().strip(":").strip().lower()
+    wanted = _fold(query.strip().strip(":").strip())
     if not wanted:
         return []
     in_code = wanted.replace(" ", "_")
     in_name = wanted.replace("_", " ")
     with_tones = "tone" in wanted
-    prefix, inside, named = [], [], []
+    exact, prefix, inside, named = [], [], [], []
     for entry, codes, name, toned in index.rows:
         if toned and not with_tones:
             continue
         rank = 3
         for code in codes:
-            if code.startswith(in_code):
+            if code == in_code:
                 rank = 0
                 break
-            if in_code in code:
+            if code.startswith(in_code):
                 rank = 1
+            elif rank > 2 and in_code in code:
+                rank = 2
         if rank == 0:
-            prefix.append(entry)
+            exact.append(entry)
         elif rank == 1:
+            prefix.append(entry)
+        elif rank == 2:
             inside.append(entry)
         elif in_name in name:
             named.append(entry)
-    return (prefix + inside + named)[:limit]
+    return (exact + prefix + inside + named)[:limit]
 
 
 def groups(include_tones: bool = False) -> list:
