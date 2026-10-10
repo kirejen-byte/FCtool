@@ -32,6 +32,11 @@ a = Analysis(
         ('assets/alerts/zkill_blip.mp3', 'assets/alerts'),
         ('assets/alerts/zkill_horn.mp3', 'assets/alerts'),
         ('assets/alerts/zkill_comms.mp3', 'assets/alerts'),
+        # Discord ping emoji pack: lookup table, 22 px sprite sheet, and the
+        # Twemoji CC-BY 4.0 attribution (NOTICE.txt must travel with the tiles).
+        ('emoji_table.json.gz', '.'),
+        ('assets/emoji/twemoji_22.png', 'assets/emoji'),
+        ('assets/emoji/NOTICE.txt', 'assets/emoji'),
         # Vendored python-xlib + six for the Linux (Proton/Wine) preview helper;
         # dead weight on Windows, so it ships as ONE zip (built by
         # tools/build_x11helper_zip.py) to keep the one-file cold boot unchanged.

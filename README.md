@@ -32,6 +32,7 @@ A desktop intel & fleet-command assistant for **EVE Online** — live zKillboard
 - **Group configuration** — share a whole FCTool setup as one file. **Settings → Group configuration** (now the first section) has **Create a group file...** and **Import a group file...**, and the window they open has a third page, **History**. A group file (`*.fctg`) can carry the **colour palette**; from **Fleet Management** the built-in and custom role presets, fleet templates and custom Specialized Roles; from **Intelligence** the coalitions, the intel filter, the alert mute and ping settings and the Intelligence Fusion channels; the **friendly and hostile staging lists** and the map's threat and friendly projection; from **Fittings** the tag categories, doctrines, fits outside doctrines, MOTD templates, the default seed target and the MOTD settings; and from **Settings** the staging system, the channels and their categories, the X-up counter, the range check, the zKill alert sound, market staging, contract scanning and the infrastructure scan regions. **Creating one:** tick what goes in — *Copy my current settings* takes everything shareable, *Granular editing* lets you pick single entries and edit the values that go into the file without changing your own — name it, and read **What will be saved** before you press **Save group file...**; that list is built from the file itself, so it cannot differ from what you hand out. **Never saved into a group file:** sign-ins, character names, previews, hotkeys, EVE settings and the FC pinned in a MOTD template. If one of your own character names still stands in text you typed — a MOTD, a template name, a tag — FCTool names it and asks before saving. **Importing one:** choose the file and FCTool shows what is in it and what each item would do to your setup (adds, updates, already the same) before anything changes. Untick what you do not want; where a list can be merged or replaced you choose **Add to mine** or **Replace mine**, and where both sides have the same entry, **Use the group's version** or **Keep mine**. Your settings files are not changed while FCTool is running: **Apply and restart** (or **Apply at next launch**) stages the import, and it is applied the next time FCTool starts, before the window opens; the result then opens by itself. **A backup of your settings is kept** each time (the last five), and **History** lists your last ten imports, each with **Restore the settings from before this import...**. An import never deletes anything unless you chose *Replace mine*, and never touches a setting you left unticked. A market **structure** named in a group file is adopted only after FCTool has checked, with your own sign-in, that your character can reach it; if it cannot, your own market stays and the Settings tab shows a ⚠ on its Market section. On a fresh install a one-line offer to import a group file sits above the tabs; it goes away once you import one, sign a character in, or close it. An optional **group tag** of up to 10 characters (say `ABCD`) is shown as **by ABCD** under the FCTool logo; type it in the same Settings section, or let a group file carry it. Doctrine `.fctdoc` export and import are unchanged.
 - **Colour palette** — **Settings → Group configuration → Colour palette...** opens an editor for the eight colours the whole app is drawn from — window, panel, field, text, muted text, accent, border and selection. Pick one of seven presets (**Navy** is the stock look; **Graphite**, **Deep Teal**, **Ember**, **Amethyst**, **Verdant** and **Steel** are the others) or click a swatch to choose your own, with a live sample beside it. A combination that would be hard to read — text too close to the colour behind it — is refused with the reason, so a palette cannot leave you with a window you cannot read. Colours are read once, at start-up: **Apply and restart** restarts FCTool right away, **Apply at next launch** waits for you, and **Reset to stock** brings the navy back. The status colours (green, red, orange, yellow) are fixed. Your palette lives in `ui_palette.json` next to the exe and can travel in a group file; deleting that file, or starting FCTool with the environment variable `FCTOOL_DEFAULT_PALETTE=1`, gives you the stock colours.
 - **Custom Specialized Roles** — a **Custom...** button in the **Specialized Roles** header on the **Fleet Management** tab adds up to twelve categories of your own, shown after the ten built-in ones. Give each a title, the hulls and/or the doctrine tags that belong to it, and an optional minimum (shown as `3 / 5`). A pilot counts when their ship is one of the hulls, or the active doctrine tags their hull with one of the tags. Nothing changes until you add one, and your categories can travel in a group file.
+- **Discord ping** — a yellow **Copy ping ▾** button in the MOTD builder that puts a ready-to-paste Discord form-up message on your clipboard in one click, built from a per-doctrine template. See [Discord ping](#discord-ping) below. Nothing is ever sent to Discord.
 - **Wormhole routing**, an **X-up fleet counter** (configurable trigger / clear words + threshold), **character & asset tracking**, and **text-to-speech audio alerts**.
 
 ## Client Previews (native)
@@ -124,6 +125,25 @@ pyinstaller --clean --noconfirm FCTool.spec
 # -> dist/FCTool.exe
 ```
 
+## Discord ping
+
+A form-up message for your Discord, written for you from the doctrine you have selected. **FCTool never sends anything to Discord** — it only puts text on your clipboard, and you paste it where you want it.
+
+**The button.** In the MOTD builder, on the second button row, right of **Refresh fleet**, there is a yellow **Copy ping ▾** button.
+- **Click the button** — the ping for the selected doctrine is copied to the clipboard. One click, no window. The status line tells you what was copied, and which lines were left out if any were. Hover the button to see the exact text a click would copy.
+- **Click the arrow** — opens the **Discord ping** window.
+
+**The window.** The left side holds this ping's values; the right side is the doctrine's template, a free-text canvas with draggable pills like the MOTD composer; the bottom is a preview of the message. Your edits save as you make them.
+- Templates are **per doctrine**. Every doctrine starts from a **basic template**; **Reset to basic** drops a doctrine's own template, and **Make this my basic template** copies the current one to the basic slot.
+- Six fields: **fleet type**, **FC**, **location**, **when**, **doctrine** and **comms**. Fleet types, locations and comms options are **shared lists** — edit them once with the pencil button beside the field and every doctrine uses them. FC comes from your FC pick in the MOTD builder.
+- A line whose field is empty is **left out** of the ping rather than copied half-blank.
+
+**When.** Choose **Now**, or **At a time...** and type a date and time in **EVE time** or **your local time**. A time is pasted as the EVE time plus **Discord timestamp tags**, so each reader sees it in *their own* local time and a live countdown. A time you set is used for **one copy**: after the next successful copy, When goes back to **Now**, and the status line says so.
+
+**Emoji.** Paste them, type a `:shortcode:` (the closing colon converts it), or use the **Emoji** picker. They are drawn with Discord's artwork (Twemoji) but copied as ordinary emoji characters, so they arrive in Discord as real emoji.
+
+**The preview** shows the message as Discord roughly displays it — an approximation, not a pixel match — or switch it to the raw text that will be copied.
+
 ## Notes
 
 - Windows desktop app (Tkinter). Needs internet access for ESI, zKillboard, and TTS.
@@ -169,3 +189,13 @@ Regenerate after an expansion that adds or moves systems or stargates:
 EVE Online and the EVE logo are the registered trademarks of CCP hf. All
 rights are reserved worldwide. FCTool is a free fan-made tool; CCP hf. is
 not affiliated with it and does not endorse it.
+
+### Emoji data & attribution
+
+The Discord ping's emoji pack is built from third-party data and bundled with FCTool:
+
+- Emoji artwork: Twemoji (jdecked/twemoji), CC-BY 4.0, resized.
+- Emoji names and sequences: Unicode `emoji-test.txt` (Unicode License v3).
+- `:shortcode:` names: the `discord-emoji` package (MIT).
+
+The full notices are in `assets/emoji/NOTICE.txt`, which also ships beside the tiles in the release.
