@@ -44,8 +44,9 @@ The rules every method keeps:
   entry or value counts as absent. It is replaced only when a change has to write through
   it; junk beside the written key stays as it is.
 * **A wrong name from the caller is a programmer error:** an unknown list kind, pick field,
-  text key or When format, a non-list where a list is due, a non-text pick, text or item
-  name, a bare string where ids are due - each is a ``ValueError`` and changes nothing.
+  text key or When format, a non-list where a list is due (``set_items`` takes a list or
+  a tuple; a template must be a list), a non-text pick, text or item name, a bare string
+  where ids are due - each is a ``ValueError`` and changes nothing.
 
 Picks are stored one field at a time, and a doctrine reads ONLY its own: ``default_picks``
 answers for "no doctrine selected" and for nothing else, so a change made with no doctrine
@@ -271,6 +272,9 @@ class PingStore:
         return _items(_block(self._get_config()), kind)
 
     def set_items(self, kind: str, items) -> None:
+        """Store one shared list, cleaned. ``items`` is a list OR a tuple of names - any
+        other value (a bare string, a set, ``None``) is a ``ValueError``. What is stored is
+        always a fresh list."""
         _require(kind, LIST_KINDS, "list kind")
         if not isinstance(items, (list, tuple)):
             raise ValueError("%s must be a list, not %r" % (kind, items))

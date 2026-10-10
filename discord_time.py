@@ -21,8 +21,11 @@ rules for the date in question. A local time that does not exist (the
 spring-forward gap) resolves the way Python resolves it. A local time that
 happens TWICE (the repeated hour of a fall-back night) cannot be told apart in
 naive fields, so ``to_unix(*fields_for(u, "local"), "local") == u`` does not
-hold inside that hour; everywhere else, and always in the EVE basis, a
-whole-minute ``u`` round-trips.
+hold inside that hour; everywhere else, and in the EVE basis without that
+exception, a whole-minute ``u`` round-trips -- PROVIDED its date in that basis
+lies in the years ``MIN_YEAR``..``MAX_YEAR`` (1970..2999). ``fields_for``
+writes any year ``datetime`` has (1..9999) and ``to_unix`` refuses the ones
+outside that span, so out there the round trip ends in ``ValueError``.
 
 Errors. The only exception this module raises for an argument VALUE is
 ``ValueError``, with a message fit for the echo line:
@@ -218,10 +221,13 @@ def fields_for(unix: int, basis: str, *, utc_to_local=None) -> tuple[str, str]:
     ``to_unix`` reads. Seconds are not part of the fields.
 
     ``to_unix(*fields_for(u, basis), basis) == u`` holds for a whole-minute
-    ``u`` in the EVE basis always, and in the local basis EXCEPT inside the
-    repeated hour of a fall-back night: both occurrences of 01:30 give the same
-    naive fields, and ``to_unix`` can only return one of them. Do not rely on a
-    general local round trip.
+    ``u`` whose date in ``basis`` lies in the years ``MIN_YEAR``..``MAX_YEAR``:
+    in the EVE basis for every such ``u``, and in the local basis EXCEPT inside
+    the repeated hour of a fall-back night (both occurrences of 01:30 give the
+    same naive fields, and ``to_unix`` can only return one of them). Outside
+    those years this function still answers -- any year 1..9999 -- but
+    ``to_unix`` refuses the fields it was given, in either basis. Do not rely on
+    a general local round trip.
 
     ``ValueError`` for an unknown basis or a ``unix`` that cannot be
     represented (out of ``datetime``'s range, or refused by the converter)."""

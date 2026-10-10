@@ -1218,7 +1218,17 @@ class PingDialog:
             x, y = button.winfo_rootx(), button.winfo_rooty() + button.winfo_height()
         except tk.TclError:
             return
-        self._picker_for_query = False
+        for_query, self._picker_for_query = self._picker_for_query, False
+        if for_query:
+            # The popup was the template's ``:`` query's and the button takes it
+            # over: the canvas is told to end that query FIRST - left holding it with
+            # no popup of its own, it took the first Esc after this picker closed.
+            # (The flag is down already, so the canvas's answer closes nothing.)
+            try:
+                if self._canvas_alive():
+                    self.canvas.dismiss_emoji_query()
+            except Exception as exc:        # (a button command must not raise into Tk)
+                self._emoji_warn("an emoji query could not be ended", exc)
         picker.open_at(x, y, take_focus=True)
 
     def _on_emoji_pick(self, seq):

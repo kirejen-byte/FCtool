@@ -85,7 +85,9 @@ _TONE_SUFFIX_RE = re.compile(r"skin-tone-([1-5])")
 #: but a letter, a digit or an underscore (``\w`` is Unicode-aware here) -- the
 #: table has one- and two-letter names (``x``, ``b``, ``ok``, ``on``, ``up``),
 #: so ``Comms:x:``, ``a:b:c``, a clock time and a URL must not be read as
-#: shortcodes, while ``**:x:**``, ``(:x:)`` and ``:x::x:`` are.
+#: shortcodes, while ``**:x:**``, ``(:x:)`` and ``:x::x:`` are.  (One more
+#: rule is not in the pattern, because it depends on what the pass has done:
+#: a DOUBLED colon opens nothing -- see :func:`replace_shortcodes`.)
 _CODE_RE = re.compile(r"<[^<>\s]+>|(?<!\w):([^\s:<>]+):")
 #: The ``:skin-tone-N:`` that may follow a ``:name:`` directly.
 _TONE_TAIL_RE = re.compile(r":skin-tone-([1-5]):", re.IGNORECASE)
@@ -325,6 +327,21 @@ def _log(level: str, message: str, *args) -> None:
         pass
 
 
+def _reason(exc) -> str:
+    """``exc`` as text for a log line, WITHOUT a directory.
+
+    An ``OSError`` spells out the full path of the file it failed on, a path
+    can carry a Windows user name, and logs get shared for support: only the
+    path's last component is kept."""
+    if isinstance(exc, OSError) and exc.filename is not None:
+        try:
+            name = os.path.basename(os.fspath(exc.filename))
+        except TypeError:                     # a file descriptor, not a path
+            name = "?"
+        return "%s: %r" % (exc.strerror or "could not be opened", name)
+    return str(exc)
+
+
 def _warn_once(message: str, *args) -> None:
     """The one WARNING of a run; later problems are silent."""
     global _warned
@@ -350,17 +367,19 @@ def _load():
         data = _read_bytes(path)
     except OSError as exc:
         _warn_once("[Emoji] %s could not be read (%s: %s); emoji are shown as "
-                   "plain characters", DATA_FILE, type(exc).__name__, exc)
+                   "plain characters", DATA_FILE, type(exc).__name__,
+                   _reason(exc))
         return None, settled
     except Exception as exc:                  # a path that is no path at all
         _warn_once("[Emoji] %s could not be located (%s: %s); emoji are shown "
-                   "as plain characters", DATA_FILE, type(exc).__name__, exc)
+                   "as plain characters", DATA_FILE, type(exc).__name__,
+                   _reason(exc))
         return None, True
     try:
         index = _build(_parse(data))
     except Exception as exc:
         _warn_once("[Emoji] %s is unusable (%s: %s); emoji are shown as plain "
-                   "characters", DATA_FILE, type(exc).__name__, exc)
+                   "characters", DATA_FILE, type(exc).__name__, _reason(exc))
         return None, True
     if _attempts > 1:
         _log("info", "[Emoji] %s read on attempt %d", DATA_FILE, _attempts)
@@ -397,7 +416,12 @@ def set_data_file(path) -> None:
 
 def available() -> bool:
     """Whether a usable table is loaded (loading it if this is the first call).
-    False when it is missing or corrupt -- one WARNING is logged, once."""
+    False when it is missing or corrupt -- one WARNING is logged, once.
+
+    A False can be PROVISIONAL: a table that could not be READ (a transient
+    open / read failure) is tried again by a later call, at most
+    ``_MAX_READ_ATTEMPTS`` times in all, so a later call may answer True. Ask
+    again when it matters; do not cache a False."""
     return _table() is not None
 
 
@@ -526,7 +550,19 @@ def replace_shortcodes(text: str) -> str:
     ``:name::skin-tone-N:`` becomes the one toned emoji when the table has it
     (else ``:name:`` alone is replaced).  Unknown names (a server's custom
     emoji) are left exactly as written, and nothing inside a ``<...>`` token
-    is touched -- ``<t:100:R>`` is a timestamp, ``<:name:123>`` a custom emoji."""
+    is touched -- ``<t:100:R>`` is a timestamp, ``<:name:123>`` a custom emoji.
+
+    **A doubled colon opens nothing**: an opening colon directly preceded by a
+    raw ``:`` is not one, so ``PING::x:up``, ``::x:`` and ``std::x:`` are left
+    alone.  The one exception is the colon that CLOSED a well-formed ``:name:``
+    this very pass has just read -- a name it converted, or an unknown one it
+    left as written (a server's custom emoji) -- whose own opening colon passed
+    these rules.  So shortcodes written back to back convert
+    (``:skull::skull:``), so does a known one straight after an unknown one
+    (``:custom::skull:``, ``:a::b::skull:``), and what follows a converted
+    ``:name:`` (a ``:skin-tone-N:`` the table has no emoji for included) is
+    read as before.  The typed path applies the same rule
+    (``pill_canvas._emoji_colon_ok``)."""
     if not text or ":" not in text:
         return text
     index = _table()
@@ -535,16 +571,25 @@ def replace_shortcodes(text: str) -> str:
     by_code = index.by_code
     find = _CODE_RE.search
     out = []
-    pos = 0
+    pos = 0             # start of the text not yet emitted
+    scan = 0            # where the search for the next candidate resumes
+    glued = -1          # just past the ``:name:`` this pass read last
     while True:
-        hit = find(text, pos)
+        hit = find(text, scan)
         if hit is None:
             break
         name = hit.group(1)
+        start = hit.start()
         end = hit.end()
         if name is None:                       # a <...> token: as written
             out.append(text[pos:end])
-            pos = end
+            pos = scan = end
+            continue
+        if start and text[start - 1] == ":" and start != glued:
+            # A doubled colon whose first colon closed no ``:name:``: this one
+            # opens nothing. Look again after it -- the candidate's own
+            # closing colon may still open a shortcode.
+            scan = start + 1
             continue
         key = name.lower()
         seq = None
@@ -560,12 +605,14 @@ def replace_shortcodes(text: str) -> str:
             # that colon may open a shortcode is the same question as for any
             # other: not after the letter that ends ``:nope:``, but yes after
             # the bracket that ends ``:-):``.
+            # (And a name may follow it directly: ``:custom::skull:``.)
             out.append(text[pos:end - 1])
-            pos = end - 1
+            pos = scan = end - 1
+            glued = end
             continue
-        out.append(text[pos:hit.start()])
+        out.append(text[pos:start])
         out.append(seq)
-        pos = end
+        pos = scan = glued = end
     out.append(text[pos:])
     return "".join(out)
 
@@ -583,14 +630,16 @@ def search(query: str, limit: int = 40) -> list:
     contain it, then names that contain it; table order within each. Skin-tone
     variants are left out unless the query contains ``tone``. A space in the
     query matches an underscore in a shortcode and the other way round for
-    names; surrounding colons are ignored. Empty query: ``[]``. A ``limit``
-    that is not a positive int behaves as 40."""
+    names; surrounding colons are ignored. Empty query: ``[]`` -- and so is one
+    that FOLDS to nothing (a lone accent character folds to a space, which
+    would otherwise match every underscore). A ``limit`` that is not a
+    positive int behaves as 40."""
     if not _is_int(limit) or limit <= 0:
         limit = _DEFAULT_LIMIT
     index = _table()
     if index is None or not isinstance(query, str):
         return []
-    wanted = _fold(query.strip().strip(":").strip())
+    wanted = _fold(query.strip().strip(":").strip()).strip()
     if not wanted:
         return []
     in_code = wanted.replace(" ", "_")

@@ -33,7 +33,9 @@ same content, and the popup opens while the user is typing.)  Only the cells
 whose content changed ask ``tiles.image(seq)``; nothing is preloaded.  A cell
 whose tile is None, raises, or is not an image -- or a picker given
 ``tiles=None`` -- shows the raw character, cell by cell; a press picks only
-what a cell actually shows.
+what a cell actually shows.  Such a cell DRAWS only as much of its sequence
+as fits inside it (canvas text is clipped by nothing, and a long sequence
+would run over its neighbours); the sequence it holds, and picks, is whole.
 
 **When it closes.**  On Esc, on a pick, and when the keyboard focus has left
 both the popup and (``take_focus=False``) the widget that was driving it -- the
@@ -105,6 +107,16 @@ LABEL_MAX = 8
 #: Side of one grid cell in px. The pack's tiles are 22 px; the rest is margin.
 CELL_PX = 30
 
+#: The widest text a cell without a tile draws, in px. Canvas text is clipped
+#: by nothing, and its bounding box is 1 px wider than the text on each side;
+#: this leaves it a pixel clear of the cell's edges (one emoji is 25 px wide
+#: in the cell font -- measured 2026-10-09).
+_CELL_TEXT_PX = CELL_PX - 4
+
+#: How many leading characters of a sequence :func:`fit_text` will try. The
+#: longest real emoji sequence is far shorter; the cap bounds a hostile one.
+_FIT_SCAN = 32
+
 #: Group names whose first word does not make a good label.
 _SHORT = {"Activities": "Activity"}
 
@@ -144,6 +156,34 @@ def describe(entry) -> tuple:
     shown = "  ".join(":%s:" % code for code in codes
                       if isinstance(code, str) and code)
     return (name, shown)
+
+
+def _splits_pair(text: str, cut: int) -> bool:
+    """Whether cutting ``text`` at ``cut`` would part the two halves of a
+    surrogate pair (a string may carry one emoji as two code units, and Tk
+    draws the pair as that emoji)."""
+    return (0 < cut < len(text)
+            and 0xD800 <= ord(text[cut - 1]) <= 0xDBFF
+            and 0xDC00 <= ord(text[cut]) <= 0xDFFF)
+
+
+def fit_text(text: str, limit: int, measure) -> str:
+    """The longest leading part of ``text`` that is at most ``limit`` px wide
+    by ``measure(part) -> px`` -- ``text`` itself when it fits.
+
+    What is left always holds the first character whole (both halves, when
+    it is a surrogate pair), fit or no fit: a cell must show SOMETHING. A cut
+    never falls inside a surrogate pair. Widths need not grow with the text
+    (a font may draw several code points as one glyph), so the parts are
+    tried from the long end; at most ``_FIT_SCAN`` characters are ever kept
+    of a text that does not fit whole, which bounds the measuring."""
+    if not text or measure(text) <= limit:
+        return text
+    first = 2 if _splits_pair(text, 1) else 1
+    for cut in range(min(len(text) - 1, _FIT_SCAN), first, -1):
+        if not _splits_pair(text, cut) and measure(text[:cut]) <= limit:
+            return text[:cut]
+    return text[:first]
 
 
 def place_popup(x: int, y: int, width: int, height: int, bounds, *,
@@ -777,7 +817,29 @@ class EmojiPicker:
             except tk.TclError:
                 pass        # not an image: this cell falls back to the text
         canvas.itemconfigure(image_item, image="", state="hidden")
-        canvas.itemconfigure(text_item, text=seq, state="normal")
+        canvas.itemconfigure(text_item, text=self._cell_text(seq),
+                             state="normal")
+
+    def _cell_text(self, seq):
+        """What a cell without a tile draws for ``seq``: as much of it as
+        fits in the cell (:func:`fit_text`, measured with the cell font).
+        Canvas text is not clipped to anything -- ``width=`` would WRAP it --
+        so a long sequence drawn whole runs over the neighbouring cells. Only
+        the drawing is cut: what the cell holds, and what a press picks, is
+        still the whole sequence. Never raises: text that cannot be measured
+        is drawn as it is."""
+        if not isinstance(seq, str):
+            return seq
+        canvas = self._canvas
+
+        def measure(part: str) -> int:
+            return int(canvas.tk.call("font", "measure", _CELL_FONT,
+                                      "-displayof", str(canvas), part))
+
+        try:
+            return fit_text(seq, _CELL_TEXT_PX, measure)
+        except Exception:
+            return seq
 
     def _restyle_selection(self) -> None:
         lit = self._model.selected_cell()

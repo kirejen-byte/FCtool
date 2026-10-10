@@ -86,7 +86,8 @@ The helpers:
     opens the stock colour dialog, right-click resets to ``default``. No
     variable traces — see its docstring.
 
-``make_split_button(parent, text, *, style, command, arrow_command, arrow_tooltip="", bg=None)``
+``make_split_button(parent, text, *, style, command, arrow_command,
+arrow_tooltip="", bg=None)``
     A main ttk button fused flush to a narrow ``ARROW_GLYPH`` (the house small
     down-arrow) button; returns a Frame carrying ``.main`` and ``.arrow``.
 """

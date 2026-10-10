@@ -135,8 +135,10 @@ def summary(composed: Composed, *, consumed_when, now_unix: int) -> tuple:
     1. the time that was used up - marked ``(already passed)`` when it was behind
        ``now_unix`` - or, with none, the fleet type and ``When: Now``;
     2. ``left out: <Label>, <Label>`` for the fields whose line was dropped;
-    3. ``N more warning(s)`` for the warnings part 2 does not account for (an unsupported
-       pill, say).
+    3. the count of the warnings part 2 does not account for (an unsupported pill, say):
+       ``1 more warning`` / ``N more warnings`` after a part 2, and plain ``1 warning`` /
+       ``N warnings`` when no line was left out - there is nothing for them to be "more"
+       than.
 
     The level is ``"warn"`` for an empty ping, when part 2 or 3 is there, and for a used-up
     time that had already passed - so a yellow line always says why.
@@ -159,7 +161,8 @@ def summary(composed: Composed, *, consumed_when, now_unix: int) -> tuple:
         level = "warn"
     more = len(composed.warnings or ()) - len(omitted)
     if more > 0:
-        parts.append("1 more warning" if more == 1 else "%d more warnings" % more)
+        parts.append("%d %s%s" % (more, "more " if omitted else "",
+                                  "warning" if more == 1 else "warnings"))
         level = "warn"
     return "Ping copied %s %s" % (_DASH, separator.join(parts)), level
 

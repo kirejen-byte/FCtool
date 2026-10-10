@@ -1957,11 +1957,34 @@ class PillCanvas(MarkupEditor):
         or underscore (an image or a pill before it is none of those), and it
         is not inside a ``<...>`` token being typed. A token holds no
         whitespace, so an unclosed ``<`` followed by whitespace ("ETA <10 min",
-        "a < b") is not one - the rule of ``emoji_data.replace_shortcodes``."""
+        "a < b") is not one - the rule of ``emoji_data.replace_shortcodes``.
+
+        A DOUBLED colon opens nothing either ("PING::x:", "::ro") - unless
+        the raw ``:`` directly before the opening colon CLOSES a well-formed
+        ``:name:`` on the same line: a non-empty run of name characters (no
+        whitespace, no ``<`` / ``>``) holding no pill and no image, whose own
+        opening colon passes this same rule. That is an unknown name left as
+        typed (a server's custom emoji), so ":custom::skull:" converts the
+        skull and ":a::b::sk" opens a query. A shortcode CONVERTED just before
+        is an image (or its emoji characters), never a colon, so names typed
+        back to back convert as always. ``replace_shortcodes`` makes the same
+        exception for the colon that closed the ``:name:`` it has just read."""
         t = self.text
-        before = t.get(opening + "-1c", opening)
-        if before.isalnum() or before == "_":
-            return False
+        at = opening
+        while True:                     # (one turn per ":name:" directly before)
+            before = t.get(at + "-1c", at)
+            if before.isalnum() or before == "_":
+                return False
+            if before != ":":
+                break
+            closing = t.index(at + "-1c")
+            at = t.search(":", closing, stopindex=line, backwards=True)
+            if not at:
+                return False                    # a bare "::"
+            name = t.get(at + "+1c", closing)
+            if (not name or any(ch.isspace() or ch in "<>" for ch in name)
+                    or t.dump(at, closing, window=True, image=True)):
+                return False                    # that colon closed no name
         head = t.get(line, opening)
         opened = head.rfind("<")
         return not (opened > head.rfind(">")

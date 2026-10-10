@@ -76,11 +76,11 @@ import re
 import ssl
 import sys
 import tarfile
+import textwrap
 import threading
 import time
 import zlib
 from collections import namedtuple
-import textwrap
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from urllib.parse import urljoin, urlsplit
@@ -849,12 +849,14 @@ def _atomic_write(path, data) -> None:
     os.replace(part, path)
 
 
-def _cached_or_get(net, url, path, max_bytes, check) -> tuple:
+def _cached_or_get(net, url, path, max_bytes, check, why=None) -> tuple:
     """``(bytes, downloaded?)`` -- the cached file when it passes ``check``.
 
     ``check(bytes) -> bool`` is asked about a cached file (a bad one is fetched
     again, so a cut-short download cannot stick) and about a fresh download
     BEFORE it is written: nothing unverified ever reaches the cache.
+    ``why(bytes) -> str`` (optional) says what is wrong with a refused download;
+    its answer is added to the error.
     """
     path = Path(path)
     if path.is_file():
@@ -863,8 +865,10 @@ def _cached_or_get(net, url, path, max_bytes, check) -> tuple:
             return data, False
     data = net.get(url, max_bytes)
     if not check(data):
+        reason = why(data) if why is not None else ""
         raise BuildError("the download of %s is incomplete or is not the file that "
-                         "was expected -- nothing was written to the cache" % url)
+                         "was expected -- nothing was written to the cache%s"
+                         % (url, " (%s)" % reason if reason else ""))
     _atomic_write(path, data)
     return data, True
 
@@ -876,6 +880,28 @@ def emoji_test_complete(data) -> bool:
     except UnicodeDecodeError:
         return False
     return text.rstrip().endswith("\n#EOF")
+
+
+def emoji_test_problem(data) -> str:
+    """What stops ``data`` from being THE ``emoji-test.txt`` this tool is pinned to,
+    as a sentence; ``""`` when nothing does.
+
+    Whole (``emoji_test_complete``), every data line understood, and exactly
+    ``EXPECTED_FULLY_QUALIFIED`` fully-qualified lines.  ``fetch`` asks this BEFORE
+    the cache write, so a complete file of another edition is never stored -- and
+    one that is already in the cache is fetched again instead of being believed.
+    """
+    if not emoji_test_complete(data):
+        return "emoji-test.txt is cut short (no #EOF line) or is not UTF-8"
+    try:
+        lines = parse_emoji_test(data.decode("utf-8"))
+    except BuildError as exc:
+        return str(exc)
+    fully_qualified = sum(1 for ln in lines if ln.status == "fully-qualified")
+    if fully_qualified != EXPECTED_FULLY_QUALIFIED:
+        return ("emoji-test.txt has %d fully-qualified lines, expected %d"
+                % (fully_qualified, EXPECTED_FULLY_QUALIFIED))
+    return ""
 
 
 def listing_complete(data) -> bool:
@@ -924,15 +950,15 @@ def fetch(net, cache_dir=CACHE_DIR, out=print) -> dict:
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
 
+    # whole, understood AND the pinned edition (its fully-qualified count): all three
+    # are settled before the file may reach the cache
     test_bytes, fresh = _cached_or_get(net, EMOJI_TEST_URL, cache_dir / CACHE_EMOJI_TEST,
-                                       EMOJI_TEST_MAX_BYTES, emoji_test_complete)
+                                       EMOJI_TEST_MAX_BYTES,
+                                       lambda data: not emoji_test_problem(data),
+                                       why=emoji_test_problem)
     out("emoji-test.txt      %10s bytes  %s" % (format(len(test_bytes), ","),
                                                "downloaded" if fresh else "cached"))
     lines = parse_emoji_test(test_bytes.decode("utf-8"))
-    fully_qualified = sum(1 for ln in lines if ln.status == "fully-qualified")
-    if fully_qualified != EXPECTED_FULLY_QUALIFIED:
-        raise BuildError("emoji-test.txt has %d fully-qualified lines, expected %d"
-                         % (fully_qualified, EXPECTED_FULLY_QUALIFIED))
 
     listing_bytes, fresh = _cached_or_get(net, TWEMOJI_LISTING_URL, cache_dir / CACHE_LISTING,
                                           LISTING_MAX_BYTES, listing_complete)
@@ -1014,6 +1040,8 @@ NON_ASCII_SHORTCODES = frozenset({"pi" + chr(0xF1) + "ata"})
 
 def shortcode_name_ok(name) -> bool:
     return bool(_SHORTCODE_NAME.fullmatch(name)) or name in NON_ASCII_SHORTCODES
+
+
 _JS_FRAME = re.compile(
     r'^\s*(?://.*|/\*.*\*/|const [a-z]+ = \{|\};|export \{[a-z, ]+\};)?\s*$')
 

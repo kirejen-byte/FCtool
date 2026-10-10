@@ -25,14 +25,23 @@ preview and nothing else - it copies nothing and sends nothing.
 * ``@everyone`` / ``@here`` at a line start or NOT preceded by a letter, a
   digit or an underscore (``**@everyone**`` and ``(@here)`` ping in Discord,
   ``mail@everyone.com`` does not), and ``<@&DIGITS>`` (shown as ``@role``) -
-  mention spans.
+  mention spans. Only a WORD underscore glues (``a_@here``): one that is
+  itself a marker does not (``_@here_`` and ``__@everyone__`` ping).
 * A bare URL - ``http://`` or ``https://`` up to the next whitespace - is
   literal text: nothing inside it is a marker (``https://x.com/_foo_/x``
-  keeps its underscores). The rule is exactly that wide, so a URL written
-  flush against a closing marker (``**https://x.com**``) swallows it.
-* A backslash before a marker character (``*`` ``_`` ``~`` or a backtick)
-  escapes it: the character is text and the backslash is not shown. A
-  backslash before anything else is just a backslash.
+  keeps its underscores). One exception, for a URL written flush against a
+  closing marker: a run of the marker's character at the very END of a URL
+  still closes a marker opened before it (``**see https://x.com**`` is bold;
+  the URL's own text stays literal, and such a run never OPENS anything).
+* A backslash escapes ANY character that is not an ASCII letter, an ASCII
+  digit or whitespace (Discord's own rule): the character is text and the
+  backslash is not shown. So an escaped marker marks nothing, an escaped
+  ``#`` / ``>`` / ``-#`` heads nothing (the block prefixes are matched at
+  the very start of the line, where the backslash now stands), an escaped
+  ``@everyone`` is not a mention, an escaped ``<t:1:R>`` is not a time, and
+  an escaped backslash is one backslash. An escaped emoji is still that
+  emoji. A backslash before a letter, a digit or whitespace, and one at the
+  very end of a line, is just a backslash (``C:\\dir\\name`` is untouched).
 * Emoji - only through the optional ``split_emoji`` hook. Each emoji it names
   becomes ONE span and is atomic: a marker character inside one (the keycap
   asterisk starts with ``*``) is never markup. Without the hook, or when the
@@ -132,8 +141,6 @@ _ROLE_RE = re.compile(r"<@&[0-9]+>")
 _MENTIONS = ("@everyone", "@here")
 # A bare URL: the scheme, then everything up to the next whitespace.
 _URL_RE = re.compile(r"https?://\S*")
-# What a backslash can escape: the inline marker characters, nothing else.
-_ESCAPABLE = frozenset("*_~`")
 
 # A span's emphasis, as (bold, italic, underline, strike) - the order of the
 # Span fields, so it can be splatted into the constructor.
@@ -199,6 +206,10 @@ class _Inline:
         # began, so a later search of the same stretch cannot succeed either;
         # remembering that keeps a line of unclosed markers linear.
         self.dead = {}
+        # The index of the LAST character of every underscore marker that
+        # was accepted (an opener or a closer): a mention right after one is
+        # not glued to a word.
+        self.marks = set()
         if split_emoji is not None:
             self._find_emoji(split_emoji, start)
 
@@ -276,8 +287,12 @@ class _Inline:
                 return [Span("mention", ROLE_TEXT, *style)], match.end()
             return None, i + 1
         if ch == "@":
-            # At the line start, or not glued to a word ("mail@everyone.com").
-            if i == 0 or not (line[i - 1].isalnum() or line[i - 1] == "_"):
+            # At the line start, or not glued to a word ("mail@everyone.com",
+            # "a_@here"). An underscore that is a MARKER is no part of a
+            # word: "_@here_" pings.
+            before = line[i - 1] if i else ""
+            if not (before.isalnum()
+                    or (before == "_" and i - 1 not in self.marks)):
                 for word in _MENTIONS:
                     if line.startswith(word, i, end):
                         return [Span("mention", word, *style)], i + len(word)
@@ -287,6 +302,8 @@ class _Inline:
             return None, (match.end() if match is not None else i + 1)
         if ch == "\\":
             if self._escapes(i, end):       # the backslash is not shown
+                if self.atomic[i + 1]:      # an emoji stays that emoji
+                    return self._piece(i + 1, end, style, depth)
                 return [Span("text", line[i + 1], *style)], i + 2
             return None, i + 1
         if depth < _MAX_DEPTH:              # ch is one of * _ ~
@@ -301,6 +318,9 @@ class _Inline:
                 stop = self._closer(marker, inner, end)
                 if stop < 0:
                     continue
+                if ch == "_":               # before the content is parsed
+                    self.marks.add(inner - 1)
+                    self.marks.add(stop + len(marker) - 1)
                 nested = style[:slot] + (True,) + style[slot + 1:]
                 return (self.run(inner, stop, nested, depth + 1),
                         stop + len(marker))
@@ -333,10 +353,14 @@ class _Inline:
         return None, None, inner
 
     def _escapes(self, i: int, end: int) -> bool:
-        """Does the backslash at ``i`` escape the character after it?"""
+        """Does the backslash at ``i`` escape the character after it? It
+        does unless that is an ASCII letter, an ASCII digit or whitespace -
+        or there is none (the end of the line, or of the marked stretch)."""
         after = i + 1
-        return (after < end and self.line[after] in _ESCAPABLE
-                and not self.atomic[after])
+        if after >= end:
+            return False
+        ch = self.line[after]
+        return not (ch.isspace() or (ch.isascii() and ch.isalnum()))
 
     def _opens(self, marker: str, i: int, inner: int, end: int) -> bool:
         line = self.line
@@ -357,7 +381,8 @@ class _Inline:
     def _closer(self, marker: str, start: int, end: int) -> int:
         """The index of the marker that closes one opened just before
         ``start``, or -1. Code spans, emoji, URLs and escaped characters are
-        stepped over.
+        stepped over - all of a URL but a run of the marker's own character
+        at its very end, which is a closer like any other.
 
         Runs of the marker character decide who owns what: a two-character
         marker closes on the LAST two of a run of two or more, a one-character
@@ -388,8 +413,16 @@ class _Inline:
             if c == "h" and line.startswith("http", k, end):
                 match = _URL_RE.match(line, k, end)
                 if match is not None:
-                    k = match.end()
-                    continue
+                    # Nothing inside a URL is a marker - but a run of this
+                    # marker's character at its very END is not the URL's.
+                    k = tail = match.end()
+                    while (tail > match.start() and line[tail - 1] == ch
+                           and not atomic[tail - 1]):
+                        tail -= 1
+                    if tail == k:
+                        continue
+                    k = tail
+                    c = ch
             if c != ch:
                 k += 1
                 continue
@@ -603,10 +636,13 @@ class DiscordPreview(tk.Frame):
         self._lines = None          # parse(self._source), once per text
         self._has_time = True       # ... and whether it holds a timestamp
         self._tiles = {}            # emoji sequence -> image / None, per text
+        self._tile_px = {}          # emoji sequence -> its tile's height
         self._shown = None          # the drawing plan last put on screen
         self._drawn_key = None      # (mode, text, now) that plan was made for
         self._images = []           # every PhotoImage now in the Text
         self._bar_image = None      # the one quote-bar image, made on demand
+        self._tall_bars = {}        # height -> a taller bar now in the Text
+        self._line_px = None        # the height of a line of body text
         self._font_tags = set()
         self._warned = False
         self._dead = False
@@ -664,6 +700,7 @@ class DiscordPreview(tk.Frame):
         self._shown = self._drawn_key = None
         self._images = []
         self._bar_image = None
+        self._tall_bars = {}
         super().destroy()
 
     def _alive(self) -> bool:
@@ -683,6 +720,7 @@ class DiscordPreview(tk.Frame):
         self._lines = None
         self._has_time = True
         self._tiles = {}
+        self._tile_px = {}
 
     def _parsed(self) -> list:
         """``parse`` of the current text - run once per text, not per tick."""
@@ -742,8 +780,9 @@ class DiscordPreview(tk.Frame):
 
     # -- the drawing plan -----------------------------------------------------
     # A plan is a tuple of operations: ("text", chars, tags), ("image",
-    # photo, tags) or ("bar", None, ()). Building one touches no text;
-    # comparing two is how "nothing changed" is known.
+    # photo, tags) or ("bar", height, ()) - the height of the tallest emoji
+    # tile on that quoted line, None when it holds none. Building one touches
+    # no text; comparing two is how "nothing changed" is known.
     def _raw_plan(self, tags=("raw",)) -> tuple:
         return (("text", self._source, tags),) if self._source else ()
 
@@ -788,8 +827,10 @@ class DiscordPreview(tk.Frame):
                     total += 1
             newline_tags = block_tags
             used = 0
+            bar = None              # this line's bar, when it is a quote
             if line.block == "quote" and total < MAX_RUNS_TOTAL:
-                plan.append(["bar", None, ()])
+                bar = ["bar", None, ()]
+                plan.append(bar)
                 used += 1
                 total += 1
             for index, span in enumerate(line.spans):
@@ -809,6 +850,12 @@ class DiscordPreview(tk.Frame):
                     image = self._image_for(shown) if use_images else None
                     if image is not None:
                         plan.append(["image", image, tags])
+                        if bar is not None:
+                            # A tile taller than the text makes its row
+                            # taller: the bar has to be as tall as that.
+                            tall = self._tile_height(shown)
+                            if tall > (bar[1] or 0):
+                                bar[1] = tall
                         used += 1
                         total += 1
                         continue
@@ -839,6 +886,17 @@ class DiscordPreview(tk.Frame):
                 image = None
         self._tiles[seq] = image
         return image
+
+    def _tile_height(self, seq: str) -> int:
+        """How tall, in pixels, the tile ``_image_for`` gave for ``seq`` is -
+        0 when it cannot say. Asked once per text, like the tile itself."""
+        if seq not in self._tile_px:
+            try:
+                height = max(0, int(self._tiles[seq].height()))
+            except Exception:
+                height = 0
+            self._tile_px[seq] = height
+        return self._tile_px[seq]
 
     def _wording(self, span):
         """What Discord shows for a timestamp here and now, or None when it
@@ -916,6 +974,7 @@ class DiscordPreview(tk.Frame):
         view = self.text
         top = view.yview()[0]
         images = []
+        tall_bars = {}
         # Filled while NORMAL: insert / delete on a disabled Text are silent
         # no-ops, so the toggle around a refill is load-bearing.
         view.configure(state="normal")
@@ -934,14 +993,15 @@ class DiscordPreview(tk.Frame):
                     for tag in op[2]:
                         view.tag_add(tag, index)
                 else:
-                    self._add_bar()
+                    self._add_bar(op[1], tall_bars)
         finally:
             view.configure(state="disabled")
             # The old images are let go only now, after their elements went.
             self._images = images
+            self._tall_bars = tall_bars
         view.yview_moveto(top)
 
-    def _add_bar(self) -> None:
+    def _add_bar(self, tall, tall_bars: dict) -> None:
         """The quote bar: an image element at the start of the line - a bar,
         then a gap, as Discord draws it. (A wrapped quote keeps its indent;
         the bar marks its first row.)
@@ -951,9 +1011,15 @@ class DiscordPreview(tk.Frame):
         windows took 260 ms and over 750 took 3.1 s; 3,000 bar images take
         3 ms). Every bar shares the one image, exactly as tall as a line of
         body text, so the bars of consecutive quoted lines join.
+
+        ``tall`` is the height of the tallest emoji tile on the line (None
+        without one). A tile taller than a line of text makes its row that
+        tall, and the shared bar would then stop short of the next line's:
+        such a line wears a bar as tall as its tile instead - one image per
+        height, kept in ``tall_bars`` for as long as this drawing is shown.
         """
         try:
-            bar = self._bar_tile()
+            bar = self._bar_tile(tall, tall_bars)
         except Exception:
             return                  # no bar is a cosmetic loss, not a failure
         view = self.text
@@ -961,14 +1027,27 @@ class DiscordPreview(tk.Frame):
         view.image_create(index, image=bar, name=QUOTE_BAR_NAME)
         view.tag_add("block-quote", index)
 
-    def _bar_tile(self):
-        if self._bar_image is None:
+    def _bar_tile(self, tall=None, tall_bars=None):
+        if self._line_px is None:
             # A Font belongs to its interpreter: built here, on demand.
-            height = max(1, int(tkfont.Font(
+            self._line_px = max(1, int(tkfont.Font(
                 root=self, font=(_UI_FONT, _BODY_PT)).metrics("linespace")))
-            image = tk.PhotoImage(master=self, width=self._quote_px,
-                                  height=height)
-            # The rest of the image stays transparent: that is the gap.
-            image.put(QUOTE_BAR, to=(0, 0, self._bar_px, height))
-            self._bar_image = image
+        height = self._line_px
+        if tall_bars is not None and tall and tall > height:
+            image = tall_bars.get(tall)
+            if image is None:       # the one on screen now, when there is one
+                image = self._tall_bars.get(tall)
+                if image is None:
+                    image = self._bar_of(tall)
+                tall_bars[tall] = image
+            return image
+        if self._bar_image is None:
+            self._bar_image = self._bar_of(height)
         return self._bar_image
+
+    def _bar_of(self, height: int):
+        image = tk.PhotoImage(master=self, width=self._quote_px,
+                              height=height)
+        # The rest of the image stays transparent: that is the gap.
+        image.put(QUOTE_BAR, to=(0, 0, self._bar_px, height))
+        return image

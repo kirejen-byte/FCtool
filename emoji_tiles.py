@@ -336,12 +336,13 @@ class EmojiTiles:
             return self._fail(
                 self._attempts >= _MAX_READ_ATTEMPTS,
                 "[Emoji] %s could not be read (%s: %s); emoji are shown as "
-                "plain characters", _ascii(path or SHEET_FILE),
+                "plain characters", self._looked_for(),
                 type(exc).__name__, _ascii(exc.strerror or exc))
         except Exception as exc:                # a path that is no path at all
             return self._fail(True, "[Emoji] %s could not be located (%s: "
                               "%s); emoji are shown as plain characters",
-                              SHEET_FILE, type(exc).__name__, _ascii(exc))
+                              self._looked_for(), type(exc).__name__,
+                              _ascii(exc))
 
         try:
             sheet = _parse_sheet(data)
@@ -357,15 +358,34 @@ class EmojiTiles:
                     + _chunk(b"tRNS", sheet.trns))
         except Exception as exc:
             return self._fail(True, "[Emoji] %s is unusable (%s: %s); emoji "
-                              "are shown as plain characters", _ascii(path),
-                              type(exc).__name__, _ascii(exc))
+                              "are shown as plain characters",
+                              self._looked_for(), type(exc).__name__,
+                              _ascii(exc))
         if self._attempts > 1:
-            _log("info", "[Emoji] %s read on attempt %d", _ascii(path),
+            _log("info", "[Emoji] %s read on attempt %d", self._looked_for(),
                  self._attempts)
         self._sheet = sheet
         self._layout = layout
         self._head = head
         return True
+
+    def _looked_for(self) -> str:
+        """What the sheet is called in EVERY log line of this module: the
+        bundled sheet's relative name (also when the lookup answered a full
+        path), or - for an explicit ``sheet_path`` - that path's last
+        component. Never a full path (a path can carry a Windows user name,
+        and logs are shared for support), always printable ASCII, never a
+        raise."""
+        if self._sheet_arg is None:
+            return SHEET_FILE
+        try:
+            name = os.path.basename(self._sheet_arg)
+            if isinstance(name, bytes):
+                name = name.decode("ascii", "backslashreplace")
+            return "".join(ch if " " <= ch <= "~" else "\\x%02x" % ord(ch)
+                           for ch in _ascii(name)) or "the sheet"
+        except Exception:
+            return "the sheet"
 
     def _fail(self, settled: bool, message, *args) -> bool:
         """Log the one WARNING and answer False; ``settled`` makes the
