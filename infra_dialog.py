@@ -43,7 +43,9 @@ from ui_theme import (
 )
 # Shared hover-tooltip helper (also a stdlib-only leaf) — replaces this dialog's
 # former bespoke ``_Tooltip`` class (OPTIMIZATION_REVIEW.md D9 dedupe).
-from ui_helpers import attach_tooltip, center_over
+from ui_helpers import (
+    attach_tooltip, begin_hidden, center_over, parent_work_area,
+)
 
 # Tree columns (order is the display order) and their header labels.
 #
@@ -62,6 +64,11 @@ HEADINGS = {"system": "System", "name": "Name", "category": "Type",
 # on each side = 89 px, plus 3 px of slack.
 _COL_WIDTH = {"system": 90, "name": 240, "category": 150, "type": 92,
               "source": 84, "last_seen": 128, "status": 92}
+
+# The dialog opens 560 px high and at least 980 px wide, wider when its content
+# asks -- but never wider than the monitor it opens on, less this margin.
+_OPEN_WIDTH, _OPEN_HEIGHT = 980, 560
+_MONITOR_MARGIN = 40
 
 
 def entry_key(entry: dict) -> str:
@@ -182,7 +189,7 @@ class InfraManagerDialog(tk.Toplevel):
         self.title("Infrastructure Manager")
         self.configure(bg=BG_DARK)
         try:
-            self.geometry("980x560")
+            self.geometry("%dx%d" % (_OPEN_WIDTH, _OPEN_HEIGHT))
             self.minsize(720, 400)
         except Exception:
             pass
@@ -193,20 +200,25 @@ class InfraManagerDialog(tk.Toplevel):
         self._build_body()         # row 1 (region panel + tree)
         self._build_statusbar()    # row 2
 
-        # A Treeview CLIPS columns that do not fit, so the last one ("Status")
-        # sat off-screen at 980 px. Ask the content how wide it wants to be.
+        # Size, then place, then show -- in that order and out of sight. The
+        # dialog picks its width from its content, and measuring content is an
+        # update_idletasks(): the call that MAPS a fresh Toplevel wherever the
+        # window manager cascades it. Left to center_over alone the window was
+        # already on screen by then, in a corner nowhere near the app, and was
+        # only moved afterwards. So the hide starts HERE, before the
+        # measurement; center_over is the last placement step and is told the
+        # hide is not its own; and the reveal sits in a ``finally``, because a
+        # dialog that could not be measured or placed must still be shown.
+        restore = begin_hidden(self)
         try:
-            self.update_idletasks()
-            needed = int(self.winfo_reqwidth())
-            cap = int(self.winfo_screenwidth()) - 40
-            self.geometry("%dx560" % min(cap, max(980, needed)))
+            self._fit_width(parent)
+            center_over(self, parent, hide=restore is None)
         except Exception:
-            pass
-
-        # Over the tool that opened it. ``geometry("980x560")`` above asks for a
-        # SIZE and no position, so without this Windows cascades the window --
-        # on a multi-monitor layout, into a corner nowhere near the app.
-        center_over(self, parent)
+            log.warning("infra dialog: could not place the window",
+                        exc_info=True)
+        finally:
+            if restore is not None:
+                restore()
 
         self._search_var.trace_add("write", lambda *_a: self._apply_filter())
         self._reload_tree()
@@ -214,6 +226,28 @@ class InfraManagerDialog(tk.Toplevel):
         if self._system_filter is not None:
             self._set_status(
                 "Showing one system — clear Search to see everything.")
+
+    def _fit_width(self, parent):
+        """Ask for the width the content wants, inside the parent's monitor.
+
+        A Treeview CLIPS columns that do not fit, so at a fixed 980 px the last
+        one ("Status") sat off-screen. The limit is the work area of the
+        monitor the PARENT is on -- the one ``center_over`` places the dialog
+        on -- and only when no monitor can be named the primary's width, which
+        is all ``winfo_screenwidth()`` knows: too wide for a parent on a narrow
+        portrait secondary, too narrow beside a small primary. Called with the
+        window hidden (see ``__init__``). Any failure leaves the opening size.
+        """
+        try:
+            self.update_idletasks()
+            needed = int(self.winfo_reqwidth())
+            area = parent_work_area(self, parent)
+            room = (area[2] - area[0]) if area else int(self.winfo_screenwidth())
+            self.geometry("%dx%d" % (
+                min(room - _MONITOR_MARGIN, max(_OPEN_WIDTH, needed)),
+                _OPEN_HEIGHT))
+        except Exception:
+            pass
 
     # ── row 0: toolbar ───────────────────────────────────────────────────────
     def _build_toolbar(self):
