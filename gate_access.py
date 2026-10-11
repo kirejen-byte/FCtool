@@ -36,7 +36,8 @@ safe from any thread: the book publishes a read-only mapping and every mutation
 REBINDS a fresh one, so a reader holding a snapshot never sees it change. The
 book is mutated on the Tk thread only (``GateAccess.apply``, reached through the
 host's UI dispatcher). The resolver's worker touches no Tk and never mutates
-the book; it posts one result batch back.
+the book; it posts one result batch back. ``kick_soon`` and ``nudge`` are the
+two calls a worker may make towards the resolver: both only queue a ``kick``.
 """
 from __future__ import annotations
 
@@ -50,10 +51,10 @@ from types import MappingProxyType
 log = logging.getLogger(__name__)
 
 NO_ALLIANCE = 0                  # a corporation that is in no alliance
-STATUS_LABEL = "other alliance"  # the manager dialog's Status cell
 BOOK_VERSION = 1
 REFRESH_AFTER_S = 24 * 3600      # a record older than this is due a re-fetch
 RETRY_FAILED_AFTER_S = 600       # a failed owner is left alone this long
+NUDGE_EVERY_S = 600              # routing queues at most one census this often
 
 _EMPTY = MappingProxyType({})
 
@@ -350,15 +351,20 @@ class OwnerAllianceBook:
             return False
 
     def due(self, owner_ids, now=None) -> set:
-        """The ``owner_ids`` to (re-)fetch: unknown, undated, or older than
-        :data:`REFRESH_AFTER_S`. A due owner that is known is STILL used."""
+        """The ``owner_ids`` to (re-)fetch: unknown, undated, older than
+        :data:`REFRESH_AFTER_S`, or stamped in the FUTURE (clock skew, a hand
+        edit -- such a record would otherwise never be due again). A due owner
+        that is known is STILL used."""
         now = _aware_utc(now)
         records = self._records
         out = set()
         for corp in owner_ids or ():
             record = records.get(corp)
-            if (record is None or record[1] is None
-                    or (now - record[1]).total_seconds() > REFRESH_AFTER_S):
+            if record is None or record[1] is None:
+                out.add(corp)
+                continue
+            age = (now - record[1]).total_seconds()
+            if age < 0 or age > REFRESH_AFTER_S:
                 out.add(corp)
         return out
 
@@ -413,18 +419,27 @@ class AllianceResolver:
     (a stranded flag would wedge the resolver for the session). An owner whose
     fetch failed is left alone for :data:`RETRY_FAILED_AFTER_S` -- memory for
     this session only -- so a dead corporation cannot cost a fetch per kick.
+
+    A kick REFUSED because a pass was running is remembered: when that pass
+    has been applied and the flag is down, ``follow_up()`` runs ONCE (the
+    facade's census), so an owner that arrived mid-pass still gets fetched. It
+    ends by itself -- the census finds the answers recorded and the failures
+    inside their ten minutes, and starts nothing.
     """
 
-    def __init__(self, get_fn, post_ui, on_results, *, session_factory=None,
-                 clock=time.monotonic, thread_factory=threading.Thread):
+    def __init__(self, get_fn, post_ui, on_results, *, follow_up=None,
+                 session_factory=None, clock=time.monotonic,
+                 thread_factory=threading.Thread):
         self._get_fn = get_fn
         self._post_ui = post_ui
         self._on_results = on_results
+        self._follow_up = follow_up
         self._session_factory = session_factory or _new_session
         self._clock = clock
         self._thread_factory = thread_factory
         self._lock = threading.Lock()
         self._in_flight = False
+        self._refused = False            # a kick was turned away by this pass
         self._failed_at = {}             # {corp_id: clock()}; rebound, not edited
 
     @property
@@ -433,7 +448,8 @@ class AllianceResolver:
 
     def kick(self, owner_ids) -> bool:
         """Start one pass over ``owner_ids``. False when there is nothing to
-        fetch, a pass is already running, or the thread would not start."""
+        fetch, a pass is already running (remembered -- see the class note),
+        or the thread would not start."""
         if not owner_ids:
             return False
         failed, now = self._failed_at, self._clock()
@@ -444,8 +460,10 @@ class AllianceResolver:
             return False
         with self._lock:
             if self._in_flight:
+                self._refused = True
                 return False
             self._in_flight = True
+            self._refused = False
         try:
             self._thread_factory(target=self._run, args=(todo,),
                                  daemon=True).start()
@@ -492,7 +510,14 @@ class AllianceResolver:
 
     def _finish(self, results, failed):
         """TK THREAD (through ``post_ui``). The flag is lowered LAST and in a
-        ``finally``, so "not in flight" means applied, and nothing strands it."""
+        ``finally``, so "not in flight" means applied, and nothing strands it.
+
+        Only THEN, and only when this pass turned a kick away, does the one
+        follow-up census run. The host's re-push kicks from inside the apply,
+        so any change can bring a refusal; the census is cheap (one store
+        read), re-pushes nothing, and may start the next pass because the flag
+        is already down.
+        """
         try:
             now = self._clock()
             memory = {owner: at for owner, at in self._failed_at.items()
@@ -508,6 +533,13 @@ class AllianceResolver:
                         exc_info=True)
         finally:
             self._in_flight = False
+        # _refused is reset by the next pass's start, so it is only read here.
+        if self._refused and self._follow_up is not None:
+            try:
+                self._follow_up()
+            except Exception:
+                log.warning("gate access: the follow-up census failed",
+                            exc_info=True)
 
 
 # -- the facade ----------------------------------------------------------------
@@ -525,13 +557,16 @@ class GateAccess:
     """
 
     def __init__(self, book=None, resolver=None, *, own_alliance_fn=None,
-                 store_fn=None, post_ui=None, on_changed=None):
+                 store_fn=None, post_ui=None, on_changed=None,
+                 clock=time.monotonic):
         self._book = book
         self._resolver = resolver
         self._own_alliance_fn = own_alliance_fn
         self._store_fn = store_fn
         self._post_ui = post_ui
         self._on_changed = on_changed
+        self._clock = clock
+        self._nudge_not_before = float("-inf")   # clock() of the next nudge
 
     # -- reads: any thread, never raise --
 
@@ -594,6 +629,32 @@ class GateAccess:
         except Exception as exc:
             log.warning("gate access: could not queue a kick (%s)", exc)
 
+    def nudge(self):
+        """Routing activity keeps the book fresh: queue one :meth:`kick` onto
+        the Tk thread, at most once per :data:`NUDGE_EVERY_S`.
+
+        For the session in which nothing else kicks -- the first pass failed
+        (ESI down at start), the map is never opened, no scan runs -- and for
+        the 24-hour refresh in a session that long. The routing choke calls
+        this on WORKER threads, so it only queues: no Tk, no thread, no store
+        read here. The fast path is one clock read and one compare. A failed
+        owner is retried by the first nudge that lands after its ten minutes,
+        so within two nudge periods of routing activity.
+
+        Safe from any thread and never raises. Two threads racing past the
+        compare can both queue; a kick is census-guarded, so that is harmless.
+        """
+        if self._resolver is None or self._post_ui is None:
+            return
+        try:
+            now = self._clock()
+            if now < self._nudge_not_before:
+                return
+            self._nudge_not_before = now + NUDGE_EVERY_S
+            self._post_ui(self.kick)
+        except Exception as exc:
+            log.warning("gate access: could not queue a nudge (%s)", exc)
+
     def apply(self, results) -> bool:
         """TK THREAD. Record one batch of answers and save; when a value
         changed, tell the host. Returns whether anything changed."""
@@ -635,11 +696,18 @@ def of(host) -> GateAccess:
 
 def build(path, *, own_alliance_fn, store_fn, get_fn, post_ui, on_changed=None,
           **resolver_options) -> GateAccess:
-    """The working stack over the book at ``path`` (loaded here)."""
+    """The working stack over the book at ``path`` (loaded here).
+
+    ``resolver_options`` go to :class:`AllianceResolver`; a ``clock`` among
+    them also times the facade's :meth:`GateAccess.nudge`. The resolver's
+    follow-up census is the facade's own :meth:`GateAccess.kick`.
+    """
     book = OwnerAllianceBook(path)
     book.load()
     access = GateAccess(book, own_alliance_fn=own_alliance_fn, store_fn=store_fn,
-                        post_ui=post_ui, on_changed=on_changed)
+                        post_ui=post_ui, on_changed=on_changed,
+                        clock=resolver_options.get("clock", time.monotonic))
     access._resolver = AllianceResolver(get_fn, post_ui, access.apply,
+                                        follow_up=access.kick,
                                         **resolver_options)
     return access

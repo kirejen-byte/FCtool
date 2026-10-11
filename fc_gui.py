@@ -2318,7 +2318,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 # Gates of ANOTHER alliance are not usable: they leave the store
                 # union here, and their id-pairs join the suppression below so a
                 # config twin goes too. Fail-open (see gate_access).
-                usable, blocked = gate_access.of(self).bridge_inputs(snapshot)
+                access = gate_access.of(self)
+                usable, blocked = access.bridge_inputs(snapshot)
                 seen = set()
                 for conn in resolved:
                     parts = conn.split("|")
@@ -2332,6 +2333,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     if key not in seen:
                         seen.add(key)
                         resolved.append(f"{ida}|{idb}")
+                # Route lookups keep the owner book fresh when nothing else
+                # does (map never opened, no scan). This may be a WORKER thread:
+                # nudge() only QUEUES a census, at most once per ten minutes.
+                access.nudge()
             except Exception as exc:
                 print(f"[Ansiblex] store gate union failed: {exc}")
         # Suppress reinforced/offline hops from jump-range routing. Read-time so a
@@ -9891,7 +9896,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         """gate_access change hook: an owner's alliance was resolved (or the own
         alliance may have changed), so what counts as another alliance's
         Ansiblex moved. Redraw the bridge lines and the chips and re-render an
-        open manager dialog. Routing needs no nudge -- it filters at read time
+        open manager dialog. Routing needs no push -- it filters at read time
         and the route cache keys on the connection list. Tk thread only."""
         self._push_bridges_to_map()
         self._push_infra_to_map()
