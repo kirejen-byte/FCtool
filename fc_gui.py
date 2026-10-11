@@ -145,8 +145,6 @@ import pill_canvas
 # Discord ping ("Copy ping", MOTD builder): PingWiringMixin, a base of FCToolGUI.
 import ping_wiring
 import system_coords
-# Ansiblex gates are usable by the owning alliance only: the rule, the book of
-# owner alliances and its resolver. fc_gui holds the facade as _gate_access.
 import gate_access
 from markup_editor import MarkupEditor
 from eveo_tracker import find_thumbs, preview_running, reset_process_cache
