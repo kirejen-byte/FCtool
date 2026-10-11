@@ -193,6 +193,16 @@ class InfraManagerDialog(tk.Toplevel):
         self._build_body()         # row 1 (region panel + tree)
         self._build_statusbar()    # row 2
 
+        # A Treeview CLIPS columns that do not fit, so the last one ("Status")
+        # sat off-screen at 980 px. Ask the content how wide it wants to be.
+        try:
+            self.update_idletasks()
+            needed = int(self.winfo_reqwidth())
+            cap = int(self.winfo_screenwidth()) - 40
+            self.geometry("%dx560" % min(cap, max(980, needed)))
+        except Exception:
+            pass
+
         # Over the tool that opened it. ``geometry("980x560")`` above asks for a
         # SIZE and no position, so without this Windows cascades the window --
         # on a multi-monitor layout, into a corner nowhere near the app.
