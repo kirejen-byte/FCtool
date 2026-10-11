@@ -386,8 +386,15 @@ class StandingsCache:
         # writes version 2. A character with no alliance is a legitimate v2
         # state, not a degraded one: own_alliance_id stays None, own_ids is
         # just the corp.
-        self.own_corp_id = int(own_corp_id)
+        #
+        # ORDER MATTERS: the alliance is published BEFORE the corporation.
+        # own_identity_known keys on own_corp_id, and gate_access.own_alliance_of
+        # reads it from other threads (the routing chokes) while this runs on the
+        # refresh thread. Corp-first would open a window where the identity reads
+        # "known" with the alliance still None -- "known: in no alliance" -- and
+        # every Ansiblex with a resolved owner would drop out of one route.
         self.own_alliance_id = int(own_alliance_id) if own_alliance_id else None
+        self.own_corp_id = int(own_corp_id)
         self.fetched_at = datetime.now(timezone.utc)
         self.source_character_id = own_char_id
         self.save()
