@@ -53,8 +53,13 @@ log = logging.getLogger(__name__)
 NO_ALLIANCE = 0                  # a corporation that is in no alliance
 BOOK_VERSION = 1
 REFRESH_AFTER_S = 24 * 3600      # a record older than this is due a re-fetch
-RETRY_FAILED_AFTER_S = 600       # a failed owner is left alone this long
 NUDGE_EVERY_S = 600              # routing queues at most one census this often
+# A failed owner is left alone this long, so a dead corporation cannot cost a
+# fetch per kick. HALF a nudge period on purpose: this memory starts when a pass
+# ENDS and the nudge clock when one STARTS, so a memory as long as the period
+# made the next nudge land just inside it and a failed owner was retried only
+# on every second nudge.
+RETRY_FAILED_AFTER_S = 300
 
 _EMPTY = MappingProxyType({})
 
@@ -417,14 +422,16 @@ class AllianceResolver:
 
     One pass at a time. A thread that fails to start resets the in-flight flag
     (a stranded flag would wedge the resolver for the session). An owner whose
-    fetch failed is left alone for :data:`RETRY_FAILED_AFTER_S` -- memory for
-    this session only -- so a dead corporation cannot cost a fetch per kick.
+    fetch failed is left alone for :data:`RETRY_FAILED_AFTER_S`, counted from
+    the END of the pass that failed -- memory for this session only -- so a
+    dead corporation cannot cost a fetch per kick. Any kick after that retries
+    it; nothing here retries by itself.
 
     A kick REFUSED because a pass was running is remembered: when that pass
     has been applied and the flag is down, ``follow_up()`` runs ONCE (the
     facade's census), so an owner that arrived mid-pass still gets fetched. It
     ends by itself -- the census finds the answers recorded and the failures
-    inside their ten minutes, and starts nothing.
+    still inside their memory, and starts nothing.
     """
 
     def __init__(self, get_fn, post_ui, on_results, *, follow_up=None,
@@ -518,6 +525,7 @@ class AllianceResolver:
         read), re-pushes nothing, and may start the next pass because the flag
         is already down.
         """
+        refused = False
         try:
             now = self._clock()
             memory = {owner: at for owner, at in self._failed_at.items()
@@ -532,9 +540,14 @@ class AllianceResolver:
             log.warning("gate access: applying the results failed",
                         exc_info=True)
         finally:
-            self._in_flight = False
-        # _refused is reset by the next pass's start, so it is only read here.
-        if self._refused and self._follow_up is not None:
+            # Lowered and read under the lock kick() raises them under, so a
+            # kick lands wholly before (refused, and followed up below) or
+            # wholly after (it starts its own pass and clears the mark).
+            # _refused is reset by the next pass's start, so it is only read.
+            with self._lock:
+                self._in_flight = False
+                refused = self._refused
+        if refused and self._follow_up is not None:
             try:
                 self._follow_up()
             except Exception:
@@ -637,9 +650,15 @@ class GateAccess:
         (ESI down at start), the map is never opened, no scan runs -- and for
         the 24-hour refresh in a session that long. The routing choke calls
         this on WORKER threads, so it only queues: no Tk, no thread, no store
-        read here. The fast path is one clock read and one compare. A failed
-        owner is retried by the first nudge that lands after its ten minutes,
-        so within two nudge periods of routing activity.
+        read here. The fast path is one clock read and one compare.
+
+        A failed owner is retried by the NEXT nudge, so within about one nudge
+        period of routing activity: its memory (:data:`RETRY_FAILED_AFTER_S`,
+        counted from the end of the failed pass) is over by then. Only a pass
+        that itself ran longer than ``NUDGE_EVERY_S - RETRY_FAILED_AFTER_S``
+        pushes the retry to the nudge after. A nudge is a route lookup, not a
+        timer: with no route lookup and no other kick (a map push, a scan, a
+        standings refresh) nothing retries.
 
         Safe from any thread and never raises. Two threads racing past the
         compare can both queue; a kick is census-guarded, so that is harmless.
