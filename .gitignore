@@ -32,6 +32,10 @@ fit_types_cache.json
 # owner's REAL alliance/corp ID -> ticker data resolved from ESI; must never be
 # committable (it is user data, not source).
 owner_tickers.json
+# Ansiblex owner -> alliance book (gate_access.py): which corporation is in
+# which alliance, resolved from ESI for the gates in the user's own store.
+# User data, never source.
+gate_owner_alliances.json
 # Group configuration (group_state.py / palette.py): the active palette, the
 # import history + attention flags, the staged-import protocol files, the
 # pre-import backups and exported group files. All user data, never source.
