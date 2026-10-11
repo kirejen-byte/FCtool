@@ -105,8 +105,9 @@ class StandingsCache:
             return
         self.friendly_ids = set(data.get("friendly_ids") or [])
         self.hostile_ids = set(data.get("hostile_ids") or [])
-        self.own_corp_id = _coerce_id(data.get("own_corp_id"))
+        # Alliance BEFORE corporation -- see the ORDER MATTERS note in refresh().
         self.own_alliance_id = _coerce_id(data.get("own_alliance_id"))
+        self.own_corp_id = _coerce_id(data.get("own_corp_id"))
         # A v1 file carries no "version" key at all. Anything unparseable is
         # treated as v1 too -- the conservative answer, since v1 only means
         # "refresh me" (is_stale), never data loss.
