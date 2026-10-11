@@ -420,6 +420,89 @@ def _begin_hidden(win):
     return _restore_withdrawn
 
 
+def begin_hidden(win):
+    """Public name of ``_begin_hidden``: hide ``win`` before the caller's own
+    measurement, and get back the ``restore()`` that reveals it (or None when
+    nothing was hidden). Never raises.
+
+    For a dialog that has to MEASURE itself before it can be placed -- one that
+    sizes itself to its content. Its ``update_idletasks()`` is exactly the call
+    that maps a fresh Toplevel at the window manager's position, so letting
+    ``center_over`` do the hiding would be one step too late: the window is on
+    screen by then, and ``center_over`` only moves an already-mapped window.
+    The order is the one ``_center_when_built`` uses::
+
+        restore = begin_hidden(win)
+        try:
+            ...measure, set the size...
+            center_over(win, parent, hide=restore is None)   # LAST placement
+        finally:
+            if restore is not None:
+                restore()
+
+    ``hide=restore is None`` because this hide owns the reveal; the
+    ``finally`` because a dialog that could not be measured must still be
+    shown.
+    """
+    return _begin_hidden(win)
+
+
+def _anchor_point(win, prect):
+    """The point whose monitor a dialog over ``prect`` belongs to: the parent
+    rect's centre, or -- with no usable parent rect (withdrawn / iconified /
+    never laid out) -- the POINTER, the display the user is looking at. None
+    when neither can be read."""
+    if prect is not None:
+        px, py, pw, ph = prect
+        return (px + pw // 2, py + ph // 2)
+    try:
+        return (int(win.winfo_pointerx()), int(win.winfo_pointery()))
+    except Exception:
+        return None
+
+
+def _monitor_bounds(cx, cy, monitor_rect_fn):
+    """Work-area EDGES of the monitor containing ``(cx, cy)``: the caller's own
+    source first, then the ``monitor_pin`` backend. None when neither answers."""
+    bounds = None
+    if monitor_rect_fn is not None:
+        try:
+            bounds = monitor_rect_fn(cx, cy)
+        except Exception:
+            bounds = None
+    if not bounds:
+        bounds = _monitor_work_rect(cx, cy)
+    return bounds or None
+
+
+def parent_work_area(win, parent, *, monitor_rect_fn=None):
+    """Work-area EDGES ``(l, t, r, b)`` of the monitor ``center_over(win,
+    parent)`` will place ``win`` on, or None. Never raises.
+
+    For a dialog that sizes itself: the room it has is the monitor its PARENT
+    is on, not ``winfo_screenwidth()``, which is the PRIMARY monitor only -- too
+    wide for a parent on a narrow portrait secondary, too narrow for a parent
+    on a wide one beside a small primary. Resolved with ``center_over``'s own
+    parts (parent rect, anchor point, monitor source), so the size limit and
+    the placement always mean the same monitor.
+
+    None when no monitor can be named. Deliberately NOT the virtual-desktop
+    fallback ``center_over`` accepts for a POSITION: the span of every monitor
+    is no size limit, and the caller's own fallback is the better answer.
+    """
+    try:
+        anchor = _anchor_point(win, _parent_rect(parent))
+        if anchor is None:
+            return None
+        bounds = _monitor_bounds(anchor[0], anchor[1], monitor_rect_fn)
+        if not bounds:
+            return None
+        l, t, r, b = (int(v) for v in bounds)
+        return (l, t, r, b) if r > l and b > t else None
+    except Exception:
+        return None
+
+
 def center_over(win, parent, *, margin=8, size=None, monitor_rect_fn=None,
                 hide=True):
     """Centre ``win`` over ``parent`` and return the applied ``(x, y)``, or None.
@@ -481,25 +564,20 @@ def center_over(win, parent, *, margin=8, size=None, monitor_rect_fn=None,
                 px, py, pw, ph = prect
                 x = px + (pw - dw) // 2
                 y = py + (ph - dh) // 2
-                cx, cy = px + pw // 2, py + ph // 2
             else:
                 # No usable parent rect (withdrawn/iconified, never laid out):
                 # fall back to the monitor the POINTER is on — the display the
-                # user is actually looking at.
-                try:
-                    cx, cy = int(win.winfo_pointerx()), int(win.winfo_pointery())
-                except Exception:
-                    return None
+                # user is actually looking at (``_anchor_point``).
                 x = y = None
+            # The anchor and the monitor source are shared with
+            # ``parent_work_area``, so a dialog that sizes itself to "the
+            # parent's monitor" is sized for the monitor it is placed on.
+            anchor = _anchor_point(win, prect)
+            if anchor is None:
+                return None
+            cx, cy = anchor
 
-            bounds = None
-            if monitor_rect_fn is not None:
-                try:
-                    bounds = monitor_rect_fn(cx, cy)
-                except Exception:
-                    bounds = None
-            if not bounds:
-                bounds = _monitor_work_rect(cx, cy)
+            bounds = _monitor_bounds(cx, cy, monitor_rect_fn)
             if not bounds:
                 bounds = _virtual_bounds(win)
             if not bounds:
