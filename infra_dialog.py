@@ -129,13 +129,22 @@ class InfraManagerDialog(tk.Toplevel):
                      saying "no staging system is configured"). Called on PRESS
                      only, so the host's lookup stays lazy. Appended last /
                      backwards compatible.
+    foreign_fn       optional callable(entry) -> bool: True for an Ansiblex gate
+                     that belongs to ANOTHER alliance (only its owners can use
+                     it, so the host keeps it off the map and out of routing).
+                     The row stays listed -- this is the database editor -- and
+                     its Status cell reads "other alliance" to say why it is not
+                     on the map. fc_gui passes a closure over its gate_access
+                     facade, read at call time; this module imports neither.
+                     None (default) or a raising callable => never foreign.
+                     Keyword-only in practice / backwards compatible.
     """
 
     def __init__(self, parent, store, scanner, regions_catalog, system_names,
                  clipboard_get, import_clipboard, import_manual,
                  on_changed, initial_system_id=None,
                  type_name_fn=None, autocomplete_cls=None, ticker_fn=None,
-                 default_regions_fn=None):
+                 default_regions_fn=None, foreign_fn=None):
         super().__init__(parent)
         self.store = store
         self.scanner = scanner
@@ -152,6 +161,7 @@ class InfraManagerDialog(tk.Toplevel):
         self._ticker_fn = ticker_fn if callable(ticker_fn) else None
         self._default_regions_fn = (default_regions_fn
                                     if callable(default_regions_fn) else None)
+        self._foreign_fn = foreign_fn if callable(foreign_fn) else None
 
         self._sort_col = None
         self._sort_reverse = False
@@ -396,12 +406,23 @@ class InfraManagerDialog(tk.Toplevel):
         return f"{name} [{ticker}]" if ticker else name
 
     def _status_label(self, entry):
-        """Status cell text with precedence: dead -> "dead"; elif reinforced ->
-        "reinforced"; else the raw status (alive/…). A reinforced Ansiblex still
+        """Status cell text with precedence: dead -> "dead"; elif another
+        alliance's gate -> "other alliance"; elif reinforced -> "reinforced";
+        else the raw status (alive/...). A reinforced Ansiblex still
         exists in space (its row stays), so "reinforced" is a display distinct
-        from "dead" and from the manual/offline suppression it drives on the map."""
+        from "dead" and from the manual/offline suppression it drives on the map.
+        "other alliance" outranks it because it is the stronger reason the gate
+        is off the map: clearing the reinforced flag would not bring it back.
+        The injected foreign_fn decides; missing or raising => not foreign."""
         if entry.get("status") == "dead":
             return "dead"
+        fn = getattr(self, "_foreign_fn", None)
+        if fn is not None:
+            try:
+                if fn(entry):
+                    return "other alliance"
+            except Exception:
+                pass
         if entry.get("reinforced"):
             return "reinforced"
         return entry.get("status") or "alive"

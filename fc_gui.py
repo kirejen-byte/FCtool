@@ -145,6 +145,9 @@ import pill_canvas
 # Discord ping ("Copy ping", MOTD builder): PingWiringMixin, a base of FCToolGUI.
 import ping_wiring
 import system_coords
+# Ansiblex gates are usable by the owning alliance only: the rule, the book of
+# owner alliances and its resolver. fc_gui holds the facade as _gate_access.
+import gate_access
 from markup_editor import MarkupEditor
 from eveo_tracker import find_thumbs, preview_running, reset_process_cache
 from eveo_overlay import OverlayWindow
@@ -1312,6 +1315,17 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # them. This is the sole worker->UI channel and keeps Tcl single-threaded
         # even under an update()-pumped host. See the tk-thread-safety audit.
         self._ui_q = queue.Queue()
+        # Which stored Ansiblex gates the own alliance can use (gate_access.py).
+        # Built HERE -- after the queue it posts to, before any worker can start
+        # -- because the routing chokes read it off-thread. The lambdas read at
+        # CALL time: the standings cache and the infra store do not exist yet.
+        self._gate_access = gate_access.build(
+            os.path.join(app_dir(), "gate_owner_alliances.json"),
+            own_alliance_fn=lambda: gate_access.own_alliance_of(
+                getattr(self, "_standings_cache", None)),
+            store_fn=lambda: getattr(self, "_infra_store", None),
+            get_fn=self._owner_ticker_esi_get, post_ui=self._post_ui,
+            on_changed=self._gate_access_repush)
         # Identity of the Tk/main thread — captured HERE because __init__ runs on
         # it, which is what makes it trustworthy. A callback that may be invoked
         # either synchronously (in its caller's thread) or later from a worker
@@ -2297,11 +2311,16 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # a 6.17 ms call (perf finding MP2). Read-only here -- nothing below
         # edits a record.
         snapshot = None
+        blocked = set()
         if store is not None:
             try:
                 import infra_overlay
                 import map_overlays as mo
                 snapshot = store.entries_view()
+                # Gates of ANOTHER alliance are not usable: they leave the store
+                # union here, and their id-pairs join the suppression below so a
+                # config twin goes too. Fail-open (see gate_access).
+                usable, blocked = gate_access.of(self).bridge_inputs(snapshot)
                 seen = set()
                 for conn in resolved:
                     parts = conn.split("|")
@@ -2310,7 +2329,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     except (ValueError, IndexError):
                         pass
                 for ida, idb in mo.resolve_bridges(
-                        infra_overlay.corroborated_gate_pairs(snapshot)):
+                        infra_overlay.corroborated_gate_pairs(usable)):
                     key = frozenset((ida, idb))
                     if key not in seen:
                         seen.add(key)
@@ -2326,7 +2345,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # snapshot taken above (same store object -- _ensure_infra_store publishes
         # to self._infra_store) so the store is read ONCE per call, not twice;
         # None snapshot (no store, or the union raised) -> it takes its own.
-        reinforced = _resolve_reinforced_id_pairs(
+        # It gets the UNFILTERED snapshot: a reinforced flag on another
+        # alliance's gate must still suppress that pair's config twin.
+        reinforced = blocked | _resolve_reinforced_id_pairs(
             getattr(self, "_infra_store", None), entries=snapshot)
         if reinforced and resolved:
             kept = []
@@ -9177,11 +9198,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # finding MP2). entries_view() is the shallow read-only accessor;
             # nothing in this method edits a record.
             snapshot = None
+            blocked = set()
             if store is not None:
                 try:
                     import infra_overlay
                     snapshot = store.entries_view()
-                    name_pairs += infra_overlay.corroborated_gate_pairs(snapshot)
+                    # Another alliance's gates leave the union and their id-pairs
+                    # are suppressed below (config twins too) -- see gate_access.
+                    # The kick resolves owners that are due, off this snapshot.
+                    access = gate_access.of(self)
+                    usable, blocked = access.bridge_inputs(snapshot)
+                    name_pairs += infra_overlay.corroborated_gate_pairs(usable)
+                    access.kick(snapshot)
                 except Exception as exc:
                     print(f"[MAP] infra gate-pairs union failed: {exc}")
             resolved = mo.resolve_bridges(name_pairs)
@@ -9191,7 +9219,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # config counterpart, so excluding that id-pair removes the line no
             # matter which source contributed it. Reversible (clear the flag ->
             # the pair returns). Empty set when nothing is flagged -> no-op.
-            reinforced = _resolve_reinforced_id_pairs(store, entries=snapshot)
+            # UNFILTERED snapshot on purpose: a flag on a foreign gate still counts.
+            reinforced = blocked | _resolve_reinforced_id_pairs(
+                store, entries=snapshot)
             if reinforced:
                 resolved = tuple(p for p in resolved
                                  if frozenset(p) not in reinforced)
@@ -9362,7 +9392,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         makes concurrent worker callers build exactly one shared store; the map
         display layer is NOT flipped on (``_infra_filters['enabled']`` untouched).
         Returns the store, or ``None`` on failure (routing then falls back to
-        config-only, i.e. ``None`` -> gate-only routing, never a crash)."""
+        config-only, i.e. ``None`` -> gate-only routing, never a crash).
+
+        The ONE thing the first build leaves behind is a QUEUED request for the
+        Tk thread to resolve the gate owners' alliances (``kick_soon`` only
+        queues; this method may be running on a worker)."""
         store = getattr(self, "_infra_store", None)
         if store is not None:
             return store
@@ -9379,6 +9413,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             except Exception as exc:
                 print(f"[INFRA] store load failed: {exc}")
                 return None
+        gate_access.of(self).kick_soon()     # first build only; never raises
         return store
 
     def _ensure_infra(self):
@@ -9415,6 +9450,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # owner tickers for any ESI-scanned structures the store already holds.
         # One-shot + census-guarded -> a no-op when nothing is unresolved.
         self._maybe_resolve_owner_tickers()
+        gate_access.of(self).kick()          # ...and the gate owners' alliances
         return store, scanner
 
     def _infra_get_infrastructure(self, filters):
@@ -9453,8 +9489,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # "type_counts" map ("Fortizar" -> 3, …) for the map's hover tooltip.
             # It is metadata only -- the map's render-tuple fold ignores it, so the
             # drawn chips are byte-identical with or without it.
+            # Another alliance's Ansiblex is not usable, so it is not a chip
+            # either (gate_access; nothing is hidden while that is unknown).
             badges = infra_overlay.infra_badges(
-                store.entries(), filters, now_iso,
+                gate_access.of(self).usable(store.entries()), filters, now_iso,
                 type_name_fn=infra_parser.type_name)
         except Exception as exc:
             print(f"[INFRA] badge compute failed: {exc}")
@@ -9488,7 +9526,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # by_system_view returns the same list (same order, same "[]" for an
             # unknown/None system) without touching the rest of the store; the
             # records below are only read.
-            entries = store.by_system_view(system_id)
+            # Minus another alliance's gates, so the list matches the chips.
+            entries = gate_access.of(self).usable(
+                store.by_system_view(system_id))
             now_iso = datetime.now(timezone.utc).isoformat(timespec="seconds")
             surviving = infra_overlay.filter_entries(entries, filters, now_iso)
             ticker_cache = getattr(self, "_owner_ticker_cache", None) or {}
@@ -9847,6 +9887,17 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._push_infra_to_map()
         self._push_bridges_to_map()
         self._maybe_resolve_owner_tickers()      # resolve any new owners' tickers
+        gate_access.of(self).kick()              # ...and their alliances
+
+    def _gate_access_repush(self):
+        """gate_access change hook: an owner's alliance was resolved (or the own
+        alliance may have changed), so what counts as another alliance's
+        Ansiblex moved. Redraw the bridge lines and the chips and re-render an
+        open manager dialog. Routing needs no nudge -- it filters at read time
+        and the route cache keys on the connection list. Tk thread only."""
+        self._push_bridges_to_map()
+        self._push_infra_to_map()
+        self._infra_refresh_dialog_rows()
 
     def _infra_scan_on_progress(self, payload):
         """InfraScanner on_progress host handler. The scanner already marshals
@@ -9888,6 +9939,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._push_bridges_to_map()
         # A scan resolves structures WITH their corp owner_id -> resolve tickers.
         self._maybe_resolve_owner_tickers()
+        gate_access.of(self).kick()              # ...and the owners' alliances
 
     def _infra_clipboard_get(self):
         """Zero-arg clipboard text reader for the manager dialog. Returns "" on an
@@ -9991,6 +10043,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 # up on the next reload (_apply_owner_tickers nudges it).
                 ticker_fn=lambda oid: (
                     getattr(self, "_owner_ticker_cache", None) or {}).get(oid),
+                # Status "other alliance" for an Ansiblex only its owners can
+                # use (it is off the map and out of routing). Read at CALL time
+                # like ticker_fn, so a later resolve shows on the next reload.
+                foreign_fn=lambda entry: gate_access.of(self).is_foreign(entry),
                 # "Default: staging + adjacent" seam. The dialog imports neither
                 # fc_gui nor system_coords (§2 isolation), so the whole scope
                 # decision arrives as one zero-arg closure returning region IDS.
@@ -36526,6 +36582,8 @@ $bmp.Dispose()
                 set(self._standings_cache.friendly_ids))
         self._push_standings_to_battle_ledger()
         self._update_standings_label()
+        # The own alliance may have changed -> which Ansiblexes are usable did.
+        gate_access.of(self).own_changed()
         msg = (
             f"Standings refreshed. {len(self._standings_cache.friendly_ids)} "
             f"friendly, {len(self._standings_cache.hostile_ids)} hostile."
@@ -36574,6 +36632,11 @@ $bmp.Dispose()
                             self._post_ui(self._update_standings_label)
                         except Exception:
                             pass
+                    # Own alliance may have changed: redraw Ansiblexes (Tk thread).
+                    try:
+                        self._post_ui(gate_access.of(self).own_changed)
+                    except Exception:
+                        pass
                     return
                 time.sleep(30)
 
