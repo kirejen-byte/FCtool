@@ -57,8 +57,11 @@ COLUMNS = ("system", "name", "category", "type", "source", "last_seen", "status"
 HEADINGS = {"system": "System", "name": "Name", "category": "Type",
             "type": "Category", "source": "Source", "last_seen": "Last seen",
             "status": "Status"}
+# "status" is sized for its longest label, "other alliance": 71 px at tk scaling
+# 1.333 and 81 px at 1.51 (Segoe UI 9, measured), plus ttk's 4 px cell padding
+# on each side = 89 px, plus 3 px of slack.
 _COL_WIDTH = {"system": 90, "name": 240, "category": 150, "type": 92,
-              "source": 84, "last_seen": 128, "status": 74}
+              "source": 84, "last_seen": 128, "status": 92}
 
 
 def entry_key(entry: dict) -> str:
