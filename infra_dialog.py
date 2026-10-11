@@ -59,11 +59,26 @@ COLUMNS = ("system", "name", "category", "type", "source", "last_seen", "status"
 HEADINGS = {"system": "System", "name": "Name", "category": "Type",
             "type": "Category", "source": "Source", "last_seen": "Last seen",
             "status": "Status"}
-# "status" is sized for its longest label, "other alliance": 71 px at tk scaling
-# 1.333 and 81 px at 1.51 (Segoe UI 9, measured), plus ttk's 4 px cell padding
-# on each side = 89 px, plus 3 px of slack.
+# "status" is a FLOOR, not the width: the column is widened at build time to
+# fit its longest label in the tree's real font (_status_column_width). The
+# text is in points and grows with tk scaling, a column width is pixels:
+# "other alliance" is 71 px at tk scaling 1.333, 81 at 1.51, 90 at 1.667 and
+# 104 at 2.0 (Segoe UI 9, measured), so the 92 px that hold it up to 1.51 cut
+# it above that.
 _COL_WIDTH = {"system": 90, "name": 240, "category": 150, "type": 92,
               "source": 84, "last_seen": 128, "status": 92}
+
+# Every Status text this dialog composes, in ONE place: _status_label writes
+# them and _status_column_width measures them, so the column cannot be sized
+# for a label the cell no longer shows. (A raw store status passes through
+# _status_label as well; the store knows "alive" and "dead".)
+STATUS_DEAD = "dead"
+STATUS_FOREIGN = "other alliance"
+STATUS_REINFORCED = "reinforced"
+STATUS_ALIVE = "alive"
+STATUS_LABELS = (STATUS_DEAD, STATUS_FOREIGN, STATUS_REINFORCED, STATUS_ALIVE)
+# ttk draws a cell's text 4 px in from each side of its column; 3 px of slack.
+_STATUS_CELL_PAD = 4 + 4 + 3
 
 # The dialog opens 560 px high and at least 980 px wide, wider when its content
 # asks -- but never wider than the monitor it opens on, less this margin.
@@ -359,10 +374,11 @@ class InfraManagerDialog(tk.Toplevel):
 
         self._tree = ttk.Treeview(wrap, columns=COLUMNS, show="headings",
                                   selectmode="extended")
+        widths = dict(_COL_WIDTH, status=self._status_column_width())
         for col in COLUMNS:
             self._tree.heading(col, text=HEADINGS[col],
                                command=lambda c=col: self._sort_by(c))
-            self._tree.column(col, width=_COL_WIDTH[col], anchor="w",
+            self._tree.column(col, width=widths[col], anchor="w",
                               stretch=(col == "name"))
         vsb = ttk.Scrollbar(wrap, orient=tk.VERTICAL, command=self._tree.yview)
         self._tree.configure(yscrollcommand=vsb.set)
@@ -374,6 +390,26 @@ class InfraManagerDialog(tk.Toplevel):
         self._tree.tag_configure("manual", foreground=FG_ACCENT)
         self._tree.bind("<Double-Button-1>", lambda _e: self._on_edit_selected())
         self._tree.bind("<Button-3>", self._on_tree_right_click)
+
+    def _status_column_width(self):
+        """Pixels the Status column needs for its longest label
+        (:data:`STATUS_LABELS`) in the tree's own font, never under the
+        ``_COL_WIDTH`` floor. Measured per build -- the font is in points, so
+        the answer follows tk scaling -- with Tk's ``font measure``, which
+        needs no font object. A font that cannot be read or measured costs
+        only the widening: the floor is returned."""
+        floor = _COL_WIDTH["status"]
+        try:
+            tree = self._tree
+            font = (ttk.Style(tree).lookup(
+                str(tree.cget("style") or "Treeview"), "font")
+                or "TkDefaultFont")
+            text = max(int(self.tk.call("font", "measure", font,
+                                        "-displayof", tree, label))
+                       for label in STATUS_LABELS)
+            return max(floor, text + _STATUS_CELL_PAD)
+        except Exception:
+            return floor
 
     # ── row 2: status bar ────────────────────────────────────────────────────
     def _build_statusbar(self):
@@ -462,17 +498,17 @@ class InfraManagerDialog(tk.Toplevel):
         is off the map: clearing the reinforced flag would not bring it back.
         The injected foreign_fn decides; missing or raising => not foreign."""
         if entry.get("status") == "dead":
-            return "dead"
+            return STATUS_DEAD
         fn = getattr(self, "_foreign_fn", None)
         if fn is not None:
             try:
                 if fn(entry):
-                    return "other alliance"
+                    return STATUS_FOREIGN
             except Exception:
                 pass
         if entry.get("reinforced"):
-            return "reinforced"
-        return entry.get("status") or "alive"
+            return STATUS_REINFORCED
+        return entry.get("status") or STATUS_ALIVE
 
     def _row_values(self, entry):
         # "category" slot → SPECIFIC type (header "Type"); "type" slot → coarse
