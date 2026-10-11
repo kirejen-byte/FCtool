@@ -71,7 +71,9 @@ _COL_WIDTH = {"system": 90, "name": 240, "category": 150, "type": 92,
 # Every Status text this dialog composes, in ONE place: _status_label writes
 # them and _status_column_width measures them, so the column cannot be sized
 # for a label the cell no longer shows. (A raw store status passes through
-# _status_label as well; the store knows "alive" and "dead".)
+# _status_label unchanged -- "alive", "dead", and the scanner's "unresolved" --
+# and is NOT in STATUS_LABELS. The column is sized for STATUS_LABELS, whose
+# longest entry is longer than any raw status the store writes today.)
 STATUS_DEAD = "dead"
 STATUS_FOREIGN = "other alliance"
 STATUS_REINFORCED = "reinforced"
@@ -262,7 +264,7 @@ class InfraManagerDialog(tk.Toplevel):
                 min(room - _MONITOR_MARGIN, max(_OPEN_WIDTH, needed)),
                 _OPEN_HEIGHT))
         except Exception:
-            pass
+            log.debug("infra dialog: could not fit the width", exc_info=True)
 
     # ── row 0: toolbar ───────────────────────────────────────────────────────
     def _build_toolbar(self):
