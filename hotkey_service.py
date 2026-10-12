@@ -12,6 +12,30 @@ Verified facts this design rests on (do not "simplify" them away):
   UNREGISTERING releases the key, so an "only while EVE is focused" gate has to
   be dynamic registration — see suspend() below.
 - ERROR_HOTKEY_ALREADY_REGISTERED == 1409 → surfaced per-binding via .failures.
+- RegisterHotKey swallows only the key-DOWN. The key-UP is delivered to
+  whatever window is in front by then, which after a focus swap is the client
+  that was just brought forward. MEASURED 2026-10-12 with logging probe
+  windows (F24 cycle hotkey): 15 of 15 swaps delivered a stray WM_KEYUP to the
+  new client, and EVE-X-Preview (AutoHotkey hook) delivered 0. EVE treats
+  that stray key-up as the end of the held key, so "hold D, swap, click the
+  gate" broke on every client after the first. The worker therefore also runs
+  a low-level keyboard filter (_KeyFilter below) that swallows the WHOLE
+  press (down, repeats and up) of a registered binding and emits the hotkey
+  itself. Only the hotkey's own key is affected. A held D (or anything else)
+  is never touched, and nothing is injected, so the compliance envelope
+  is unchanged.
+- Swallowing ONLY the key-up is wrong, and was measured to be wrong: the down
+  has already set the async key state, so the key reads as held forever after
+  (GetAsyncKeyState), and with MOD_NOREPEAT the NEXT press counts as a repeat
+  and never fires WM_HOTKEY, so every other swap would fail. The filter
+  swallows the down too, so the key state never changes at all.
+- RegisterHotKey stays registered underneath the filter. It still owns the
+  combination (so 1409 conflicts are reported exactly as before) and it is the
+  fallback: if the filter is not installed (Wine, or the install failed) or
+  Windows silently removes it (LowLevelHooksTimeout), the key-down simply
+  reaches RegisterHotKey again and hotkeys keep working with the old
+  key-up leak. A press is never double-fired, because a down the filter
+  swallowed never reaches the hotkey machinery.
 """
 from __future__ import annotations
 
@@ -233,10 +257,100 @@ def capture_hint(keysym: str, state: int = 0, keycode: "int | None" = None) -> s
     return f"'{keysym}' is not a usable hotkey — try again."
 
 
+# The modifier bits RegisterHotKey compares EXACTLY (MOD_NOREPEAT is a flag,
+# not a modifier, and is masked off before comparing).
+_MOD_MASK = MOD_ALT | MOD_CONTROL | MOD_SHIFT | MOD_WIN
+
+
+class _KeyFilter:
+    """Swallows the whole press of a registered binding and emits it itself.
+
+    Pure: no ctypes, no threads. The backend's low-level keyboard hook calls
+    on_key(vk, is_up) for every key event, and a True return means "swallow
+    this event". `modifiers` is a zero-arg callable returning the MOD_* bits
+    held right now (Ctrl/Alt/Shift/Win). At a key-down, the hook sees the
+    modifiers that are already down, which is the same state RegisterHotKey
+    would compare. `emit(hk_id)` is called once per press.
+
+    Mirrors RegisterHotKey's matching so the two can never disagree about
+    which press is a hotkey: same vk, exactly the same modifier set (an
+    extra held Win or Shift means NO match, as in RegisterHotKey), and
+    MOD_NOREPEAT semantics (auto-repeat downs are swallowed without
+    re-emitting). A press that does not match passes through completely,
+    down and up, so a binding of bare F24 leaves Ctrl+F24 alone.
+
+    The press is tracked by vk from its down to its up, so releasing a
+    modifier first (Ctrl down, F1 down, Ctrl up, F1 up) still swallows the
+    F1 up. Only the bound key itself is swallowed: the modifiers' own downs
+    and ups pass through exactly as they did under RegisterHotKey alone.
+    """
+
+    def __init__(self, bindings, emit, modifiers):
+        # vk -> [(mods & _MOD_MASK, hk_id), ...]; several bindings may share a vk.
+        self._by_vk: dict[int, list[tuple[int, int]]] = {}
+        for hk_id, (mods, vk) in bindings.items():
+            self._by_vk.setdefault(vk, []).append((mods & _MOD_MASK, hk_id))
+        self._emit = emit
+        self._modifiers = modifiers
+        self._held: set[int] = set()       # vks whose current press we own
+
+    def on_key(self, vk: int, is_up: bool) -> bool:
+        if is_up:
+            if vk in self._held:
+                self._held.discard(vk)
+                return True
+            return False
+        if vk in self._held:               # auto-repeat of a press we own
+            return True
+        candidates = self._by_vk.get(vk)
+        if not candidates:
+            return False
+        held_mods = self._modifiers() & _MOD_MASK
+        for mods, hk_id in candidates:
+            if mods == held_mods:
+                self._held.add(vk)
+                self._emit(hk_id)
+                return True
+        return False
+
+
+class _KBDLLHOOKSTRUCT(ctypes.Structure):  # pragma: no cover — live only
+    _fields_ = [("vkCode", wintypes.DWORD), ("scanCode", wintypes.DWORD),
+                ("flags", wintypes.DWORD), ("time", wintypes.DWORD),
+                ("dwExtraInfo", ctypes.c_size_t)]
+
+
+_WH_KEYBOARD_LL = 13
+_WM_KEYUP, _WM_SYSKEYUP = 0x0101, 0x0105
+# WINFUNCTYPE exists only on Windows builds of Python; the fallback keeps the
+# module importable elsewhere (the hook itself is never installed there).
+_HOOKPROC = getattr(ctypes, "WINFUNCTYPE", ctypes.CFUNCTYPE)(
+    ctypes.c_ssize_t, ctypes.c_int, wintypes.WPARAM, wintypes.LPARAM)
+# GetAsyncKeyState probes for _RealBackend.modifier_state. The generic
+# VK_CONTROL/VK_MENU/VK_SHIFT cover both left and right keys; Win has no
+# generic code, so both sides are checked.
+_MOD_PROBES = ((0x11, MOD_CONTROL), (0x12, MOD_ALT), (0x10, MOD_SHIFT),
+               (0x5B, MOD_WIN), (0x5C, MOD_WIN))
+
+
 class _RealBackend:  # pragma: no cover — exercised by spike S2 + live
     def __init__(self):
         self._u = ctypes.WinDLL("user32", use_last_error=True)
         self._k = ctypes.WinDLL("kernel32")
+        self._u.SetWindowsHookExW.argtypes = [ctypes.c_int, _HOOKPROC,
+                                              wintypes.HINSTANCE, wintypes.DWORD]
+        self._u.SetWindowsHookExW.restype = wintypes.HHOOK
+        self._u.CallNextHookEx.argtypes = [wintypes.HHOOK, ctypes.c_int,
+                                           wintypes.WPARAM, wintypes.LPARAM]
+        self._u.CallNextHookEx.restype = ctypes.c_ssize_t
+        self._u.UnhookWindowsHookEx.argtypes = [wintypes.HHOOK]
+        self._u.GetAsyncKeyState.argtypes = [ctypes.c_int]
+        self._u.GetAsyncKeyState.restype = ctypes.c_short
+        # restype is load-bearing: an undeclared HMODULE is truncated to 32
+        # bits on Win64 and SetWindowsHookExW then fails.
+        self._k.GetModuleHandleW.argtypes = [wintypes.LPCWSTR]
+        self._k.GetModuleHandleW.restype = wintypes.HMODULE
+        self._hook_proc = None             # keeps the ctypes callback alive
         self._u.RegisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int,
                                            wintypes.UINT, wintypes.UINT]
         self._u.RegisterHotKey.restype = wintypes.BOOL
@@ -265,6 +379,60 @@ class _RealBackend:  # pragma: no cover — exercised by spike S2 + live
 
     def post_quit(self, thread_id):
         self._u.PostThreadMessageW(thread_id, WM_QUIT, 0, 0)
+
+    def modifier_state(self):
+        mods = 0
+        for vk, bit in _MOD_PROBES:
+            if self._u.GetAsyncKeyState(vk) & 0x8000:
+                mods |= bit
+        return mods
+
+    def install_key_filter(self, on_key):
+        """Install a WH_KEYBOARD_LL hook that routes key events through
+        on_key(vk, is_up) -> swallow?. It must be called ON the worker thread:
+        a low-level hook's callbacks are dispatched through the installing
+        thread's GetMessage loop, which the worker already runs.
+
+        Returns a handle, or None when no hook is installed. Under Wine the
+        hook is skipped on purpose: RegisterHotKey alone keeps working there,
+        and this fix was only measured on Windows.
+
+        The callback is kept minimal because Windows silently drops a hook
+        that keeps answering too slowly (LowLevelHooksTimeout). If that
+        happens, RegisterHotKey underneath takes over again (module
+        docstring). It never raises into Windows: any error passes the
+        event on untouched."""
+        try:
+            import wine_detect
+            if wine_detect.is_wine():
+                return None
+        except Exception:
+            pass
+        u = self._u
+
+        def proc(code, wparam, lparam):
+            try:
+                if code == 0:          # HC_ACTION
+                    kb = ctypes.cast(
+                        lparam, ctypes.POINTER(_KBDLLHOOKSTRUCT)).contents
+                    if on_key(int(kb.vkCode),
+                              wparam in (_WM_KEYUP, _WM_SYSKEYUP)):
+                        return 1
+            except Exception:
+                pass
+            return u.CallNextHookEx(None, code, wparam, lparam)
+
+        self._hook_proc = _HOOKPROC(proc)
+        handle = u.SetWindowsHookExW(_WH_KEYBOARD_LL, self._hook_proc,
+                                     self._k.GetModuleHandleW(None), 0)
+        if not handle:
+            self._hook_proc = None
+            return None
+        return handle
+
+    def remove_key_filter(self, handle):
+        self._u.UnhookWindowsHookEx(handle)
+        self._hook_proc = None
 
 
 class HotkeyService:
@@ -359,6 +527,19 @@ class HotkeyService:
                 registered.append(hk_id)
             else:
                 self.failures[hk_id] = be.last_error()
+        # Filter only the bindings RegisterHotKey actually granted: a
+        # combination another application owns (1409) is left to its owner,
+        # exactly as before. getattr keeps backends without a filter (test
+        # fakes, older stand-ins) on the plain RegisterHotKey path.
+        filt_handle = None
+        install = getattr(be, "install_key_filter", None)
+        if install is not None and registered:
+            filt = _KeyFilter({h: bindings[h] for h in registered},
+                              self.events.put, be.modifier_state)
+            try:
+                filt_handle = install(filt.on_key)
+            except Exception:
+                filt_handle = None
         self._ready.set()
         try:
             while True:
@@ -368,5 +549,7 @@ class HotkeyService:
                 if msg == WM_HOTKEY:
                     self.events.put(int(wparam))
         finally:
+            if filt_handle is not None:
+                be.remove_key_filter(filt_handle)
             for hk_id in registered:
                 be.unregister(hk_id)
