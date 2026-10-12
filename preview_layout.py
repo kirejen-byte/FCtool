@@ -103,7 +103,8 @@ def full_h(body_h, strip_h):
     wrong (see preview_tile.strip_h_for — the strip is NOT always STRIP_H).
 
     SCOPE, precisely: this pair owns the spinbox-display ↔ stored-`tile_body_h`
-    crossing, and Arrange in grid also calls `full_h` to size its rows. It is NOT the project's only STRIP_H arithmetic
+    crossing, and Arrange also calls `full_h` to size its rows. It is NOT the
+    project's only STRIP_H arithmetic
     and was never meant to be — the tile GEOMETRY paths (preview_tile's own
     strip/thumb layout) and the FC HUD rect seam in fc_gui each do their own,
     legitimately, against live widget state this pure module cannot see. The
@@ -504,6 +505,30 @@ def grid_arrange(count, tile_w, tile_h, bounds, origin=(10, 10), gap=8):
         row, col = divmod(i, per_row)
         out.append((ox + col * (tile_w + gap), oy + row * (tile_h + gap),
                     tile_w, tile_h))
+    return out
+
+
+def flow_arrange(sizes, bounds, origin=(10, 10), gap=8):
+    """Lay out tiles of differing sizes left to right, wrapping into rows.
+
+    `sizes` is a list of (w, h) in order, h being the tile's FULL window height;
+    only the width of `bounds` (bx, by, bw, bh) is used, as in grid_arrange.
+    A tile joins the current row when its right edge plus `gap` is within `bw`;
+    the first tile of a row is always placed, so every row advances. A new row
+    starts `gap` below the tallest tile of the finished one. Returns (x, y, w, h)
+    in input order. With every size equal this is exactly grid_arrange.
+    """
+    bw = bounds[2]
+    ox, oy = origin
+    out = []
+    x, y, row_h = ox, oy, 0
+    for w, h in sizes:
+        if x > ox and x + w + gap > bw:
+            y += row_h + gap
+            x, row_h = ox, 0
+        out.append((x, y, w, h))
+        x += w + gap
+        row_h = max(row_h, h)
     return out
 
 
