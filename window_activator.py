@@ -63,10 +63,10 @@ So under Wine the real mechanism is an X11 ``_NET_ACTIVE_WINDOW`` (source=2,
 deny rule (this is EVE Preview Manager's mechanism). That callable is INJECTED
 via ``set_wine_activator`` (this module never imports the helper), the dead
 ``SwitchToThisWindow`` rung is skipped, and an unconfirmable switch returns the
-truthy sentinel ``ISSUED`` rather than False. When that callable succeeds, SetForegroundWindow
-is skipped too (``skip(x11)``): a second activation racing the EWMH one only
-buys a wineserver denial round trip -- ~100 ms of click-to-front lag in the
-field. Off Wine NOTHING here changes.
+truthy sentinel ``ISSUED`` rather than False. When that callable succeeds,
+SetForegroundWindow is skipped too (``skip(x11)``): a second activation racing
+the EWMH one only buys a wineserver denial round trip -- ~100 ms of
+click-to-front lag in the field. Off Wine NOTHING here changes.
 
 The Wine ladder is also the only path that measures itself, and round 6 adds
 the segment nobody could see. The field numbers were: the app-side ladder
