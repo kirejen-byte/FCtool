@@ -613,3 +613,58 @@ def resolve_cycle_members(members, live_identities, char_for_account):
         elif m in live_identities:
             resolved.append(m)
     return resolved
+
+
+def resolve_active_hwnd(cur, fg_active, anchor_hwnd, last_key, *,
+                        fg_raw=None, switch=None, now=0.0, cap=0.0):
+    """Which live client window counts as ACTIVE (highlight border + resting
+    opacity) this tick. Returns ``(hwnd_or_None, switch_record_to_keep)``.
+
+    `cur` is ``{hwnd: client}`` for the live clients. The shipped order is
+    unchanged: `fg_active` (the polled foreground, when it is a tracked client)
+    -> `anchor_hwnd` (the last window activated through us, login included)
+    while it is still live -> the window whose ``client.key == last_key``.
+
+    `switch` is the fresh-switch record ``(target_hwnd, fg_before, ts)`` left by
+    the last switch made through us, or None. It outranks that chain while ALL
+    of: it is at most `cap` seconds old (`now` and `ts` are monotonic); its
+    target is still live; and the raw foreground `fg_raw` still reads EXACTLY
+    what it read just before the switch. The foreground is not a reliable
+    answer right after we asked for a switch (Windows applies it late, or
+    refuses it), and a tick landing in that window used to paint the highlight
+    back onto the client we had just left.
+
+    The record is dropped (second return value None) the moment the foreground
+    reads anything else - our switch landing, or the user going somewhere of
+    their own accord - and when it expires, its target is gone, or it is
+    malformed. An UNKNOWN foreground (`fg_raw` None: no backend, a failed
+    probe, or the NULL Windows reports mid-transition) is never "unchanged":
+    the record is not applied on that tick, but it is kept, because the next
+    reading may be the stale one again.
+
+    Accepted limits, both bounded by `cap`: a refused switch that never lands
+    shows the highlight on the requested tile until the record expires, then
+    it returns to the real foreground; and "unchanged" cannot tell that apart
+    from a switch that landed and was undone by hand before any tick saw it.
+    Pure - no Tk, no ctypes."""
+    if switch is not None:
+        try:
+            target, fg_before, ts = switch
+            fresh = (now - ts) <= cap
+        except (TypeError, ValueError):
+            fresh = False
+        if not fresh or target not in cur:
+            switch = None
+        elif fg_raw is not None:
+            if fg_raw == fg_before:
+                return target, switch           # still in flight - trust it
+            switch = None                       # landed, or the user moved on
+    if fg_active is not None and fg_active in cur:
+        return fg_active, switch
+    if anchor_hwnd is not None and anchor_hwnd in cur:
+        return anchor_hwnd, switch
+    if last_key:
+        for hwnd, client in cur.items():
+            if client.key == last_key:
+                return hwnd, switch
+    return None, switch
