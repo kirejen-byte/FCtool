@@ -23646,17 +23646,24 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # fallback exactly. getattr-guarded for the bare synthetic hosts.
             # Issue 13: a FRESH switch through _preview_switch_to outranks all
             # three while the raw foreground still reads what it read just
-            # before it (a tick landing there used to paint the highlight back
-            # onto the client we had left). The resolver owns the decision and
-            # hands back the record to keep. That record is SEPARATE from
-            # _preview_pending_switch, which the tick must never clear or
-            # consume - it belongs to the cycle anchor.
+            # before it (without that, a tick landing there would paint the
+            # highlight back onto the client we had left). The resolver owns
+            # the decision and hands back the record to keep. That record is
+            # SEPARATE from _preview_pending_switch, which the tick must never
+            # clear or consume - it belongs to the cycle anchor.
             _fresh = getattr(self, "_preview_fresh_switch", None)
+            if cfg.get("hide_active", False):
+                # hide_active withdraws the active client's tile, so a switch
+                # lights nobody: resolve on the polled foreground alone. The
+                # record is DROPPED (None comes back), not parked - a parked one
+                # would miss the landed / moved-on checks and could be applied
+                # stale if the setting were switched off within the cap.
+                _fresh = None
             active_hwnd, self._preview_fresh_switch = (
                 preview_layout.resolve_active_hwnd(
                     cur, getattr(fg_info, "active_hwnd", None),
                     getattr(self, "_preview_active_hwnd", None),
-                    self._preview_last_key,
+                    getattr(self, "_preview_last_key", ""),
                     fg_raw=getattr(fg_info, "fg_hwnd", None),
                     switch=_fresh,
                     # the clock is read only while a record exists
