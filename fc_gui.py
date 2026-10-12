@@ -27573,9 +27573,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         if not ordered_live:
             return
         cfg = self._preview_cfg()
-        # Arrange always uses the GLOBAL size (not _preview_resolve_size, which
-        # is per-key), so it needs its own floor — otherwise a sub-minimum
-        # global would be stamped into every char's saved layout rect.
+        # What Arrange stores and places is the GLOBAL size (the spacing below
+        # uses each tile's resolved size), so it needs its own floor - otherwise
+        # a sub-minimum global would be stamped into every char's saved layout.
         tile_w, body_h = preview_layout.clamp_size(cfg.get("tile_w", 384),
                                                    cfg.get("tile_body_h", 216))
         # C5: arrange across the full virtual desktop (all monitors), not just
@@ -27589,10 +27589,22 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             bx, by, bw, bh = 0, 0, 1920, 1080
         # Lay out in a bounds-local (0,0,bw,bh) space so per-row math is correct,
         # then shift every rect onto the virtual desktop by the origin (bx, by).
+        # The grid is laid out in FULL window heights (body + caption strip) so
+        # rows do not overlap; only x/y are used - stored/placed size stays body_h.
+        # Tiles FLOW left to right, each taking only its own resolved size (a
+        # per-char override with uniform_size off is re-applied by the next tick
+        # at the tile's x/y); a row is as tall as its tallest tile. With equal
+        # sizes this is the plain grid.
+        sizes = []
+        for client in ordered_live:
+            try:
+                rw, rb = self._preview_resolve_size(cfg, client.key)
+            except Exception:
+                rw, rb = tile_w, body_h
+            sizes.append((rw, preview_layout.full_h(rb, preview_tile.STRIP_H)))
         rects = [(bx + gx, by + gy, gw, gh) for gx, gy, gw, gh
-                 in preview_layout.grid_arrange(
-                     len(ordered_live), tile_w, body_h, (0, 0, bw, bh),
-                     origin=(10, 10), gap=8)]
+                 in preview_layout.flow_arrange(
+                     sizes, (0, 0, bw, bh), origin=(10, 10), gap=8)]
         layouts = cfg.setdefault("layouts", {})
         for client, (x, y, _w, _h) in zip(ordered_live, rects):
             layouts[self._preview_layout_key(client.key)] = [
