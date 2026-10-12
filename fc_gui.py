@@ -27589,10 +27589,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             bx, by, bw, bh = 0, 0, 1920, 1080
         # Lay out in a bounds-local (0,0,bw,bh) space so per-row math is correct,
         # then shift every rect onto the virtual desktop by the origin (bx, by).
+        # The grid is laid out in FULL window heights (body + caption strip) so
+        # rows do not overlap; only x/y are used - stored/placed size stays body_h.
         rects = [(bx + gx, by + gy, gw, gh) for gx, gy, gw, gh
                  in preview_layout.grid_arrange(
-                     len(ordered_live), tile_w, body_h, (0, 0, bw, bh),
-                     origin=(10, 10), gap=8)]
+                     len(ordered_live), tile_w,
+                     preview_layout.full_h(body_h, preview_tile.STRIP_H),
+                     (0, 0, bw, bh), origin=(10, 10), gap=8)]
         layouts = cfg.setdefault("layouts", {})
         for client, (x, y, _w, _h) in zip(ordered_live, rects):
             layouts[self._preview_layout_key(client.key)] = [
