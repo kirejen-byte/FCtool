@@ -1,9 +1,10 @@
 """The ONLY module allowed to change another window's state (spec §4 invariant #1).
 Focus-change ladder verified vs EVE-O (SetForegroundWindow+restore is its entire
 mechanism) + documented SetForegroundWindow rules (caller received last input =
-allowed, which is our click/hotkey situation). ALT-nudge injects an ALT press into
-OUR OWN input queue only — never targeted at any client window. AttachThreadInput
-deliberately omitted (deadlock-prone). One ``activate`` = one focus change, always.
+allowed, which is our click/hotkey situation). The ladder injects NO input of any
+kind: no keystroke and no mouse event is synthesized, into any window or into the
+system input stream. AttachThreadInput deliberately omitted (deadlock-prone). One
+``activate`` = one focus change, always.
 
 ``activate`` is HONEST about the outcome (it used to ``return True`` on every
 path, which made a failed switch invisible, unretried and unlogged while the
@@ -14,14 +15,15 @@ return value is True only when that probe confirms the target (or its GA_ROOT
 top-level) really is the foreground window.
 
 There is deliberately NO wait / poll / sleep / retry loop around that probe. The
-denied-SetForegroundWindow regime (foreground lock -> alt-nudge ->
-SwitchToThisWindow) completes asynchronously, so a verify-WAIT would stall the Tk
-thread for exactly the duration of the case it was meant to diagnose. A switch we
-cannot confirm is a fact to LOG; the caller's next press is the retry.
+denied-SetForegroundWindow regime (foreground lock -> SwitchToThisWindow)
+completes asynchronously, so a verify-WAIT would stall the Tk thread for exactly
+the duration of the case it was meant to diagnose. A switch we cannot confirm is
+a fact to LOG; the caller's next press is the retry.
 
-Compliance envelope (spec §4) is unchanged: focus APIs only, verification is
-strictly read-only (GetForegroundWindow / GetAncestor), and no input is injected
-beyond the pre-existing ALT-nudge into our own queue.
+Compliance envelope (spec §4): focus APIs only, verification is strictly
+read-only (GetForegroundWindow / GetAncestor), and no input is injected. When
+Windows refuses SetForegroundWindow the switch rests on SwitchToThisWindow
+alone, and may not land until the user's next press.
 
 ONE deliberate exception to "focus APIs only" (owner-approved; close-all-clients
 spec §3): ``close_window`` posts ``WM_CLOSE`` to a client's top-level window.
@@ -50,9 +52,7 @@ useless or harmful there (all source-verified against Wine, 2026-09-13):
     ``WM_HOTKEY`` never bumps ``user_time`` -- so after the one-shot per-window
     freebie EVERY hotkey-driven swap is denied, forever (tile clicks still
     work, which is exactly the field report).
-  * ``SwitchToThisWindow`` is a stub, and the ALT nudge is delivered to the EVE
-    client (a spurious ALT that perturbs the next keystroke) while ALSO bumping
-    the target's ``user_time``, making the retry LESS likely to pass.
+  * ``SwitchToThisWindow`` is a stub.
   * ``GetForegroundWindow`` right after a successful activate still returns the
     OLD window (the target's thread writes ``active`` later), so the closing
     probe is always stale and False would be a lie.
@@ -61,9 +61,9 @@ So under Wine the real mechanism is an X11 ``_NET_ACTIVE_WINDOW`` (source=2,
 "pager") + StackMode Above sent by the preview helper on its own X connection
 -- Wine's FocusIn handler then sets the foreground internally, bypassing the
 deny rule (this is EVE Preview Manager's mechanism). That callable is INJECTED
-via ``set_wine_activator`` (this module never imports the helper), the three
-dead rungs are skipped, and an unconfirmable switch returns the truthy sentinel
-``ISSUED`` rather than False. When that callable succeeds, SetForegroundWindow
+via ``set_wine_activator`` (this module never imports the helper), the dead
+``SwitchToThisWindow`` rung is skipped, and an unconfirmable switch returns the
+truthy sentinel ``ISSUED`` rather than False. When that callable succeeds, SetForegroundWindow
 is skipped too (``skip(x11)``): a second activation racing the EWMH one only
 buys a wineserver denial round trip -- ~100 ms of click-to-front lag in the
 field. Off Wine NOTHING here changes.
@@ -93,8 +93,6 @@ log = logging.getLogger(__name__)
 SW_SHOWNOACTIVATE = 4
 SW_MINIMIZE = 6
 SW_RESTORE = 9
-_VK_MENU = 0x12
-_KEYEVENTF_KEYUP = 0x2
 
 # GetAncestor flag: the root top-level window of an hwnd's parent chain. EVE
 # client hwnds reach us from EnumWindows and so are already top-level; resolving
@@ -150,8 +148,6 @@ class _RealUser32:  # pragma: no cover — exercised by spike/live
         u.SetForegroundWindow.restype = wintypes.BOOL
         u.SwitchToThisWindow.argtypes = [wintypes.HWND, wintypes.BOOL]
         u.SwitchToThisWindow.restype = None
-        u.keybd_event.argtypes = [ctypes.c_ubyte, ctypes.c_ubyte,
-                                  wintypes.DWORD, ctypes.POINTER(wintypes.ULONG)]
         u.SetWindowPos.argtypes = [wintypes.HWND, wintypes.HWND, ctypes.c_int,
                                    ctypes.c_int, ctypes.c_int, ctypes.c_int,
                                    wintypes.UINT]
@@ -187,10 +183,6 @@ class _RealUser32:  # pragma: no cover — exercised by spike/live
 
     def set_foreground(self, hwnd):
         return bool(self._u.SetForegroundWindow(hwnd))
-
-    def alt_nudge(self):
-        self._u.keybd_event(_VK_MENU, 0, 0, None)
-        self._u.keybd_event(_VK_MENU, 0, _KEYEVENTF_KEYUP, None)
 
     def switch_to_window(self, hwnd):
         self._u.SwitchToThisWindow(hwnd, True)
@@ -250,15 +242,15 @@ def _real_user32():  # pragma: no cover
 # Escalation ladder, in order. EVERY rung is reported on every call so the
 # failure log has one fixed, greppable shape; a rung the ladder never reached
 # reads "skip", which is itself the diagnostic ("did we even get that far?").
-_RUNGS = ("is_iconic", "restore", "set_foreground", "alt_nudge",
-          "set_foreground_retry", "switch_to_window")
+_RUNGS = ("is_iconic", "restore", "set_foreground", "switch_to_window")
 
 # The Wine ladder reports the SAME rungs (so the log shape never moves) plus
-# the X11 one; the three rungs Wine makes useless read "skip(wine)".
+# the X11 one; the rung Wine makes useless (SwitchToThisWindow is a stub
+# there) reads "skip(wine)".
 _WINE_RUNG = "x11_activate"
 _WINE_RUNGS = ("is_iconic", "restore", _WINE_RUNG, "set_foreground",
-               "alt_nudge", "set_foreground_retry", "switch_to_window")
-_WINE_SKIPPED = ("alt_nudge", "set_foreground_retry", "switch_to_window")
+               "switch_to_window")
+_WINE_SKIPPED = ("switch_to_window",)
 _SKIP_WINE = "skip(wine)"
 # SetForegroundWindow is ALSO skipped when the X11 activator already took the
 # request (round 5): the wineserver's denial of the second, racing activation
@@ -370,9 +362,9 @@ _last_fail_log: dict = {}
 def _run_rung(outcomes, name, fn):
     """Run one ladder rung and record what it did.
 
-    Records ``True``/``False`` for rungs that report status, ``ok`` for the ones
-    that return nothing (alt_nudge, SwitchToThisWindow), and ``ERR(<Type>)`` when
-    the backend raises. A raising rung is reported as a non-success and the
+    Records ``True``/``False`` for rungs that report status, ``ok`` for the one
+    that returns nothing (SwitchToThisWindow), and ``ERR(<Type>)`` when the
+    backend raises. A raising rung is reported as a non-success and the
     ladder escalates past it — a broken backend call must never read as a win.
     """
     try:
@@ -624,21 +616,20 @@ def activate(hwnd: int, win32=None) -> bool:
     per-rung outcomes lands in the log (the field diagnostic for the
     "sometimes ignores a cycle" report).
 
-    The ladder itself is unchanged — this reports it, it does not extend it:
+    The ladder injects no input of any kind:
       0. restore, if the window is minimized
       1. SetForegroundWindow
-      2. ALT-nudge (unlocks the foreground system) + SetForegroundWindow again
-      3. SwitchToThisWindow — alt-tab equivalent, last resort
+      2. SwitchToThisWindow, only when rung 1 did not report success
 
-    Rungs 2-3 are asynchronous/maybe-no-op when Windows holds the foreground
-    lock, which is precisely why the confirmation is a single read rather than a
+    Rung 2 is asynchronous/maybe-no-op when Windows holds the foreground lock,
+    which is precisely why the confirmation is a single read rather than a
     wait: blocking here would stall the Tk thread in the one regime that already
     feels slow. An unconfirmed switch is retried by the next press, never here.
 
     UNDER WINE this delegates to ``_activate_wine`` (see the module docstring):
     a posted restore, the injected X11 activation, ONE SetForegroundWindow, and
-    a truthy ``ISSUED`` instead of an un-confirmable False. Off Wine, every line
-    below runs exactly as it did before that path existed.
+    a truthy ``ISSUED`` instead of an un-confirmable False. Off Wine the lines
+    below are the whole ladder.
     """
     u = win32 or _real_user32()
     if _is_wine():
@@ -648,11 +639,7 @@ def activate(hwnd: int, win32=None) -> bool:
     if _run_rung(outcomes, "is_iconic", lambda: u.is_iconic(hwnd)):
         _run_rung(outcomes, "restore", lambda: u.show_window(hwnd, SW_RESTORE))
     if not _run_rung(outcomes, "set_foreground", lambda: u.set_foreground(hwnd)):
-        _run_rung(outcomes, "alt_nudge", lambda: u.alt_nudge())
-        if not _run_rung(outcomes, "set_foreground_retry",
-                         lambda: u.set_foreground(hwnd)):
-            _run_rung(outcomes, "switch_to_window",
-                      lambda: u.switch_to_window(hwnd))
+        _run_rung(outcomes, "switch_to_window", lambda: u.switch_to_window(hwnd))
 
     confirmed, detail = _confirm_foreground(u, hwnd)
     if not confirmed:
