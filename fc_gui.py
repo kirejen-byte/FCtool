@@ -1658,6 +1658,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # _preview_switch_to (so a tile click always outranks it), the anchor
         # itself once the record is spent, and _preview_teardown.
         self._preview_pending_switch = None
+        # (target_hwnd, foreground_hwnd_before, monotonic_ts) of the last switch
+        # through _preview_switch_to - EVERY path, tile click included. Read
+        # only by the tick's active-highlight resolver
+        # (preview_layout.resolve_active_hwnd), never by the cycle anchor.
+        self._preview_fresh_switch = None
         # Monotonic ts of the last LOGGED fast-drain failure (None = the next one
         # gets a full traceback). Throttles the ~22/s log flood a permanently
         # throwing drain produced; a healthy pass re-arms the full report.
@@ -20362,6 +20367,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
     # denied/slow switch, short enough that a genuinely stuck one resolves back
     # to the shipped foreground-first behaviour within a beat.
     _PREVIEW_PENDING_SWITCH_S = 1.5
+    # "_preview_switch_to was not handed a foreground sample" - distinct from
+    # None, which is a sample that came back unknown.
+    _PREVIEW_FG_NOT_SAMPLED = object()
 
     # ── Stranded-tile respawn ──────────────────────────────────────────────
     # A tile whose DWM attach raised (source window died between enumerate and
@@ -21411,7 +21419,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         for hwnd in list(self._preview_tiles):
             self._preview_retire_tile(hwnd)
 
-    def _preview_switch_to(self, client):
+    def _preview_switch_to(self, client, fg_before=_PREVIEW_FG_NOT_SAMPLED):
         """Foreground `client`, and (C3) minimize the PREVIOUS active client when
         `minimize_inactive` is on and that client isn't exempt. The single
         activation choke-point every switch path routes through (tile click,
@@ -21429,8 +21437,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         outrank it — that made the following cycle press a visible no-op (it
         re-targeted the client the keyboard had picked, ignoring the click).
         The hotkey path re-arms the record AFTER calling this, which is why the
-        order in `_preview_hotkey_switch_to` is load-bearing."""
+        order in `_preview_hotkey_switch_to` is load-bearing.
+
+        Issue 13: the active highlight follows the switch AT ONCE - this arms
+        `_preview_fresh_switch` for the tick's resolver and repaints the active
+        state itself instead of waiting up to a tick. `fg_before` lets a caller
+        that already sampled the foreground (the hotkey path) hand its reading
+        in, so no path reads it twice; None = "sampled, unknown"."""
         self._preview_pending_switch = None
+        if fg_before is FCToolGUI._PREVIEW_FG_NOT_SAMPLED:
+            # One read-only GetForegroundWindow, taken before anything below
+            # (minimize-inactive included) can move the foreground.
+            fg_before = FCToolGUI._preview_probe_foreground(self)
         cfg = self._preview_cfg()
         prev_key = self._preview_last_key
         if (cfg.get("minimize_inactive", False)
@@ -21448,7 +21466,22 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # key; it also means the highlight survives the login->character
         # retitle (same window, same hwnd).
         self._preview_active_hwnd = client.hwnd
+        # The probe may keep naming the client we are leaving for a moment (or
+        # for good, when Windows refuses the switch): the tick's resolver
+        # trusts this record over an UNCHANGED reading. ACCEPTED LIMIT: a
+        # refused switch that never lands shows the highlight on the requested
+        # tile for at most _PREVIEW_PENDING_SWITCH_S, then it returns to the
+        # real foreground. An unknown reading (None / 0) arms nothing.
+        self._preview_fresh_switch = (
+            (client.hwnd, fg_before, time.monotonic()) if fg_before else None)
         window_activator.activate(client.hwnd)
+        # ...and move the highlight NOW rather than on the next tick. Guarded as
+        # a whole: a paint failure must never cost the retop below.
+        try:
+            FCToolGUI._preview_repaint_active(self, cfg, client.hwnd)
+        except Exception:
+            log.debug("[preview] immediate highlight repaint failed",
+                      exc_info=True)
         # BUG A (occlusion): the just-activated EVE client jumps to the top of the
         # z-order. Without an immediate re-assert the tiles vanish behind it for up
         # to one tick (~250 ms). Re-top every tile (and the overlay) ONCE right now
@@ -21482,6 +21515,37 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             relift_topmost_tooltips()
         except Exception:
             pass
+
+    def _preview_repaint_active(self, cfg, active_hwnd):
+        """Issue 13: make `active_hwnd`'s tile the active one RIGHT NOW (resting
+        opacity + border) and take both off whichever tile held them, instead
+        of waiting up to 250 ms for the tick.
+
+        Every SHOWN tile goes through the tick's own two setters - `set_active`
+        and `_preview_paint_border`, the single owner of the border chain - so
+        a live alert border keeps its tile and `highlight_active` off paints
+        nothing, exactly as on a tick. Both are zero-write when unchanged; no
+        window enumeration, disk or ESI. Left to the tick: a tile the hide
+        rules withdrew last tick, a tile whose client is not published, and a
+        tile that raises (retiring is the tick's job). Under `hide_active` the
+        target's tile is about to be withdrawn, so nobody is painted active."""
+        if cfg.get("hide_active", False):
+            active_hwnd = None
+        hidden = getattr(self, "_preview_last_hidden", None) or ()
+        clients = self._preview_clients
+        for hwnd, tile in list(self._preview_tiles.items()):
+            client = clients.get(hwnd)
+            if client is None or hwnd in hidden:
+                continue
+            try:
+                set_active = getattr(tile, "set_active", None)
+                if set_active is not None:
+                    set_active(hwnd == active_hwnd)
+                FCToolGUI._preview_paint_border(
+                    self, tile, hwnd, client, cfg, active_hwnd)
+            except Exception:
+                log.debug("[preview] immediate highlight repaint skipped "
+                          "tile %r", hwnd, exc_info=True)
 
     def _preview_on_tile_activate(self, key, hwnd=None):
         # hwnd-first: login screens (title exactly "EVE") all share key ""
@@ -22185,7 +22249,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         not clobbering the anchor."""
         key = getattr(client, "key", "")
         fg_before = self._preview_probe_foreground()
-        self._preview_switch_to(client)
+        # the sample is handed on so the switch does not read it a second time
+        self._preview_switch_to(client, fg_before=fg_before)
         self._preview_pending_switch = (
             (key, fg_before, time.monotonic()) if key else None)
 
@@ -23364,6 +23429,91 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             info.external_hwnd = fg      # neither an EVE client nor ours → switch target
         return info
 
+    def _preview_paint_border(self, tile, hwnd, client, cfg, active_hwnd):
+        """Decide and paint ONE tile's border. The single owner of the border
+        precedence chain: the tick calls it per shown tile, and
+        `_preview_repaint_active` calls it right after a switch (issue 13), so
+        the two can never disagree about which source wins.
+
+        Border precedence is fixed + deterministic (2026-09-26):
+          PLAYER damage red > DECLOAK yellow > NPC damage orange >
+          intel flash > active highlight > none.
+        A hostile player's hit is the most urgent signal; a decloak is urgent
+        AND short-lived, so it outranks routine NPC damage (ratting orange must
+        never mask a decloak). Each flash expires on its own and falls through
+        to the next source; the steady active-client highlight (P12/C4) is the
+        lowest. `active_hwnd` is the caller's answer to "which window is
+        active" - this method never works that out for itself."""
+        state = (None if client.is_login
+                 else self._preview_state_for(client.key))
+        # C4/P12: highlight the active client's tile (steady frame). HWND
+        # equality, so the character-select/login screen gets the same frame as
+        # a logged-in pilot (owner ask).
+        highlight = (cfg.get("highlight_color", "#00d4ff")
+                     if (cfg.get("highlight_active", True)
+                         and hwnd == active_hwnd)
+                     else None)
+        # Damage flash: the tracker owns the per-class holds and ONE pulse
+        # clock per character -- flash_state() -> (kind, since), kind
+        # "player" | "npc" | None (see damage_flash). While a hold is live the
+        # border PULSES (~2 Hz, pulse_color) stepped by now - since, so
+        # orange -> red keeps the rhythm.
+        now = time.monotonic()
+        key = client.key
+        dmg_kind = dmg_since = None
+        if cfg.get("damage_flash", True) and not client.is_login:
+            dmg_kind, dmg_since = self._preview_damage.flash_state(
+                key, self._preview_layer_hp.get(key), cfg, now)
+        # DECLOAK flash: the window is edge-armed in _preview_on_decloak
+        # (until = now + decloak_flash_secs, pulse start seeded then). Here we
+        # only read the live window, expire it, and - while live - pulse the
+        # border YELLOW (below player red, above NPC orange in the chain below).
+        decloaking = False
+        if cfg.get("decloak_flash", True) and not client.is_login:
+            d_until = self._preview_decloak_until.get(key)
+            if d_until is not None:
+                if now < d_until:
+                    decloaking = True
+                else:
+                    self._preview_decloak_until.pop(key, None)
+                    self._preview_decloak_since.pop(key, None)
+        # Intel flash reach: the poller keeps THIS char's gate-jump ball in
+        # _preview_intel_reach, keyed by the same char key the state lookup
+        # above used; the predicate stays pure by taking it as an argument.
+        # getattr-guarded (the tick's unit hosts are bare SimpleNamespaces) - a
+        # missing ball just means the flash falls back to same-system-only.
+        _reach_map = getattr(self, "_preview_intel_reach", None)
+        _reach = _reach_map.get(key) if _reach_map else None
+        # Wine-only: hold the alert border at the steady peak colour instead of
+        # pulsing it (see _preview_alert_border) -- a new colour every tick
+        # forces a repaint of the body frame over the X11 preview child, which
+        # is what the pulse's 2 Hz was flashing black. Windows (backend None)
+        # is byte-identical.
+        _wine_steady = (getattr(self, "_preview_thumb_backend", None)
+                        is not None)
+        # Damage colours are normalised to each kind's OWN default (a garbage
+        # NPC colour must never read as player red).
+        if dmg_kind == "player":
+            peak = normalize_hex_color(cfg.get("damage_flash_color"),
+                                       damage_flash.PLAYER_COLOR_DEFAULT)
+            tile.set_border(_preview_alert_border(
+                peak, dmg_since, now, _wine_steady))
+        elif decloaking:
+            peak = cfg.get("decloak_flash_color", "#ffcc00")
+            started = self._preview_decloak_since.get(key, now)
+            tile.set_border(_preview_alert_border(
+                peak, started, now, _wine_steady))
+        elif dmg_kind == "npc":
+            peak = normalize_hex_color(cfg.get("damage_flash_npc_color"),
+                                       damage_flash.NPC_COLOR_DEFAULT)
+            tile.set_border(_preview_alert_border(
+                peak, dmg_since, now, _wine_steady))
+        elif self._preview_should_flash(self._preview_intel, state, cfg,
+                                        time.monotonic(), reach=_reach):
+            tile.set_border(cfg.get("intel_flash_color", "#ff3b30"))
+        else:
+            tile.set_border(highlight)
+
     def _preview_native_tick_body(self):
         cfg = self._preview_cfg()
         # ONE desktop window sweep for the whole tick (uptime perf, 2026-09-17).
@@ -23494,16 +23644,25 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # included) while it is still live; else the window belonging to
             # `_preview_last_key`, which preserves the pre-login-highlight
             # fallback exactly. getattr-guarded for the bare synthetic hosts.
-            active_hwnd = None
-            if getattr(fg_info, "active_hwnd", None) in cur:
-                active_hwnd = fg_info.active_hwnd
-            elif getattr(self, "_preview_active_hwnd", None) in cur:
-                active_hwnd = self._preview_active_hwnd
-            elif self._preview_last_key:
-                for _h, _c in cur.items():
-                    if _c.key == self._preview_last_key:
-                        active_hwnd = _h
-                        break
+            # Issue 13: a FRESH switch through _preview_switch_to outranks all
+            # three while the raw foreground still reads what it read just
+            # before it (a tick landing there used to paint the highlight back
+            # onto the client we had left). The resolver owns the decision and
+            # hands back the record to keep. That record is SEPARATE from
+            # _preview_pending_switch, which the tick must never clear or
+            # consume - it belongs to the cycle anchor.
+            _fresh = getattr(self, "_preview_fresh_switch", None)
+            active_hwnd, self._preview_fresh_switch = (
+                preview_layout.resolve_active_hwnd(
+                    cur, getattr(fg_info, "active_hwnd", None),
+                    getattr(self, "_preview_active_hwnd", None),
+                    self._preview_last_key,
+                    fg_raw=getattr(fg_info, "fg_hwnd", None),
+                    switch=_fresh,
+                    # the clock is read only while a record exists
+                    now=time.monotonic() if _fresh is not None else 0.0,
+                    cap=getattr(self, "_PREVIEW_PENDING_SWITCH_S",
+                                FCToolGUI._PREVIEW_PENDING_SWITCH_S)))
             hidden, self._preview_lost_focus_since = self._preview_visibility(
                 cur, fg_info, cfg, self._preview_tick_count,
                 self._preview_lost_focus_since)
@@ -23548,85 +23707,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     self._preview_apply_tile_size(hwnd, tile, client.key, cfg)
                     if self._preview_tick_count % 8 == 0:
                         tile.refresh_source_size()                  # cheap re-letterbox
-                    # Border precedence is fixed + deterministic (2026-09-26):
-                    #   PLAYER damage red > DECLOAK yellow > NPC damage orange >
-                    #   intel flash > active highlight > none.
-                    # A hostile player's hit is the most urgent signal; a decloak
-                    # is urgent AND short-lived, so it outranks routine NPC damage
-                    # (ratting orange must never mask a decloak). Each flash
-                    # expires on its own and falls through to the next source;
-                    # the steady active-client highlight (P12/C4) is the lowest.
-                    state = (None if client.is_login
-                             else self._preview_state_for(client.key))
-                    # C4/P12: highlight the active client's tile (steady frame).
-                    # HWND equality, so the character-select/login screen gets
-                    # the same frame as a logged-in pilot (owner ask).
-                    highlight = (cfg.get("highlight_color", "#00d4ff")
-                                 if (cfg.get("highlight_active", True)
-                                     and hwnd == active_hwnd)
-                                 else None)
-                    # Damage flash: the tracker owns the per-class holds and ONE
-                    # pulse clock per character -- flash_state() -> (kind, since),
-                    # kind "player" | "npc" | None (see damage_flash). While a
-                    # hold is live the border PULSES (~2 Hz, pulse_color) stepped
-                    # by now - since, so orange -> red keeps the rhythm.
-                    now = time.monotonic()
-                    key = client.key
-                    dmg_kind = dmg_since = None
-                    if cfg.get("damage_flash", True) and not client.is_login:
-                        dmg_kind, dmg_since = self._preview_damage.flash_state(
-                            key, self._preview_layer_hp.get(key), cfg, now)
-                    # DECLOAK flash: the window is edge-armed in _preview_on_decloak
-                    # (until = now + decloak_flash_secs, pulse start seeded then).
-                    # Here we only read the live window, expire it, and — while
-                    # live — pulse the border YELLOW (below player red, above NPC
-                    # orange in the chain below).
-                    decloaking = False
-                    if cfg.get("decloak_flash", True) and not client.is_login:
-                        d_until = self._preview_decloak_until.get(key)
-                        if d_until is not None:
-                            if now < d_until:
-                                decloaking = True
-                            else:
-                                self._preview_decloak_until.pop(key, None)
-                                self._preview_decloak_since.pop(key, None)
-                    # Intel flash reach: the poller keeps THIS char's gate-jump
-                    # ball in _preview_intel_reach, keyed by the same char key
-                    # the state lookup above used; the predicate stays pure by
-                    # taking it as an argument. getattr-guarded (the tick's unit
-                    # hosts are bare SimpleNamespaces) — a missing ball just
-                    # means the flash falls back to same-system-only.
-                    _reach_map = getattr(self, "_preview_intel_reach", None)
-                    _reach = _reach_map.get(key) if _reach_map else None
-                    # Wine-only: hold the alert border at the steady peak colour
-                    # instead of pulsing it (see _preview_alert_border) -- a new
-                    # colour every tick forces a repaint of the body frame over
-                    # the X11 preview child, which is what the pulse's 2 Hz was
-                    # flashing black. Windows (backend None) is byte-identical.
-                    _wine_steady = (getattr(self, "_preview_thumb_backend", None)
-                                    is not None)
-                    # Damage colours are normalised to each kind's OWN default (a
-                    # garbage NPC colour must never read as player red).
-                    if dmg_kind == "player":
-                        peak = normalize_hex_color(cfg.get("damage_flash_color"),
-                                                   damage_flash.PLAYER_COLOR_DEFAULT)
-                        tile.set_border(_preview_alert_border(
-                            peak, dmg_since, now, _wine_steady))
-                    elif decloaking:
-                        peak = cfg.get("decloak_flash_color", "#ffcc00")
-                        started = self._preview_decloak_since.get(key, now)
-                        tile.set_border(_preview_alert_border(
-                            peak, started, now, _wine_steady))
-                    elif dmg_kind == "npc":
-                        peak = normalize_hex_color(cfg.get("damage_flash_npc_color"),
-                                                   damage_flash.NPC_COLOR_DEFAULT)
-                        tile.set_border(_preview_alert_border(
-                            peak, dmg_since, now, _wine_steady))
-                    elif self._preview_should_flash(self._preview_intel, state, cfg,
-                                                    time.monotonic(), reach=_reach):
-                        tile.set_border(cfg.get("intel_flash_color", "#ff3b30"))
-                    else:
-                        tile.set_border(highlight)
+                    # Border: ONE owner for the fixed precedence chain, shared
+                    # with the immediate repaint in _preview_switch_to (issue
+                    # 13). Called through the class so the bare tick-test hosts
+                    # need no extra binding.
+                    FCToolGUI._preview_paint_border(
+                        self, tile, hwnd, client, cfg, active_hwnd)
                 except Exception:
                     # Per-tile failure of ANY kind (DWM handle invalidated, a Tk
                     # op after a foreground change, a client that died mid-tick).
@@ -24081,6 +24167,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # A pending hotkey switch is session state, not config: a mode bounce must
         # not leave the next session's first cycle press anchored on a dead key.
         self._preview_pending_switch = None
+        self._preview_fresh_switch = None     # hwnd-keyed: dies with the session
         # Same for the stranded-tile book: hwnds do not survive a mode bounce,
         # and the next enable spawns everything fresh anyway.
         self._preview_spawn_retry = {}
