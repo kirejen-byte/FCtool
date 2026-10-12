@@ -353,7 +353,7 @@ def _show(u, hwnd, cmd):
     return u.show_window(hwnd, cmd)
 
 # A client that is permanently unfocusable must not flood the log while the user
-# keeps hammering the cycle key: one WARNING per hwnd per interval.
+# keeps hammering the cycle key: one line per hwnd per log level per interval.
 _FAIL_LOG_MIN_INTERVAL_S = 10.0
 _FAIL_LOG_MAX_TRACKED = 64
 _last_fail_log: dict = {}
@@ -394,18 +394,22 @@ def _confirm_foreground(u, hwnd):
     the target (and, only if that misses, with the target's GA_ROOT top-level).
 
     Read-only and instantaneous by contract — no waiting, no polling, no sleep.
-    Returns ``(confirmed, detail)``; `detail` is an ASCII fragment for the log.
-    An unavailable or raising probe is "not confirmed", never an optimistic True.
+    Returns ``(confirmed, detail, fg)``; `detail` is an ASCII fragment for the
+    log, and `fg` is the hwnd that was read: ``0`` when NO window is foreground,
+    ``None`` when the probe itself failed. An unavailable or raising probe is
+    "not confirmed", never an optimistic True.
     """
     try:
         fg = int(u.get_foreground() or 0)
     except Exception as exc:
-        return False, "foreground=ERR(%s) target=%s" % (type(exc).__name__, hwnd)
+        return (False,
+                "foreground=ERR(%s) target=%s" % (type(exc).__name__, hwnd),
+                None)
     if fg and fg == hwnd:
-        return True, "foreground=%s target=%s" % (fg, hwnd)
+        return True, "foreground=%s target=%s" % (fg, hwnd), fg
     root = _root_of(u, hwnd)
     ok = bool(fg) and fg == root
-    return ok, "foreground=%s target=%s root=%s" % (fg, hwnd, root)
+    return ok, "foreground=%s target=%s root=%s" % (fg, hwnd, root), fg
 
 
 # --------------------------------------------------------- foreground probe
@@ -460,7 +464,7 @@ def _fg_probe_body(u, hwnd, owned, t0, sleep=time.sleep,
     try:
         flip_ms = None
         while True:
-            confirmed, _detail = _confirm_foreground(u, hwnd)
+            confirmed, _detail, _fg = _confirm_foreground(u, hwnd)
             elapsed = clock() - t0
             if confirmed:
                 flip_ms = round(elapsed * 1000.0, 1)
@@ -505,23 +509,28 @@ def _start_fg_probe(u, hwnd, owned, t0, sleep=time.sleep,
         return None
 
 
-def _log_failed_activate(hwnd, outcomes, detail):
-    """One throttled, ASCII-only WARNING per unconfirmed activate.
+def _log_failed_activate(hwnd, outcomes, detail, level=logging.WARNING):
+    """One throttled, ASCII-only line per unconfirmed activate, at ``level``.
 
     ASCII matters: this box's console is cp1252, and a non-cp1252 glyph anywhere
     in a log string makes StreamHandler.emit spew a "Logging error" traceback.
+
+    The throttle is per hwnd AND per level: the DEBUG line of a switch that is
+    merely still in flight must never use up the slot of a real failure on the
+    same window.
     """
     now = time.monotonic()
-    last = _last_fail_log.get(hwnd)
+    key = (hwnd, level)
+    last = _last_fail_log.get(key)
     if last is not None and (now - last) < _FAIL_LOG_MIN_INTERVAL_S:
         return
     if len(_last_fail_log) >= _FAIL_LOG_MAX_TRACKED:
         cutoff = now - _FAIL_LOG_MIN_INTERVAL_S
         for stale in [k for k, t in _last_fail_log.items() if t < cutoff]:
             _last_fail_log.pop(stale, None)
-    _last_fail_log[hwnd] = now
-    log.warning("activate could not confirm foreground: %s; rungs: %s", detail,
-                _rung_text(outcomes, _RUNGS))
+    _last_fail_log[key] = now
+    log.log(level, "activate could not confirm foreground: %s; rungs: %s",
+            detail, _rung_text(outcomes, _RUNGS))
 
 
 def _rung_text(outcomes, rungs):
@@ -588,7 +597,7 @@ def _activate_wine(hwnd, u):
         timed("set_foreground", lambda: u.set_foreground(hwnd))
 
     probe_t0 = time.perf_counter()
-    confirmed, detail = _confirm_foreground(u, hwnd)
+    confirmed, detail, _fg = _confirm_foreground(u, hwnd)
     timing["confirm"] = _ms_since(probe_t0)
     timing["total_ms"] = _ms_since(started)
     timing["verdict"] = "confirmed" if confirmed else "issued"
@@ -610,11 +619,13 @@ def activate(hwnd: int, win32=None) -> bool:
     """Bring an EVE client to the foreground. Focus APIs only — nothing else, ever.
 
     Returns True ONLY when the closing read-only foreground probe confirms that
-    `hwnd` (or its GA_ROOT top-level) actually IS the foreground window. False is
-    a real, reportable failure: the switch did not happen, a caller's cycle ring
-    must not advance as though it had, and one throttled WARNING carrying the
-    per-rung outcomes lands in the log (the field diagnostic for the
-    "sometimes ignores a cycle" report).
+    `hwnd` (or its GA_ROOT top-level) actually IS the foreground window. False
+    means NOT CONFIRMED: a caller's cycle ring must not advance as though the
+    switch had landed, and one throttled line carrying the per-rung outcomes
+    lands in the log (the field diagnostic for the "sometimes ignores a cycle"
+    report). That line is a WARNING, with one exception: SetForegroundWindow
+    was accepted and the probe read NO foreground window at all - Windows
+    between two foreground windows, the switch in flight - is logged at DEBUG.
 
     The ladder injects no input of any kind:
       0. restore, if the window is minimized
@@ -638,12 +649,21 @@ def activate(hwnd: int, win32=None) -> bool:
 
     if _run_rung(outcomes, "is_iconic", lambda: u.is_iconic(hwnd)):
         _run_rung(outcomes, "restore", lambda: u.show_window(hwnd, SW_RESTORE))
-    if not _run_rung(outcomes, "set_foreground", lambda: u.set_foreground(hwnd)):
+    accepted = _run_rung(outcomes, "set_foreground",
+                         lambda: u.set_foreground(hwnd))
+    if not accepted:
         _run_rung(outcomes, "switch_to_window", lambda: u.switch_to_window(hwnd))
 
-    confirmed, detail = _confirm_foreground(u, hwnd)
+    confirmed, detail, fg = _confirm_foreground(u, hwnd)
     if not confirmed:
-        _log_failed_activate(hwnd, outcomes, detail)
+        # Windows ACCEPTED the request and the probe read no foreground window
+        # at all: it ran in the instant between the old foreground and the new
+        # one, with the switch in flight. Worth a DEBUG line, not a WARNING. A
+        # refused or raising request, a DIFFERENT window in front, or a probe
+        # that failed (fg is None) is a real "did not happen".
+        in_flight = bool(accepted) and fg == 0
+        _log_failed_activate(hwnd, outcomes, detail,
+                             logging.DEBUG if in_flight else logging.WARNING)
     return confirmed
 
 
