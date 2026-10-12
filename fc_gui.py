@@ -27591,10 +27591,20 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # then shift every rect onto the virtual desktop by the origin (bx, by).
         # The grid is laid out in FULL window heights (body + caption strip) so
         # rows do not overlap; only x/y are used - stored/placed size stays body_h.
+        # The CELL is the largest size any arranged tile resolves to (a per-char
+        # override with uniform_size off is re-applied by the next tick at the
+        # tile's x/y), never below the global size, so neighbours cannot overlap.
+        cell_w, cell_body = tile_w, body_h
+        for client in ordered_live:
+            try:
+                rw, rb = self._preview_resolve_size(cfg, client.key)
+                cell_w, cell_body = max(cell_w, int(rw)), max(cell_body, int(rb))
+            except Exception:
+                pass
         rects = [(bx + gx, by + gy, gw, gh) for gx, gy, gw, gh
                  in preview_layout.grid_arrange(
-                     len(ordered_live), tile_w,
-                     preview_layout.full_h(body_h, preview_tile.STRIP_H),
+                     len(ordered_live), cell_w,
+                     preview_layout.full_h(cell_body, preview_tile.STRIP_H),
                      (0, 0, bw, bh), origin=(10, 10), gap=8)]
         layouts = cfg.setdefault("layouts", {})
         for client, (x, y, _w, _h) in zip(ordered_live, rects):

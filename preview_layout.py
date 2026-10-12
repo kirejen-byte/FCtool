@@ -103,7 +103,7 @@ def full_h(body_h, strip_h):
     wrong (see preview_tile.strip_h_for — the strip is NOT always STRIP_H).
 
     SCOPE, precisely: this pair owns the spinbox-display ↔ stored-`tile_body_h`
-    crossing and nothing else. It is NOT the project's only STRIP_H arithmetic
+    crossing, and Arrange in grid also calls `full_h` to size its rows. It is NOT the project's only STRIP_H arithmetic
     and was never meant to be — the tile GEOMETRY paths (preview_tile's own
     strip/thumb layout) and the FC HUD rect seam in fc_gui each do their own,
     legitimately, against live widget state this pure module cannot see. The
