@@ -104,11 +104,11 @@ def full_h(body_h, strip_h):
 
     SCOPE, precisely: this pair owns the spinbox-display ↔ stored-`tile_body_h`
     crossing, and Arrange also calls `full_h` to size its rows. It is NOT the
-    project's only STRIP_H arithmetic
-    and was never meant to be — the tile GEOMETRY paths (preview_tile's own
-    strip/thumb layout) and the FC HUD rect seam in fc_gui each do their own,
-    legitimately, against live widget state this pure module cannot see. The
-    claim to defend is narrow: no OTHER code re-derives the settings box's unit.
+    project's only STRIP_H arithmetic and was never meant to be — the tile
+    GEOMETRY paths (preview_tile's own strip/thumb layout) and the FC HUD rect
+    seam in fc_gui each do their own, legitimately, against live widget state
+    this pure module cannot see. The claim to defend is narrow: no OTHER code
+    re-derives the settings box's unit.
 
     `strip_h` is passed IN rather than imported: preview_tile imports this
     module, so this module can never import preview_tile back, and the caller
@@ -516,7 +516,8 @@ def flow_arrange(sizes, bounds, origin=(10, 10), gap=8):
     A tile joins the current row when its right edge plus `gap` is within `bw`;
     the first tile of a row is always placed, so every row advances. A new row
     starts `gap` below the tallest tile of the finished one. Returns (x, y, w, h)
-    in input order. With every size equal this is exactly grid_arrange.
+    in input order. With every size equal this is exactly grid_arrange, as long
+    as w + gap > 0 (at w + gap == 0 grid_arrange divides by zero; this does not).
     """
     bw = bounds[2]
     ox, oy = origin
@@ -656,8 +657,8 @@ def resolve_active_hwnd(cur, fg_active, anchor_hwnd, last_key, *,
     target is still live; and the raw foreground `fg_raw` still reads EXACTLY
     what it read just before the switch. The foreground is not a reliable
     answer right after we asked for a switch (Windows applies it late, or
-    refuses it), and a tick landing in that window used to paint the highlight
-    back onto the client we had just left.
+    refuses it): without this rule a tick landing in that window would paint
+    the highlight back onto the client we had just left.
 
     The record is dropped (second return value None) the moment the foreground
     reads anything else - our switch landing, or the user going somewhere of

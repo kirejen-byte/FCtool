@@ -21429,7 +21429,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         it only if it is a DIFFERENT, still-live client whose key is not in
         `never_minimize` (EVE-O PriorityClients parity). Activation itself is
         always via window_activator (the compliance choke-point) — focus APIs
-        only, nothing injected into any EVE client (spec §4).
+        only. The FCTool process itself injects nothing into any EVE client; on
+        Windows nothing is injected at all, and window_activator's module
+        docstring covers the Wine helper's one pointer event (spec §4).
 
         Clears any pending hotkey-switch record: every switch arriving here
         SUPERSEDES it. A tile click is a mouse gesture the user watched land, so
@@ -22256,8 +22258,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
     def _preview_drain_hotkeys(self):
         """Drain the hotkey worker queue and act on each event. Focus APIs only —
-        the compliance choke-point is window_activator; nothing is injected into
-        any EVE client (spec §4)."""
+        the compliance choke-point is window_activator; the FCTool process itself
+        injects nothing into any EVE client, and on Windows nothing is injected
+        at all (the Wine helper's one pointer event: see window_activator's
+        module docstring; spec §4)."""
         svc = self._preview_hotkeys
         if svc is None:
             return
@@ -27661,9 +27665,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._preview_arrange_ordered(live)
 
     def _preview_arrange_ordered(self, ordered_live):
-        """Grid-place an already-ordered list of live clients, persist each rect
-        (keyed by char name), and re-place its tile. Shared by the grid and
-        by-fleet arrange buttons. No-op on an empty list."""
+        """Flow an already-ordered list of live clients into rows, each tile
+        spaced by its own resolved size (full window height); what is persisted
+        (keyed by char name) and placed is still the GLOBAL size at that x/y.
+        Shared by the grid and by-fleet arrange buttons. No-op on an empty
+        list."""
         if not ordered_live:
             return
         cfg = self._preview_cfg()

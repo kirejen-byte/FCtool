@@ -1,10 +1,14 @@
 """The ONLY module allowed to change another window's state (spec §4 invariant #1).
 Focus-change ladder verified vs EVE-O (SetForegroundWindow+restore is its entire
 mechanism) + documented SetForegroundWindow rules (caller received last input =
-allowed, which is our click/hotkey situation). The ladder injects NO input of any
-kind: no keystroke and no mouse event is synthesized, into any window or into the
-system input stream. AttachThreadInput deliberately omitted (deadlock-prone). One
-``activate`` = one focus change, always.
+allowed, which is our click/hotkey situation). This module synthesizes NO
+keystroke and NO mouse event on any platform, into any window or into the system
+input stream, so on Windows the whole ladder injects no input. Under Wine the
+injected X11 activator (below) belongs to the preview helper, which follows its
+activation with ONE synthetic pointer-motion event to the client (MotionNotify,
+one pixel off the real pointer; no key, no button). AttachThreadInput
+deliberately omitted (deadlock-prone). One ``activate`` = one focus change,
+always.
 
 ``activate`` is HONEST about the outcome (it used to ``return True`` on every
 path, which made a failed switch invisible, unretried and unlogged while the
@@ -21,9 +25,11 @@ the duration of the case it was meant to diagnose. A switch we cannot confirm is
 a fact to LOG; the caller's next press is the retry.
 
 Compliance envelope (spec §4): focus APIs only, verification is strictly
-read-only (GetForegroundWindow / GetAncestor), and no input is injected. When
-Windows refuses SetForegroundWindow the switch rests on SwitchToThisWindow
-alone, and may not land until the user's next press.
+read-only (GetForegroundWindow / GetAncestor), and this module injects no
+input: on Windows nothing in the ladder does, and under Wine the only input is
+the preview helper's one pointer-motion event (above). When Windows refuses
+SetForegroundWindow the switch rests on SwitchToThisWindow alone, and may not
+land until the user's next press.
 
 ONE deliberate exception to "focus APIs only" (owner-approved; close-all-clients
 spec §3): ``close_window`` posts ``WM_CLOSE`` to a client's top-level window.
@@ -616,7 +622,9 @@ def _activate_wine(hwnd, u):
 
 
 def activate(hwnd: int, win32=None) -> bool:
-    """Bring an EVE client to the foreground. Focus APIs only — nothing else, ever.
+    """Bring an EVE client to the foreground. Focus APIs only — nothing else
+    in this module, on any platform (the X11 activator injected under Wine is the
+    preview helper's: see the module docstring).
 
     Returns True ONLY when the closing read-only foreground probe confirms that
     `hwnd` (or its GA_ROOT top-level) actually IS the foreground window. False
@@ -627,7 +635,7 @@ def activate(hwnd: int, win32=None) -> bool:
     was accepted and the probe read NO foreground window at all - Windows
     between two foreground windows, the switch in flight - is logged at DEBUG.
 
-    The ladder injects no input of any kind:
+    The Windows ladder injects no input of any kind:
       0. restore, if the window is minimized
       1. SetForegroundWindow
       2. SwitchToThisWindow, only when rung 1 did not report success

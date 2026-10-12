@@ -8,9 +8,12 @@ as NPC. "unknown", None and anything else are stored and treated as PLAYER —
 the fail-safe direction: a hit we cannot classify pulses red (the urgent
 colour) instead of being demoted to routine orange or gated by the threshold.
 
-flash_state(char_key, hp, cfg, now) -> (kind, since) is the ONE reader (the
-FCPreview tick calls it once per tile per tick); kind is "player" (red),
-"npc" (orange) or None:
+flash_state(char_key, hp, cfg, now) -> (kind, since) is the ONE reader. Its
+caller is fc_gui's border painter (_preview_paint_border): once per shown tile
+on every FCPreview tick, and once more per shown tile right after a switch
+through the previews. Reads are therefore NOT bound to the tick grid: that
+extra read can arm a hold up to one tick sooner than the next tick would have.
+kind is "player" (red), "npc" (orange) or None:
   - PLAYER damage ALWAYS arms red, in BOTH modes, with NO threshold: any
     windowed player damage > 0 arms it.
   - NPC damage arms orange only while cfg['damage_flash_npc'] is truthy
@@ -40,7 +43,7 @@ damage is still arming. ONE pulse clock per character (`_since[char]`)
 starts with the first live hold of either class and survives re-arms AND
 red<->orange changes (the colour switches, the rhythm doesn't restart); it
 is cleared once both holds have expired — and ALSO at the start of any read
-that finds no hold live, because the tick does not read a character while
+that finds no hold live, because no caller reads a character while
 damage flash is off, on the login screen, while its tile is retired or while
 its tile is hidden by a hide rule (hide-active / hide-login /
 hide-on-lost-focus), so a hold can expire unobserved and must not hand its
@@ -75,8 +78,9 @@ HP values (threshold mode) are BASE dogma hull HP (fitted ships have more) — t
 UI labels this as an approximation.
 
 Threading: every caller is on the Tk thread (ingest via fc_gui's _post_ui,
-reads via the preview tick), so the unlocked mutations here (_hits, the hold
-dicts, _retention_s) are single-threaded BY THAT INVARIANT — a future
+reads via the preview tick and the repaint that follows a switch), so the
+unlocked mutations here (_hits, the hold dicts, _retention_s) are
+single-threaded BY THAT INVARIANT — a future
 off-thread caller must add locking."""
 from __future__ import annotations
 
@@ -331,7 +335,7 @@ class DamageFlashTracker:
         window_s = coerce_window_s(cfg)
         self._note_reader_window(window_s)
         # No hold live at the START of this read -> the pulse clock is stale:
-        # the tick skips a character while damage flash is off, on the login
+        # no caller reads a character while damage flash is off, on the login
         # screen, or while its tile is retired or hidden by a hide rule, so a
         # hold can expire with no read to clear `_since`. Drop it so a new
         # hold starts a FRESH clock.
