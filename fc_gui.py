@@ -21332,6 +21332,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
     def _preview_spawn_tile(self, client):
         cfg = self._preview_cfg()
         x, y, w, body_h = self._preview_tile_rect(client, cfg)
+        if client.hwnd in self._preview_tiles:
+            # A replacement lands where the tile it replaces sits: the cascade
+            # slot counts tiles, which a replacement does not grow.
+            prev = self._preview_tile_rects.get(client.hwnd)
+            if prev is not None:
+                x, y, w, body_h = prev
         tile = self._preview_make_tile(client.key, x, y, w, body_h, client.hwnd)
         try:
             tile.attach_source(client.hwnd)
@@ -21346,6 +21352,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 pass
             self._preview_note_stranded(client)
             return
+        except BaseException:
+            # Not stored, so nothing else could ever destroy it; the tick's
+            # failure counting still sees the original error.
+            try:
+                tile.destroy()
+            except Exception:
+                pass
+            raise
         # A tick that failed after spawning never published its clients, so
         # they are `added` again: retire the tile this slot already holds.
         # Only the window itself; the per-hwnd memory is the new tile's too.
@@ -23790,6 +23804,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 self._preview_clients, cur)
             for old in removed:
                 self._preview_retire_tile(old.hwnd)                 # layouts untouched
+            # A client spawned in a failed (never published) tick and gone by
+            # now is never reported `removed`; its tile would outlive it.
+            for hw in [h for h in self._preview_tiles if h not in cur]:
+                self._preview_retire_tile(hw)
             for old, new in retitled:
                 self._preview_rekey_tile(old, new)                  # login→char and back
             for client in added:
