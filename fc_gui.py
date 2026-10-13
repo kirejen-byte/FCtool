@@ -21346,6 +21346,19 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 pass
             self._preview_note_stranded(client)
             return
+        # A tick that failed after spawning never published its clients, so
+        # they are `added` again: retire the tile this slot already holds.
+        # Only the window itself; the per-hwnd memory is the new tile's too.
+        old = self._preview_tiles.get(client.hwnd)
+        if old is not None and old is not tile:
+            try:
+                old.detach()
+            except Exception:
+                pass
+            try:
+                old.destroy()
+            except Exception:
+                pass
         self._preview_tiles[client.hwnd] = tile
         self._preview_tile_rects[client.hwnd] = (x, y, w, body_h)
         # Same evidence as the rekey path, and the one that actually fires for
