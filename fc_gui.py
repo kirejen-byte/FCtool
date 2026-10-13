@@ -23824,11 +23824,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # published, so give each tile-less one a single spawn. A failure is
             # booked by the spawn itself and left to the bounded sweep below.
             if getattr(self, "_preview_eveo_resume", False):
-                self._preview_eveo_resume = False
                 _spawned = {c.hwnd for c in added}
                 for hw, client in cur.items():
                     if hw not in self._preview_tiles and hw not in _spawned:
                         self._preview_spawn_tile(client)
+                # cleared AFTER the loop: a raise leaves it armed for next tick
+                self._preview_eveo_resume = False
             # `added` fires ONCE per client, so a client whose tile failed to
             # spawn (or was retired mid-tick) is invisible to the diff from then
             # on. The bounded sweep is the only thing that gives it another go.
