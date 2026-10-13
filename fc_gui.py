@@ -21333,10 +21333,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         cfg = self._preview_cfg()
         x, y, w, body_h = self._preview_tile_rect(client, cfg)
         if client.hwnd in self._preview_tiles:
-            # A replacement lands where the tile it replaces sits: the cascade
-            # slot counts tiles, which a replacement does not grow.
+            # Precedence: saved layout, then the replaced tile's recorded rect
+            # (the cascade counts tiles, which a replacement does not grow),
+            # then cascade / login stack. Same saved test as _preview_tile_rect.
+            saved = (cfg.get("layouts", {}) or {}).get(
+                self._preview_layout_key(client.identity))
             prev = self._preview_tile_rects.get(client.hwnd)
-            if prev is not None:
+            if prev is not None and not (saved and len(saved) >= 4):
                 x, y, w, body_h = prev
         tile = self._preview_make_tile(client.key, x, y, w, body_h, client.hwnd)
         try:
