@@ -1473,6 +1473,9 @@ class TileWindow:
         if getattr(self, "_hidden", False):
             return
         self._hidden = True
+        # An owned popup is NOT hidden with its owner: say so (visible=False)
+        # BEFORE the withdraw, so no frame ever shows the band without its tile.
+        self._sync_band()
         try:
             self.top.withdraw()
         except tk.TclError:
@@ -1485,8 +1488,6 @@ class TileWindow:
         self._press_root = None
         self._strip_moving = False
         self._corner_resizing = False
-        # An owned popup is NOT hidden with its owner: say so (visible=False).
-        self._sync_band()
 
     def show(self):
         """Re-map a tile hidden by hide(). Idempotent; re-pushes the thumbnail rect
@@ -2326,12 +2327,19 @@ class TileWindow:
         band, and put the text back on the strips - at once, so it never
         silently disappears - with ONE log line. The latch makes set_text_band
         answer False from now on, so this runs at most once per tile and the
-        line cannot repeat. Names no character (the log may be shared).
-        Never raises (see _sync_band)."""
+        line cannot repeat. Names no character (the log may be shared): the
+        band's own last_failure (the step + Win32 error code, never request
+        text) is appended when it has one. Never raises (see _sync_band)."""
+        try:
+            detail = getattr(self._band, "last_failure", None)
+        except Exception:
+            detail = None
         self._band_off = True
         self._text_band = False
         self._destroy_band()
         try:
+            if isinstance(detail, str) and detail:
+                why = "%s: %s" % (why, detail)
             log.warning("preview: text over video is unavailable for one tile "
                         "(%s); that tile shows caption strips instead", why)
         except Exception:

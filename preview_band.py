@@ -7,12 +7,13 @@ top-level window. This module owns that window: one small popup per tile,
 OWNED by the tile's hwnd.
 
 What the owner relationship buys (measured on a hidden desktop, 2026-10-13):
-the band inherits topmost from its tile and stays DIRECTLY above it through
-every re-top of the tile or of an overlapping neighbour, the tile's own
-placement, its opacity flip and its withdraw / deiconify - with no call made
-on the band. So nothing here ever re-stacks the band. What the relationship
-does NOT do: the band does not move with its tile and is not hidden when the
-tile is withdrawn. The tile says both through BandWindow.sync().
+the band inherits topmost from its tile and - from the tile's first re-top
+after the band was created (BandWindow._create says where a NEW band lands) -
+stays DIRECTLY above it through every re-top of the tile or of an
+overlapping neighbour, the tile's own placement, its opacity flip and its
+withdraw / deiconify - with no call made on the band. So nothing here ever
+re-stacks the band. What the relationship does NOT do: the band does not move
+with its tile and is not hidden when the tile is withdrawn. The tile says both through BandWindow.sync().
 
 THE TWO FPS INVARIANTS (a change that breaks either is a regression):
   1. the band is never re-stacked by our code - the one window-position call
@@ -24,8 +25,10 @@ retired 2026-07-03) broke both: one desktop-wide window, redrawn and re-topped
 on every tick.
 
 Layers, top to bottom of the file:
-  * pure functions - layout_band (row rectangles) and compose_pixels (glyph
-    coverage -> premultiplied BGRA). No window, no ctypes; importable anywhere.
+  * pure functions - text_band_wanted / text_band_effective (the 'Label
+    text' switch's config rule, read by fc_gui), layout_band (row
+    rectangles) and compose_pixels (glyph coverage -> premultiplied BGRA).
+    No window, no ctypes; importable anywhere.
   * BandWindow - one band for one tile, every Win32 call behind an injectable
     backend (win32=), the preview_tile / eveo_overlay house pattern.
   * _RealBandWin32 - the ctypes backend, built LAZILY by _real_band_win32().
@@ -61,8 +64,49 @@ _BAND_MAX_FRAC = 0.60
 # Horizontal text inset in px - the padx of the strips' labels.
 _TEXT_PAD = 4
 
+# Bold Consolas' GDI cell height : em height, as 2398 : 2048 (see
+# _glyph_px_max - the ratio that keeps a drawn line inside its row).
+_CELL_EM_NUM, _CELL_EM_DEN = 2398, 2048
+
 _FG_FALLBACK = (255, 255, 255)      # a garbage text colour draws white
 _BG_FALLBACK = (0, 0, 0)            # a garbage background draws black
+
+# The ONLY characters a '#rrggbb' colour may hold after the '#'. Explicit and
+# ASCII: int(s, 16) also takes a sign, spaces, underscores and non-ASCII digits.
+_HEX_DIGITS = frozenset("0123456789abcdefABCDEF")
+
+# A band size (tile width, body height) larger than this is garbage: no
+# monitor is that big, and int(body_h * 0.60) would overflow on 10 ** 400.
+_MAX_SIZE_PX = 1 << 20
+
+# The 'Label text' switch (preview.text_placement): the one value that asks
+# for the band. See text_band_wanted.
+TEXT_PLACEMENT_BAND = "over_video"
+
+
+def text_band_wanted(cfg) -> bool:
+    """True iff the preview config asks for the bottom text on the band
+    ('Label text' = 'Text over video'). THE one reader of
+    preview.text_placement: only the exact string "over_video" counts - any
+    other value or type (a hand-edited list, number, null, "OVER_VIDEO",
+    " over_video") reads as "caption", the strips. Pure; never raises,
+    never writes."""
+    try:
+        value = cfg.get("text_placement")
+    except Exception:
+        return False
+    return isinstance(value, str) and value == TEXT_PLACEMENT_BAND
+
+
+def text_band_effective(cfg, *, on_wine, thumb_backend_is_none) -> bool:
+    """The layout tiles actually get: wanted (text_band_wanted) AND a Windows
+    DWM preview - not Wine / Proton (`on_wine`; the band is a Win32 layered
+    window) and no X11 thumbnail helper (`thumb_backend_is_none` False means
+    the helper is in use, where a tile refuses the band anyway). Both flags
+    must be real bools: anything else reads as the safe answer, the strips.
+    Pure: the caller does the Wine probe. Never raises."""
+    return (thumb_backend_is_none is True and on_wine is False
+            and text_band_wanted(cfg))
 
 
 @dataclass(frozen=True)
@@ -120,40 +164,55 @@ def _shrink_rows(heights, target):
     return out
 
 
+def _size_or_none(value):
+    """A band size in px: a plain int in 1.._MAX_SIZE_PX, else None. A bool,
+    a float (even 2.0), a numeric string or an overflowing int is garbage."""
+    if isinstance(value, bool) or not isinstance(value, int):
+        return None
+    return value if 1 <= value <= _MAX_SIZE_PX else None
+
+
 def layout_band(tile_w, body_h, lines):
     """Where the band's rows go. Pure.
 
-    None when there is nothing to lay out (no lines, tile_w < 1, body_h < 1).
-    Otherwise BandLayout(height, rows): one (y, h) per line, in the order
-    given, stacked top-down with no gap; height == sum of the row heights.
+    None when there is nothing to lay out: no lines, a non-iterable `lines`,
+    or a tile_w / body_h that is not a plain int in 1.._MAX_SIZE_PX (0, a
+    negative, a float, a word, None, 10 ** 400). Otherwise
+    BandLayout(height, rows): one (y, h) per line, in the order given,
+    stacked top-down with no gap; height == sum of the row heights.
 
     Each row asks for its line's `height`. When the total exceeds
     int(body_h * 0.60) the rows shrink in proportion - but every row stays
     >= 1, so on a body too small for that the band is one px per row (and the
-    floor, not the cap, wins). Garbage sizes read as "nothing"; a garbage row
-    height reads as 1. Never raises."""
-    lines = tuple(lines or ())
-    tile_w, body_h = _int_or(tile_w, 0), _int_or(body_h, 0)
-    if not lines or tile_w < 1 or body_h < 1:
+    floor, not the cap, wins). A garbage row height reads as 1. Never raises:
+    anything unforeseen reads as "nothing to lay out"."""
+    try:
+        tile_w, body_h = _size_or_none(tile_w), _size_or_none(body_h)
+        if tile_w is None or body_h is None:
+            return None
+        lines = tuple(lines or ())
+        if not lines:
+            return None
+        heights = [max(1, _int_or(getattr(line, "height", 1), 1)) for line in lines]
+        target = max(int(body_h * _BAND_MAX_FRAC), len(heights))
+        if sum(heights) > target:
+            heights = _shrink_rows(heights, target)
+        rows, y = [], 0
+        for h in heights:
+            rows.append((y, h))
+            y += h
+        return BandLayout(height=y, rows=tuple(rows))
+    except Exception:
         return None
-    heights = [max(1, _int_or(getattr(line, "height", 1), 1)) for line in lines]
-    target = max(int(body_h * _BAND_MAX_FRAC), len(heights))
-    if sum(heights) > target:
-        heights = _shrink_rows(heights, target)
-    rows, y = [], 0
-    for h in heights:
-        rows.append((y, h))
-        y += h
-    return BandLayout(height=y, rows=tuple(rows))
 
 
 def _parse_hex(color, fallback):
-    """'#rrggbb' -> (r, g, b); anything else -> `fallback`. Never raises."""
-    if isinstance(color, str) and len(color) == 7 and color[0] == "#":
-        try:
-            return (int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16))
-        except ValueError:
-            pass
+    """'#rrggbb' (ASCII hex digits only) -> (r, g, b); anything else ->
+    `fallback`. Never raises. The digits are checked explicitly because
+    int(s, 16) accepts '-1', '+f', ' f' and non-ASCII digits."""
+    if (isinstance(color, str) and len(color) == 7 and color[0] == "#"
+            and all(c in _HEX_DIGITS for c in color[1:])):
+        return (int(color[1:3], 16), int(color[3:5], 16), int(color[5:7], 16))
     return fallback
 
 
@@ -194,6 +253,23 @@ def compose_pixels(coverage, fg, bg, bg_alpha):
     return bytes(out)
 
 
+def _glyph_px_max(row_h):
+    """The largest font_px whose drawn line fits a row `row_h` px tall
+    without losing a px (>= 1). The renderer asks GDI for a GLYPH (em)
+    height, but GDI centres and clips the whole CELL, and bold Consolas'
+    cell is about 1.171 em - so a glyph as tall as the row, or even 2 px
+    shorter, loses the tops / descenders of its letters.
+
+    Measured on a hidden desktop (2026-10-13), rows 3..60 px, five texts
+    with ascenders, descenders, brackets and '|': row_h * 2048 // 2398
+    never clips; row_h - 2 clipped at rows 19, 23 and every row from 28.
+    A row with room to spare is untouched (this is only a ceiling): at
+    100 % scaling the label sizes up to 13 pt keep their font, at 150 % up
+    to 8 pt; above that the glyph shrinks to fit its row instead of being
+    cut. Strictly smaller than the row from row_h = 2 on."""
+    return max(1, int(row_h) * _CELL_EM_DEN // _CELL_EM_NUM)
+
+
 def _alpha255(alpha):
     """Tile opacity 0.0..1.0 -> the band's constant alpha 0..255. The band
     fades WITH its tile (0.85 at rest, 1.0 hovered or active). Garbage reads
@@ -206,7 +282,12 @@ def _alpha255(alpha):
 
 class BandWindow:
     """One text band for one tile: a small layered popup OWNED by the tile's
-    hwnd, covering the bottom of the tile body. Tile-thread (Tk-thread) only.
+    hwnd, covering the bottom of the tile body.
+
+    Tk-thread (= the owner tile's thread) ONLY - every method, destroy()
+    included. The real backend refuses a window of another thread, so a
+    destroy() called from another thread zeroes `hwnd` but removes nothing:
+    the window is orphaned until its owner dies, while `hwnd` reads 0.
 
     sync() is the ONLY way state reaches the window, and it is ZERO-WRITE: it
     diffs the request against what was last successfully applied and makes
@@ -231,12 +312,20 @@ class BandWindow:
     All Win32 is behind `win32` (default: the lazy _real_band_win32());
     tests inject a recording fake. No GDI object outlives a backend call, so
     there is nothing to leak between syncs and destroy() has only the window
-    to remove."""
+    to remove.
+
+    `last_failure` says why the last sync() answered False, for the tile's
+    one log line: None after a sync that succeeded, else a short ASCII string
+    naming the step that failed (request / owner / create / render / push /
+    move / show) plus the Win32 error code when the backend has one. It
+    never holds text from the request (no character name, no label)."""
 
     def __init__(self, owner_hwnd, win32=None):
         self._owner = _int_or(owner_hwnd, 0)
         self._win32 = win32
         self.hwnd = 0                   # 0 while no window exists
+        self.last_failure = None        # see the class docstring
+        self._step = "request"          # the step _sync is in (for last_failure)
         self._forget()
 
     def _forget(self):
@@ -261,42 +350,55 @@ class BandWindow:
 
         True when the window now matches the request - "nothing to show,
         window hidden (or never created)" included. False on any backend
-        failure; the caller falls back to its strips. NEVER raises: this is
-        reached from the preview tick, where an escaping exception counts
-        against the whole preview subsystem."""
+        failure (last_failure says which step); the caller falls back to its
+        strips. NEVER raises: this is reached from the preview tick, where an
+        escaping exception counts against the whole preview subsystem.
+
+        Blind spot, accepted by design: being zero-write, an UNCHANGED request
+        makes no backend call at all, so a window destroyed behind the band's
+        back (not by its owner dying with it - that is the tile's own
+        teardown) is noticed only on the next CHANGED sync, whose failing call
+        finds the hwnd dead and starts over with a fresh window."""
+        self._step = "request"
         try:
-            return self._sync(x, y, w, body_h, lines, alpha, visible)
-        except Exception:
-            return self._failed()
+            ok = self._sync(x, y, w, body_h, lines, alpha, visible)
+        except Exception as exc:
+            ok = self._failed(exc)
+        if ok:
+            self.last_failure = None
+        return ok
 
     def _sync(self, x, y, w, body_h, lines, alpha, visible):
-        lines = tuple(lines or ())
         layout = layout_band(w, body_h, lines) if visible else None
         if layout is None:
             return self._hide()
-        w = int(w)
-        bx, by = int(x), int(y) + int(body_h) - layout.height
+        lines = tuple(lines)            # iterable: layout_band said so
+        bx, by = int(x), int(y) + body_h - layout.height
         alpha255 = _alpha255(alpha)
         win32 = self._backend()
         if not self.hwnd and not self._create(win32, bx, by, w, layout.height):
-            return False
+            return self._failed()
         key = (w, layout, lines)
         repaint = key != self._painted
         if repaint or alpha255 != self._alpha:
+            self._step = "render"
             bgra = self._render(win32, w, layout, lines) if repaint else self._bgra
             if bgra is None:
                 return self._failed()
             # push() also places the window, so it covers a move made together
             # with the repaint / fade - still ONE call.
+            self._step = "push"
             if not win32.push(self.hwnd, bx, by, w, layout.height, bgra, alpha255):
                 return self._failed()
             self._painted, self._bgra = key, bgra
             self._pos, self._alpha = (bx, by), alpha255
         elif (bx, by) != self._pos:
+            self._step = "move"
             if not win32.move(self.hwnd, bx, by):
                 return self._failed()
             self._pos = (bx, by)
         if not self._shown:
+            self._step = "show"
             if not win32.show(self.hwnd, True):
                 return self._failed()
             self._shown = True
@@ -305,6 +407,7 @@ class BandWindow:
     def _hide(self):
         """Nothing to show: hide the window if one is up, else do nothing."""
         if self.hwnd and self._shown:
+            self._step = "show"
             if not self._backend().show(self.hwnd, False):
                 return self._failed()
             self._shown = False
@@ -313,9 +416,18 @@ class BandWindow:
     def _create(self, win32, x, y, w, h):
         """Create the (hidden) window. Refuses an owner that is not this
         process's own window - the compliance gate, asked BEFORE anything is
-        created. A garbage owner never reaches the backend at all."""
+        created. A garbage owner never reaches the backend at all.
+
+        Where the new window lands in the z-order (measured on a hidden
+        desktop, 2026-10-13): at the HEAD of the topmost band - above its
+        tile, but also above any neighbour stacked over that tile. It sits
+        DIRECTLY above its own tile only from the tile's next re-top on (the
+        preview tick's retop batch: at the latest the 2 s heartbeat). Nothing
+        here re-stacks it sooner - that would break FPS invariant 1."""
+        self._step = "owner"
         if self._owner <= 0 or not win32.is_own_window(self._owner):
             return False
+        self._step = "create"
         self.hwnd = _int_or(win32.create(self._owner, x, y, w, h), 0)
         self._forget()
         return bool(self.hwnd)
@@ -325,10 +437,7 @@ class BandWindow:
         None when the backend hands back a row of the wrong size."""
         parts = []
         for line, (_y, h) in zip(lines, layout.rows):
-            # A row the 60 % cap squeezed must not be handed a glyph taller
-            # than itself (it would show the middle slice of the letters).
-            # Rows at their requested height are untouched by this.
-            font_px = max(1, min(_int_or(line.font_px, h), h))
+            font_px = max(1, min(_int_or(line.font_px, h), _glyph_px_max(h)))
             align = "center" if line.align == "center" else "w"
             text = "" if line.text is None else str(line.text)
             coverage = win32.render_coverage(w, h, text, font_px, align)
@@ -339,11 +448,26 @@ class BandWindow:
                 _ALERT_BG_ALPHA if line.alert else BAND_BG_ALPHA))
         return b"".join(parts)
 
-    def _failed(self):
-        """A backend call failed. The band is OWNED, so it dies with its
-        tile's window: if the hwnd is gone, forget it, and the next sync
-        creates a fresh window instead of pushing to a dead handle forever.
-        Returns False (the sync result)."""
+    def _failed(self, exc=None):
+        """A step failed (or raised `exc`): record last_failure, then - the
+        band is OWNED, so it dies with its tile's window - if the hwnd is
+        gone, forget it, and the next sync creates a fresh window instead of
+        pushing to a dead handle forever. Returns False (the sync result)."""
+        why = self._step
+        if exc is not None:
+            why += " raised " + type(exc).__name__
+        else:
+            why += " failed"
+        code = 0
+        if self._step != "request":     # a backend exists past this step
+            try:
+                # Read BEFORE the liveness probe below can overwrite it.
+                code = int(getattr(self._backend(), "last_error",
+                                   lambda: 0)() or 0)
+            except Exception:
+                code = 0
+        if code:
+            why += " (win32 error %d)" % code
         if self.hwnd:
             try:
                 alive = bool(self._backend().is_window(self.hwnd))
@@ -352,11 +476,19 @@ class BandWindow:
             if not alive:
                 self.hwnd = 0
                 self._forget()
+                why += ", window gone"
+        # ASCII only, whatever a class name holds (it reaches a shared log).
+        self.last_failure = "".join(
+            c if " " <= c <= "~" else "?" for c in why)[:120]
         return False
 
     def destroy(self) -> None:
         """Remove the window. Idempotent, never raises; hwnd == 0 afterwards.
-        A later sync() starts over with a new window."""
+        A later sync() starts over with a new window.
+
+        Tk-thread (owner-thread) only: the real backend removes only a window
+        of the calling thread, so from any other thread this zeroes `hwnd`
+        and leaves the window orphaned until its owner dies."""
         hwnd, self.hwnd = self.hwnd, 0
         self._forget()
         if hwnd:
@@ -507,10 +639,22 @@ class _RealBandWin32:  # pragma: no cover - the one real-Win32 test + live use
         return bool(hwnd) and bool(self._user32.IsWindow(hwnd))
 
     # -- the window ----------------------------------------------------------
+    def last_error(self) -> int:
+        """The Win32 error code of the last failed call in this backend's
+        current method (0 = none recorded). Each acting method clears it on
+        entry, so a stale code from an earlier call is never reported."""
+        return int(self._ctypes.get_last_error())
+
+    def _clear_error(self):
+        self._ctypes.set_last_error(0)
+
     def create(self, owner_hwnd, x, y, w, h) -> int:
         """A hidden popup owned by `owner_hwnd`; 0 on failure or a foreign
         owner. Class "Static" so no Python window procedure exists. Being
-        owned by a topmost tile it is created topmost, directly above it."""
+        owned by a topmost tile it is created topmost - at the HEAD of the
+        topmost band, NOT necessarily directly above its tile: it gets there
+        on the tile's next re-top (see BandWindow._create)."""
+        self._clear_error()
         if not self._own(owner_hwnd):
             return 0
         hwnd = self._user32.CreateWindowExW(
@@ -525,6 +669,7 @@ class _RealBandWin32:  # pragma: no cover - the one real-Win32 test + live use
         DC and bitmap built here are freed before returning. Changes the
         window's position and size, never its place in the z-order."""
         ct, wt, g = self._ctypes, self._wt, self._gdi32
+        self._clear_error()
         w, h = int(w), int(h)
         n = w * h * 4
         if w < 1 or h < 1 or len(bgra) != n or not self._own(hwnd):
@@ -559,6 +704,7 @@ class _RealBandWin32:  # pragma: no cover - the one real-Win32 test + live use
     def move(self, hwnd, x, y) -> bool:
         """Move only. NOZORDER is THE invariant: the band is never re-stacked
         by our code, it rides its owner."""
+        self._clear_error()
         if not self._own(hwnd):
             return False
         return bool(self._user32.SetWindowPos(
@@ -568,6 +714,7 @@ class _RealBandWin32:  # pragma: no cover - the one real-Win32 test + live use
     def show(self, hwnd, visible) -> bool:
         """Show without activating, or hide. ShowWindow's return value is the
         PREVIOUS visibility, not success, so the result is read back."""
+        self._clear_error()
         if not self._own(hwnd):
             return False
         self._user32.ShowWindow(
@@ -588,8 +735,11 @@ class _RealBandWin32:  # pragma: no cover - the one real-Win32 test + live use
         GDI draws WHITE text on a zeroed 32-bit bitmap with greyscale
         antialiasing, so any colour channel of the result IS the coverage.
         The DC, the bitmap and the font all live only inside this call and
-        are released in the finally - a failure half-way leaks nothing."""
+        are released in the finally - a failure half-way leaks nothing. A
+        failed DrawTextW (it returns 0) raises OSError: a blank row must never
+        be reported as drawn text."""
         ct, wt, g = self._ctypes, self._wt, self._gdi32
+        self._clear_error()
         w, h = int(w), int(h)
         if w < 1 or h < 1:
             return b""
@@ -622,7 +772,8 @@ class _RealBandWin32:  # pragma: no cover - the one real-Win32 test + live use
                 flags = (self.DT_VCENTER | self.DT_SINGLELINE | self.DT_NOPREFIX
                          | self.DT_END_ELLIPSIS
                          | (self.DT_CENTER if align == "center" else 0))
-                self._user32.DrawTextW(hdc, text, -1, ct.byref(rc), flags)
+                if not self._user32.DrawTextW(hdc, text, -1, ct.byref(rc), flags):
+                    raise OSError("DrawTextW failed")
             g.GdiFlush()
             return ct.string_at(bits, n)[2::4]
         finally:

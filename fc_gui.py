@@ -20524,9 +20524,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # Where a tile draws its bottom text (label, location, decloak banner):
         # "caption" = strips below the video (every earlier build's layout),
         # "over_video" = a translucent band over the picture (preview_band;
-        # Windows only). Read ONLY through _preview_text_band_wanted: anything
-        # but the exact string "over_video" is "caption". The band's text has
-        # its own colour key; preview_band owns the default hex.
+        # Windows only). Read ONLY through _preview_text_band_wanted (rule in
+        # preview_band): anything but the exact string "over_video" is
+        # "caption", never written back. preview_band owns the colour default.
         "text_placement": "caption",
         "text_over_video_color": preview_band.TEXT_COLOR_DEFAULT,
         "show_role_chip": True,
@@ -21915,18 +21915,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         if save:
             self._save_config()
 
+    # 'Label text' switch readers: the pure rule lives in preview_band; only the
+    # Wine probe stays here. Called class-qualified: no harness bind entry.
     @staticmethod
     def _preview_text_band_wanted(cfg):
-        """True iff config asks for the bottom text on a band OVER the video
-        ('Label text' = 'Text over video'). The ONE reader of
-        preview.text_placement: only the exact string "over_video" counts -
-        any other value or type (a hand-edited list, number, null,
-        "OVER_VIDEO") is "caption", the strips. Never raises, never writes."""
-        try:
-            value = cfg.get("text_placement")
-        except Exception:
-            return False
-        return isinstance(value, str) and value == "over_video"
+        return preview_band.text_band_wanted(cfg)
 
     @staticmethod
     def _preview_text_band_supported():
@@ -21938,14 +21931,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
     @staticmethod
     def _preview_text_band_effective(cfg, thumb_backend=None):
-        """The layout tiles actually get: wanted AND a Windows (DWM) preview.
-        `thumb_backend` is the caller's `_preview_thumb_backend`; non-None =
-        the X11 helper, where a tile refuses the band anyway. The style, fit
-        and compose passes all ask HERE, so they cannot disagree. Called
-        class-qualified (as its two helpers are): no harness bind entry."""
-        return (thumb_backend is None
-                and FCToolGUI._preview_text_band_wanted(cfg)
-                and FCToolGUI._preview_text_band_supported())
+        # thumb_backend = the caller's _preview_thumb_backend (non-None = X11).
+        return preview_band.text_band_effective(
+            cfg, on_wine=not FCToolGUI._preview_text_band_supported(),
+            thumb_backend_is_none=thumb_backend is None)
 
     @staticmethod
     def _preview_expected_bottom_h(cfg, font_size, is_login=False,
@@ -22101,8 +22090,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 ask = getattr(tile, "fitted_body_h", None)
                 if not callable(ask):
                     continue                  # a fake/legacy tile: nothing to ask
+                # Per-tile truth: a band-faulted tile (text_band False) is back
+                # on strips; a tile without the attribute follows the config.
                 target = ask(bottom_h=self._preview_expected_bottom_h(
-                    cfg, font_size, client.is_login, text_band=text_band))
+                    cfg, font_size, client.is_login,
+                    text_band=text_band and getattr(tile, "text_band", True)))
                 if target is None:
                     continue                  # undeterminable → leave it alone
                 w, _cur = self._preview_resolve_size(cfg, client.key)
@@ -23042,11 +23034,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # or ('Text over video') on its own band over the picture; no topmost
         # overlay is driven either way. On the band the text takes its OWN
         # colour key - resolved ONCE, outside the per-tile try, through
-        # normalize_hex_color (never raises; garbage reads as the default).
-        bottom_color = ocfg.get("color", "#ffffff")
+        # normalize_hex_color (never raises; garbage reads as the default) -
+        # per tile, as in the fit pass: a band-faulted tile keeps the overlay's.
+        overlay_color = ocfg.get("color", "#ffffff")
+        band_color = None
         if FCToolGUI._preview_text_band_effective(
                 cfg, getattr(self, "_preview_thumb_backend", None)):
-            bottom_color = normalize_hex_color(
+            band_color = normalize_hex_color(
                 cfg.get("text_over_video_color"),
                 preview_band.TEXT_COLOR_DEFAULT)
         try:
@@ -23081,6 +23075,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 client, state, rules, overrides_norm, role_chip, tag_index,
                 doctrine_tag_captions)
             try:
+                bottom_color = (band_color if band_color is not None
+                                and getattr(tile, "text_band", True)
+                                else overlay_color)
                 if do_strip:
                     tile.set_caption(name, dot, chip, activity)
                 # Bottom-strip activity label: '<label> - <ShipType>'. Login
@@ -23892,8 +23889,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             except Exception:
                 pass
             # NOTE: native mode NEVER re-tops the OverlayWindow. The activity label
-            # now lives in each tile's bottom strip (set_bottom_label); driving a
-            # topmost overlay per tick was the in-game lag source and is retired.
+            # is drawn by each tile (its bottom strip, or its own band;
+            # set_bottom_label); driving a topmost overlay per tick was the
+            # in-game lag source and is retired.
             # A lingering overlay from a prior eveo session is already withdrawn by
             # _preview_teardown's set_labels([]) on the mode switch.
             # Publish the current client set BEFORE draining hotkeys / composing
@@ -26189,7 +26187,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             relief=tk.RIDGE, command=self._overlay_cycle_color)
         self._overlay_color_btn.grid(row=0, column=3, padx=(0, 16))
         _tip(self._overlay_color_btn,
-             "Click to cycle the colour of the on-video label text.")
+             "Click to cycle the label text colour (Eve-O labels, and "
+             "FCPreview's Caption strips; 'Text over video' uses its own "
+             "Text color).")
 
         self._overlay_anchor_label = tk.Label(
             row2, text="Position", font=("Consolas", 10), fg=FG_TEXT,
@@ -26206,9 +26206,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                                         lambda e: self._overlay_apply_style())
         _tip(self._overlay_anchor_combo,
              "Which corner the label sits in — applies to Eve-O Preview "
-             "Enhancement mode only (FCPreview uses fixed bottom strips).")
+             "Enhancement mode only (FCPreview always draws it at the bottom "
+             "of each tile).")
         # Anchor only affects EVE-O-Enhancement thumbnails; native tiles draw the
-        # label/location in fixed bottom strips. Grey it out when mode == native.
+        # label/location at the bottom of the tile (strips, or the 'Text over
+        # video' band). Grey it out when mode == native.
         self._preview_sync_anchor_enabled()
 
         # Row 3 (shared): Label rules… button (rules + manual tags modal). Native
@@ -26478,10 +26480,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # -- Display > row 3 (native): WHERE that bottom text is drawn --------
         # A two-segment switch on ONE StringVar (preview.text_placement) plus
         # the band's text colour; both vars ride _PREVIEW_NATIVE_VARS. SEED
-        # POLICY: only the exact stored "over_video", and only where the band
-        # exists (not under Wine), shows 'Text over video'. Anything else
-        # shows 'Caption' and is NOT written back - the apply's shadow is
-        # snapshotted from this var, so an untouched switch never writes.
+        # POLICY: 'Text over video' only where _preview_text_band_wanted says
+        # so and the band exists (not under Wine); else 'Caption', NOT
+        # written back - the apply's shadow is snapshotted from this var, so
+        # an untouched switch never writes.
         # Runs inside __init__ before any heal: nothing here may raise.
         rowNText = tk.Frame(cat_display, bg=BG_DARK)
         rowNText.pack(fill=tk.X, pady=2)
@@ -26515,6 +26517,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 command=self._preview_apply_native_state, font=("Consolas", 10),
                 fg=FG_TEXT, bg=BG_ENTRY, selectcolor=BG_SELECT,
                 activebackground=BG_ENTRY, activeforeground=FG_TEXT,
+                disabledforeground=FG_DIM,    # readable greyed under Wine
                 offrelief=tk.RIDGE, bd=1, padx=8, pady=1, cursor="hand2")
             seg.grid(row=0, column=_col, padx=(0, 0 if _col == 1 else 16))
             w.append(seg)
@@ -27459,9 +27462,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         """Grey out the shared Position (anchor) control in native mode.
 
         The anchor corner only affects Eve-O Preview Enhancement mode (labels drawn
-        on EVE-O's own thumbnails). Native FCPreview tiles render label + location in
-        fixed bottom strips, so the anchor does nothing there — disable it to signal
-        that. Size/Color still apply to native and stay enabled."""
+        on EVE-O's own thumbnails). Native FCPreview tiles render label + location
+        at the bottom of the tile (strips, or the 'Text over video' band), so the
+        anchor does nothing there - disable it to signal that. Size still applies
+        to native, Color to its Caption layout; both stay enabled."""
         combo = getattr(self, "_overlay_anchor_combo", None)
         if combo is None:
             return
