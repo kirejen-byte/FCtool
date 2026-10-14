@@ -28,7 +28,9 @@ on every tick.
 Layers, top to bottom of the file:
   * pure functions - text_band_wanted / text_band_effective (the 'Label
     text' switch's config rule, read by fc_gui), layout_band (row
-    rectangles) and compose_pixels (glyph coverage -> premultiplied BGRA).
+    rectangles), compose_pixels (glyph coverage -> premultiplied BGRA on the
+    band background) and compose_outlined (the same with no background and
+    a 1 px black outline - a BandLine with outline=True).
     No window, no ctypes; importable anywhere.
   * BandWindow - one band for one tile, every Win32 call behind an injectable
     backend (win32=), the preview_tile / eveo_overlay house pattern.
@@ -118,7 +120,11 @@ class BandLine:
     `text` is ALREADY fitted by the caller (shrunk / ellipsized); `font_px` is
     the glyph height in physical px; `height` the row height in px. `alert`
     marks the decloak banner row: opaque `bg`, where a normal row draws `bg`
-    at BAND_BG_ALPHA. Frozen, so a tuple of lines is a comparable mirror key."""
+    at BAND_BG_ALPHA. `outline` (only the real bool True counts) drops a
+    NORMAL row's background: the text sits on the video with a 1 px black
+    outline round its glyphs (compose_outlined); an alert row ignores it and
+    keeps its opaque `bg`. Frozen, so a tuple of lines is a comparable mirror
+    key - `outline` included, so flipping it re-renders once."""
     text: str
     font_px: int
     height: int
@@ -126,6 +132,7 @@ class BandLine:
     alert: bool = False
     bg: str = "#000000"
     align: str = "w"                # "w" or "center"
+    outline: bool = False           # appended LAST: positional calls unchanged
 
 
 @dataclass(frozen=True)
@@ -279,6 +286,58 @@ def compose_pixels(coverage, fg, bg, bg_alpha):
     out[2::4] = coverage.translate(channel(fr, br))
     out[3::4] = coverage.translate(
         bytes((c * 255 + a0 * (255 - c) + 127) // 255 for c in range(256)))
+    return bytes(out)
+
+
+def compose_outlined(coverage, w, h, fg):
+    """Glyph coverage -> premultiplied BGRA with NO background and a 1 px
+    black outline round the glyphs, 4 bytes per coverage byte, top-down. Pure.
+
+    `coverage` is one row's w * h bytes, top-down. `ring` is its 3 x 3
+    max-dilation (edges clamped: a pixel's neighbours stop at the row's own
+    edges, nothing wraps from one pixel row to the next). Per pixel, with
+    c the coverage and k the ring:
+        alpha  = c + k * (255 - c) // 255     (integer; exact at 0 and 255)
+        colour = fg * c / 255, rounded        (premultiplied; black adds 0)
+    so no ink anywhere near -> fully transparent, a pixel next to ink -> black
+    at the ink's alpha, full ink -> fg at alpha 255. Every channel <= alpha
+    (colour <= c <= alpha). A garbage `fg` draws white, as in compose_pixels.
+
+    Never raises. A garbage size (w or h not a plain int in 1.._MAX_SIZE_PX,
+    or w * h over _MAX_SIZE_PX) -> b"". A coverage that is not exactly w * h
+    bytes (wrong length, not bytes-like) -> the fully TRANSPARENT row of the
+    right size: an empty row, never an exception. (BandWindow checks the
+    length itself first and calls a wrong-sized render a failure, so it
+    never reaches that fallback.)
+
+    Fast enough to need no per-pixel 3 x 3 loop: the dilation is two passes
+    of bytes(map(max, ...)) over shifted copies (horizontal per pixel row,
+    then vertical over the whole buffer), the colour is bytes.translate."""
+    w, h = _size_or_none(w), _size_or_none(h)
+    if w is None or h is None or w * h > _MAX_SIZE_PX:
+        return b""
+    n = w * h
+    try:
+        # bytes(7) is seven zeros, not coverage: an int is garbage too
+        coverage = b"" if isinstance(coverage, int) else bytes(coverage)
+    except Exception:
+        coverage = b""
+    if len(coverage) != n:
+        return bytes(4 * n)
+    fr, fgr, fb = _parse_hex(fg, _FG_FALLBACK)
+    zero = b"\x00"
+    rows = [coverage[i:i + w] for i in range(0, n, w)]
+    # horizontal: each pixel row against itself shifted one px left / right
+    across = b"".join(bytes(map(max, row, zero + row[:-1], row[1:] + zero))
+                      for row in rows)
+    # vertical: the whole buffer against itself shifted one pixel row up / down
+    pad = bytes(w)
+    ring = bytes(map(max, across, pad + across[:-w], across[w:] + pad))
+    out = bytearray(4 * n)
+    out[0::4] = coverage.translate(bytes((fb * c + 127) // 255 for c in range(256)))
+    out[1::4] = coverage.translate(bytes((fgr * c + 127) // 255 for c in range(256)))
+    out[2::4] = coverage.translate(bytes((fr * c + 127) // 255 for c in range(256)))
+    out[3::4] = bytes([c + k * (255 - c) // 255 for c, k in zip(coverage, ring)])
     return bytes(out)
 
 
@@ -490,6 +549,10 @@ class BandWindow:
             coverage = win32.render_coverage(w, h, text, font_px, align)
             if len(coverage) != w * h:
                 return None
+            if line.outline is True and not line.alert:
+                # no background: the text on the video, outlined in black
+                parts.append(compose_outlined(coverage, w, h, line.fg))
+                continue
             parts.append(compose_pixels(
                 coverage, line.fg, line.bg,
                 _ALERT_BG_ALPHA if line.alert else BAND_BG_ALPHA))
