@@ -124,7 +124,10 @@ class BandLine:
     NORMAL row's background: the text sits on the video with a 1 px black
     outline round its glyphs (compose_outlined); an alert row ignores it and
     keeps its opaque `bg`. Frozen, so a tuple of lines is a comparable mirror
-    key - `outline` included, so flipping it re-renders once."""
+    key - `outline` included, so flipping it re-renders once. `outline` is
+    stored as `outline is True` (a 1, "yes" or None reads False): the key
+    compares with ==, where 1 == True, so an un-normalised 1 would keep the
+    outlined pixels of an earlier True while drawing a plain row's rule."""
     text: str
     font_px: int
     height: int
@@ -133,6 +136,9 @@ class BandLine:
     bg: str = "#000000"
     align: str = "w"                # "w" or "center"
     outline: bool = False           # appended LAST: positional calls unchanged
+
+    def __post_init__(self):
+        object.__setattr__(self, "outline", self.outline is True)
 
 
 @dataclass(frozen=True)
@@ -304,41 +310,63 @@ def compose_outlined(coverage, w, h, fg):
     (colour <= c <= alpha). A garbage `fg` draws white, as in compose_pixels.
 
     Never raises. A garbage size (w or h not a plain int in 1.._MAX_SIZE_PX,
-    or w * h over _MAX_SIZE_PX) -> b"". A coverage that is not exactly w * h
-    bytes (wrong length, not bytes-like) -> the fully TRANSPARENT row of the
-    right size: an empty row, never an exception. (BandWindow checks the
-    length itself first and calls a wrong-sized render a failure, so it
-    never reaches that fallback.)
+    or w * h over _MAX_SIZE_PX) -> b"". A coverage that is not bytes,
+    bytearray or memoryview (a str, a list, an int, None) -> b"" too: the
+    wrong length for any real size, so BandWindow's render calls it a failure
+    instead of drawing nothing. A bytes-like coverage that is not exactly
+    w * h bytes -> the fully TRANSPARENT row of the right size. (BandWindow
+    checks the coverage length itself first, so it never reaches that.)
 
     Fast enough to need no per-pixel 3 x 3 loop: the dilation is two passes
     of bytes(map(max, ...)) over shifted copies (horizontal per pixel row,
-    then vertical over the whole buffer), the colour is bytes.translate."""
+    then vertical over the whole buffer), the colour is bytes.translate. And
+    only over the INK'S COLUMN SPAN, one column wider each side (the ring's
+    reach): every pixel outside it is transparent zero bytes, so a short
+    name on a wide zoomed row costs its own width, and a row with no ink at
+    all costs one scan. Zero padding at the span's edges is exact - beyond
+    it lies either the row's own edge or a column with no ink."""
     w, h = _size_or_none(w), _size_or_none(h)
     if w is None or h is None or w * h > _MAX_SIZE_PX:
         return b""
-    n = w * h
+    if not isinstance(coverage, (bytes, bytearray, memoryview)):
+        return b""
     try:
-        # bytes(7) is seven zeros, not coverage: an int is garbage too
-        coverage = b"" if isinstance(coverage, int) else bytes(coverage)
-    except Exception:
-        coverage = b""
+        coverage = bytes(coverage)
+    except Exception:                   # e.g. a released memoryview
+        return b""
+    n = w * h
     if len(coverage) != n:
         return bytes(4 * n)
-    fr, fgr, fb = _parse_hex(fg, _FG_FALLBACK)
     zero = b"\x00"
     rows = [coverage[i:i + w] for i in range(0, n, w)]
+    # the ink's columns: lo = the leftmost, hi = one past the rightmost
+    lo, hi = w, 0
+    for row in rows:
+        lo = min(lo, w - len(row.lstrip(zero)))
+        hi = max(hi, len(row.rstrip(zero)))
+    if hi == 0:
+        return bytes(4 * n)             # no ink anywhere: fully transparent
+    a, b = max(0, lo - 1), min(w, hi + 1)
+    sw = b - a
+    rows = [row[a:b] for row in rows]
+    span = b"".join(rows)
     # horizontal: each pixel row against itself shifted one px left / right
     across = b"".join(bytes(map(max, row, zero + row[:-1], row[1:] + zero))
                       for row in rows)
-    # vertical: the whole buffer against itself shifted one pixel row up / down
-    pad = bytes(w)
-    ring = bytes(map(max, across, pad + across[:-w], across[w:] + pad))
-    out = bytearray(4 * n)
-    out[0::4] = coverage.translate(bytes((fb * c + 127) // 255 for c in range(256)))
-    out[1::4] = coverage.translate(bytes((fgr * c + 127) // 255 for c in range(256)))
-    out[2::4] = coverage.translate(bytes((fr * c + 127) // 255 for c in range(256)))
-    out[3::4] = bytes([c + k * (255 - c) // 255 for c, k in zip(coverage, ring)])
-    return bytes(out)
+    # vertical: the whole span against itself shifted one pixel row up / down
+    pad = bytes(sw)
+    ring = bytes(map(max, across, pad + across[:-sw], across[sw:] + pad))
+    fr, fgr, fb = _parse_hex(fg, _FG_FALLBACK)
+    part = bytearray(4 * sw * h)
+    part[0::4] = span.translate(bytes((fb * c + 127) // 255 for c in range(256)))
+    part[1::4] = span.translate(bytes((fgr * c + 127) // 255 for c in range(256)))
+    part[2::4] = span.translate(bytes((fr * c + 127) // 255 for c in range(256)))
+    part[3::4] = bytes([c + k * (255 - c) // 255 for c, k in zip(span, ring)])
+    if sw == w:
+        return bytes(part)
+    left, right, step = bytes(4 * a), bytes(4 * (w - b)), 4 * sw
+    return b"".join(left + part[i:i + step] + right
+                    for i in range(0, len(part), step))
 
 
 def _glyph_px_max(row_h):
@@ -540,7 +568,8 @@ class BandWindow:
 
     def _render(self, win32, w, layout, lines):
         """Every row's pixels, top-down, as one premultiplied BGRA buffer - or
-        None when the backend hands back a row of the wrong size."""
+        None when the backend hands back a row of the wrong size (or, for an
+        outlined row, one compose_outlined refuses - not bytes-like)."""
         parts = []
         for line, (_y, h) in zip(lines, layout.rows):
             font_px = max(1, min(_int_or(line.font_px, h), _glyph_px_max(h)))
@@ -551,7 +580,10 @@ class BandWindow:
                 return None
             if line.outline is True and not line.alert:
                 # no background: the text on the video, outlined in black
-                parts.append(compose_outlined(coverage, w, h, line.fg))
+                part = compose_outlined(coverage, w, h, line.fg)
+                if len(part) != 4 * w * h:
+                    return None         # e.g. a str "coverage" of the right length
+                parts.append(part)
                 continue
             parts.append(compose_pixels(
                 coverage, line.fg, line.bg,
