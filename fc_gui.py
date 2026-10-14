@@ -20529,6 +20529,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # "caption", never written back. preview_band owns the colour default.
         "text_placement": "caption",
         "text_over_video_color": preview_band.TEXT_COLOR_DEFAULT,
+        # 'Band background' (Text over video only): False = no band, the text
+        # outlined on the video. Read ONLY through _preview_band_background_wanted:
+        # only the exact False turns the band off.
+        "text_band_background": True,
         "show_role_chip": True,
         "intel_flash": False, "intel_flash_color": "#ff3b30",
         "intel_flash_secs": 10, "intel_report_types": ["hostile"],
@@ -21243,6 +21247,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # 'Label text' switch: push the EFFECTIVE bottom-text layout (band or
         # strips). An unchanged call is one compare on the tile, and this runs
         # BEFORE the tick's compose pass, so the text moves in the same tick.
+        # 'Band background' first: in the strips layout it is only stored, so
+        # a band coming up below is drawn right the first time (one sync).
+        set_bg = getattr(tile, "set_band_background", None)
+        if set_bg is not None:
+            set_bg(FCToolGUI._preview_band_background_wanted(cfg))
         set_band = getattr(tile, "set_text_band", None)
         if set_band is not None:
             set_band(FCToolGUI._preview_text_band_effective(
@@ -21935,6 +21944,16 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         return preview_band.text_band_effective(
             cfg, on_wine=not FCToolGUI._preview_text_band_supported(),
             thumb_backend_is_none=thumb_backend is None)
+
+    @staticmethod
+    def _preview_band_background_wanted(cfg):
+        """'Band background' - the ONE reader of preview.text_band_background:
+        only the exact False means "no band" (text outlined on the video); any
+        other value or type is today's band. Never raises, never writes."""
+        try:
+            return cfg.get("text_band_background") is not False
+        except Exception:
+            return True
 
     @staticmethod
     def _preview_expected_bottom_h(cfg, font_size, is_login=False,
@@ -26546,10 +26565,32 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         w.append(sw_band)
         _tip(sw_band, _band_color_tip)
         self._preview_text_over_video_color_swatch = sw_band
+        # 'Band background', on its own line right under the switch (the row
+        # above is cell-pinned). Swatch-gated; the seed is display-only (only
+        # a stored False unticks), so an untouched box never writes.
+        rowNTextBg = tk.Frame(cat_display, bg=BG_DARK)
+        rowNTextBg.pack(fill=tk.X, pady=2)
+        self._preview_band_background_var = tk.BooleanVar(
+            value=FCToolGUI._preview_band_background_wanted(pcfg))
+        cb_band_bg = tk.Checkbutton(
+            rowNTextBg, text="Band background",
+            variable=self._preview_band_background_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cb_band_bg.grid(row=0, column=0, padx=(0, 16), sticky=tk.W)
+        w.append(cb_band_bg)
+        _tip(cb_band_bg,
+             "Ticked: the text sits on a translucent dark band. Unticked: no "
+             "band - the text is drawn straight over the video with a thin "
+             "black outline so it stays readable. The DECLOAKED banner always "
+             "keeps its yellow background. Only used by 'Text over video'."
+             + _band_wine_tip)
+        self._preview_band_background_check = cb_band_bg
         # Second gate (Wine), applied by _preview_sync_native_widgets AFTER its
         # bulk loop - the Tile "h" Spinbox pattern.
         self._preview_text_band_widgets = (
-            *self._preview_text_placement_buttons.values(), sw_band)
+            *self._preview_text_placement_buttons.values(), sw_band, cb_band_bg)
 
         # ── Display ▸ row 4 (native): markers drawn on the tile itself ───────
         rowNMark = tk.Frame(cat_display, bg=BG_DARK)
@@ -27571,6 +27612,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # untouched control over a hand-edited value never writes it back.
         ("_preview_text_placement_var", "text_placement", str),
         ("_preview_text_over_video_color_var", "text_over_video_color", str),
+        ("_preview_band_background_var", "text_band_background", bool),
         ("_preview_highlight_var", "highlight_active", bool),
         ("_preview_lock_var", "lock_layout", bool),
         ("_preview_snap_var", "snap_enabled", bool),

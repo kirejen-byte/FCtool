@@ -17,6 +17,8 @@ Design (spec §5):
   popup, a SEPARATE window owned by this tile and drawn over the bottom of the
   body, so the text costs the picture no height. The tile fits the text either
   way; _sync_band() is the one place it tells the band where the tile is.
+  set_band_background(False) drops the band's dark background: the normal
+  lines are then drawn on the video with a thin black outline.
 - Placement is ONLY via win32.set_window_pos(GA_ROOT, x, y, w, h) in physical px —
   never Tk geometry (Tk geometry is logical px under PMv2 and would misplace).
 - Mouse model (EVE-O parity): LEFT on the BODY acts on PRESS — activate (Ctrl =
@@ -561,6 +563,9 @@ class TileWindow:
         # need; tests inject a recording fake.
         self._band_factory = band_factory
         self._text_band = False       # EFFECTIVE layout: True = band, False = strips
+        # 'Band background' (set_band_background): True = normal lines sit on
+        # the translucent band; False = no band, each one outlined in black.
+        self._band_background = True
         self._band_off = False        # latched by a band fault (or destroy()):
                                       # strips for the rest of this tile's life
         self._band = None             # the band object; None until first NEEDED
@@ -2182,6 +2187,23 @@ class TileWindow:
             self._replay_strips()
         return self._text_band
 
+    def set_band_background(self, on) -> None:
+        """'Band background': True (the default) = the band's normal lines sit
+        on its translucent dark background; False = no background, each
+        normal line is drawn straight over the video with a 1 px black outline
+        (BandLine.outline). The DECLOAKED alert line keeps its opaque yellow
+        either way. Only the real bool False turns the band off - any other
+        value is today's band, as fc_gui's config reader decides.
+
+        A per-tick setter: an unchanged call is one compare (no Tk call, no
+        band call). In the band layout a change re-syncs the band once; in the
+        strips layout the flag is only stored, for when the band comes up."""
+        want = on is not False
+        if want == self._band_background:
+            return
+        self._band_background = want
+        self._sync_band()             # a no-op in the strips layout
+
     def band_lines(self):
         """The lines the band is asked to show right now, top-down, as a tuple
         of preview_band.BandLine - () in the strips layout or with nothing to
@@ -2279,16 +2301,20 @@ class TileWindow:
         then the location. Colour-agnostic like the strips: a line is drawn in
         whatever colour its caller passed, the panel fg when it passed none."""
         lines = []
+        # 'Band background' off -> the normal lines are outlined, no band
+        outline = not self._band_background
         if self._alert_req is not None:
             text, size = self._alert_req
             lines.append(self._band_line(text, size, _ALERT_FG, alert=True,
                                          bg=_ALERT_BG, align="center"))
         elif self._label_req is not None:
             text, color, size = self._label_req
-            lines.append(self._band_line(text, size, color or self._fg_text))
+            lines.append(self._band_line(text, size, color or self._fg_text,
+                                         outline=outline))
         if self._location_req is not None:
             text, color, size = self._location_req
-            lines.append(self._band_line(text, size, color or self._fg_text))
+            lines.append(self._band_line(text, size, color or self._fg_text,
+                                         outline=outline))
         return tuple(lines)
 
     def _band_follow(self, x, y):
