@@ -1222,8 +1222,11 @@ class TileWindow:
         h = self._body_h + STRIP_H
         if w <= 0 or h <= 0:
             return None
-        lx = event.x_root - self._pos[0]
-        ly = event.y_root - self._pos[1]
+        # The window's REAL origin: while hover-zoomed on a non-"nw" anchor it
+        # is away from _pos (the pre-zoom origin) though _w/_body_h are zoomed.
+        ox, oy = self._placed_pos if self._placed_pos is not None else self._pos
+        lx = event.x_root - ox
+        ly = event.y_root - oy
         if lx < 0 or ly < 0 or lx > w or ly > h:
             return None
         left = lx <= _CORNER_ZONE
@@ -1398,8 +1401,12 @@ class TileWindow:
         self._press_root = None
         self._mode = None
         if mode == "resize":
+            # A still click never reached the motion handler's settle: take the
+            # zoom off so the reported size is the true one, not the zoomed one.
+            self._settle_zoom()
             self._on_resize_end(self._key, self._w, self._body_h)
         elif not self._lock_layout:
+            self._settle_zoom()   # same, for a still click (no-op after a drag)
             x = self._press_pos[0] + dx
             y = self._press_pos[1] + dy
             x, y = self._maybe_snap(x, y)     # persist the snapped position (see strip release)
@@ -1765,7 +1772,7 @@ class TileWindow:
         self._apply_resting_alpha()
 
     def _apply_zoom(self):
-        if not self._zoom_enabled or self._zoomed or self._dragging():
+        if not self._zoom_enabled or self._zoomed or self.in_gesture:
             return
         rect = (self._pos[0], self._pos[1], self._w, self._body_h)
         self._prezoom_rect = rect
