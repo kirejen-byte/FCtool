@@ -21247,8 +21247,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # 'Label text' switch: push the EFFECTIVE bottom-text layout (band or
         # strips). An unchanged call is one compare on the tile, and this runs
         # BEFORE the tick's compose pass, so the text moves in the same tick.
-        # 'Band background' first: in the strips layout it is only stored, so
-        # a band coming up below is drawn right the first time (one sync).
+        # 'Band background' is pushed first (keep this order). It matters only
+        # when BOTH keys change between two ticks on a tile that already shows
+        # text: the band then comes up below already outlined - one sync, not a
+        # dark-band sync then an outlined one. A spawned tile has no text at
+        # its spawn-time style pass, so either order gives it one sync.
         set_bg = getattr(tile, "set_band_background", None)
         if set_bg is not None:
             set_bg(FCToolGUI._preview_band_background_wanted(cfg))
@@ -26498,7 +26501,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         # -- Display > row 3 (native): WHERE that bottom text is drawn --------
         # A two-segment switch on ONE StringVar (preview.text_placement) plus
-        # the band's text colour; both vars ride _PREVIEW_NATIVE_VARS. SEED
+        # the band's text colour and 'Band background'; all three vars ride
+        # _PREVIEW_NATIVE_VARS. SEED
         # POLICY: 'Text over video' only where _preview_text_band_wanted says
         # so and the band exists (not under Wine); else 'Caption', NOT
         # written back - the apply's shadow is snapshotted from this var, so
@@ -26561,24 +26565,24 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             rowNText, self._preview_text_over_video_color_var, _band_default,
             title="Text over video color",
             on_change=self._preview_apply_native_state)
-        sw_band.grid(row=0, column=4, padx=(0, 8))
+        sw_band.grid(row=0, column=4, padx=(0, 16))
         w.append(sw_band)
         _tip(sw_band, _band_color_tip)
         self._preview_text_over_video_color_swatch = sw_band
-        # 'Band background', on its own line right under the switch (the row
-        # above is cell-pinned). Swatch-gated; the seed is display-only (only
-        # a stored False unticks), so an untouched box never writes.
-        rowNTextBg = tk.Frame(cat_display, bg=BG_DARK)
-        rowNTextBg.pack(fill=tk.X, pady=2)
+        # 'Band background', the last cell of this row (after the swatch).
+        # Swatch-gated; the seed is display-only (only a stored False
+        # unticks), so an untouched box never writes. No TRAILING pad:
+        # nothing follows it on this row.
         self._preview_band_background_var = tk.BooleanVar(
             value=FCToolGUI._preview_band_background_wanted(pcfg))
         cb_band_bg = tk.Checkbutton(
-            rowNTextBg, text="Band background",
+            rowNText, text="Band background",
             variable=self._preview_band_background_var,
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
-            activeforeground=FG_TEXT)
-        cb_band_bg.grid(row=0, column=0, padx=(0, 16), sticky=tk.W)
+            activeforeground=FG_TEXT,
+            disabledforeground=FG_DIM)    # readable greyed under Wine
+        cb_band_bg.grid(row=0, column=5, padx=(0, 0), sticky=tk.W)
         w.append(cb_band_bg)
         _tip(cb_band_bg,
              "Ticked: the text sits on a translucent dark band. Unticked: no "
@@ -27488,10 +27492,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                                            else "disabled"))
             except tk.TclError:
                 pass
-        # Third dependent gate, same shape: under Wine the 'Label text' switch
-        # and its swatch stay greyed in EVERY mode (the band is Win32-only).
-        # Widget STATE only - the var was seeded on 'Caption' at build and the
-        # stored value is never touched.
+        # Third dependent gate, same shape: under Wine the 'Label text' switch,
+        # its swatch and the 'Band background' checkbox stay greyed in EVERY
+        # mode (the band is Win32-only). Widget STATE only - the vars were
+        # seeded at build and the stored values are never touched.
         if not FCToolGUI._preview_text_band_supported():
             for widget in getattr(self, "_preview_text_band_widgets", ()):
                 try:

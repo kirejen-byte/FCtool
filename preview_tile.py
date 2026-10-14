@@ -2330,9 +2330,9 @@ class TileWindow:
         talks to its band; a no-op in the strips layout.
 
         Reached from everything the band depends on - the three text setters,
-        set_text_band, set_alpha (after a successful write), hide(), and every
-        placement through _band_follow (place, show, zoom in / out, each drag
-        and resize motion).
+        set_text_band, set_band_background, set_alpha (after a successful
+        write), hide(), and every placement through _band_follow (place,
+        show, zoom in / out, each drag and resize motion).
 
         NEVER raises. Callers include place() and the per-tick setters, and an
         exception escaping into fc_gui's per-tile `try` retires the tile (five
