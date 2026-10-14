@@ -29901,9 +29901,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         return self._preview_char_accounts().get(key, "")
 
     def _preview_effective_account_of(self, char_key) -> str:
-        """The account this character is EFFECTIVELY on: the manual
-        char_accounts label if the user set one, else the observed account's
-        label from the ground-truth map, else "".
+        """The account this character is EFFECTIVELY on, three steps in order:
+        (1) the character's own manual char_accounts label; (2) else a manual
+        label carried by a DIFFERENT character on the same observed account
+        (the sorted-first labelled sibling wins when they disagree), so an
+        unlabelled alt shares its hand-labelled main's slot; (3) else the
+        observed account's auto label from the ground-truth map; else "".
 
         The read-time overlay behind auto-grouping (spec §9.3). "Manual wins" is
         STRUCTURAL, not a merge: this NEVER writes an observed account back into
@@ -29928,6 +29931,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             acct = amap.account_for_char(char_key)
             if acct is None:
                 return ""
+            # Same account, same slot: an unlabelled alt on an account that a
+            # DIFFERENT character hand-labelled shares that label (sorted-first
+            # labelled char wins when they disagree). Pure dict pass, no IO; any
+            # fault falls through to the auto label below.
+            try:
+                own = str(char_key).strip().lower()
+                manual_all = self._preview_char_accounts()
+                for other in sorted(manual_all):
+                    if other != own and amap.account_for_char(other) == acct:
+                        return manual_all[other]
+            except Exception:
+                pass
             return amap.label_for_account(acct)
         except Exception:
             return ""
@@ -30099,6 +30114,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # account_slots-off path byte-identical. The map read is the same
         # documented-harmless kind as the label lookup below -- the FLAG gate
         # above stayed RAW, so the per-tick no-write contract is intact.
+        # Representative choice: a LIVE char wins; with none live, a member
+        # carrying a MANUAL label (sorted-first, found via account_for_char ==
+        # id, the same rule as the sibling inheritance) beats the plain
+        # sorted-first sidecar member, so the login shares the hand-labelled
+        # main's slot rather than an unlabelled alt's auto slot.
         if isinstance(char_key, str) and char_key.startswith("login:"):
             amap = getattr(self, "_account_map", None)
             if amap is not None:
@@ -30111,6 +30131,21 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                         rep = amap.any_char_for_account(acct_id)
                     except Exception:
                         rep = None
+                    # No LIVE char on the account: prefer a member carrying a
+                    # manual label (sorted-first among those) over the plain
+                    # sorted-first sidecar member, so the login lands on the
+                    # slot the hand-labelled main uses. Found by the SAME rule
+                    # as the unlabelled-sibling inheritance in
+                    # `_preview_effective_account_of`: account_for_char(k) == id.
+                    try:
+                        if not amap.char_for_account(acct_id):
+                            labelled = sorted(
+                                k for k in self._preview_char_accounts()
+                                if amap.account_for_char(k) == acct_id)
+                            if labelled:
+                                rep = labelled[0]
+                    except Exception:
+                        pass
                     if rep:
                         return self._preview_layout_key(rep)
             return char_key                 # no representative yet -> login:<id>
@@ -30144,11 +30179,17 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         character can own a saved rect without owning a size override and the
         two blocks must each pick the first member that can actually answer.
 
-        The manual grouping is seeded first; a SECOND pass then seeds accounts
-        known only by observation (the read-time overlay, spec §9.3) so an
-        auto-detected alt keeps its hand-placed position on opt-in. That pass
-        reads the ground-truth map only and never writes preview.char_accounts
-        (manual wins, structurally); it is inert when no map is present.
+        The manual grouping is seeded first; a SECOND (observed-only) pass then
+        labels each unlabelled character that has saved geometry and a
+        ground-truth account by its EFFECTIVE account
+        (`_preview_effective_account_of`: a same-account sibling's manual label,
+        sorted-first, before the observed auto label), so an auto-detected alt
+        keeps its hand-placed position on opt-in and lands in the slot the
+        runtime reads. Because manual groups are seeded first, a hand-labelled
+        main's own well-formed entry wins over an alt's for the shared slot.
+        That pass reads the ground-truth map only and never writes
+        preview.char_accounts (manual wins, structurally); it is inert when no
+        map is present.
 
         - An EXISTING slot is never overwritten: the user has already placed
           that account's tile and this is not the moment to move it.
@@ -30181,8 +30222,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # wins" stays structural (manually-labelled keys are skipped, and an
         # already-seeded slot is never overwritten by the unified loop below).
         # Inert without a map, which is why the manual behaviour above is
-        # unchanged for every no-map host. Same manual→observed precedence as
-        # `_preview_effective_account_of`, resolved here in bulk.
+        # unchanged for every no-map host. The label is the EFFECTIVE one
+        # (`_preview_effective_account_of`): a same-account sibling's manual
+        # label (sorted-first labelled sibling) before the observed auto label,
+        # so the seeded slot is exactly the one the runtime reads.
         amap = getattr(self, "_account_map", None)
         if amap is not None:
             manual_keys = set(self._preview_char_accounts())
@@ -30200,10 +30243,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             observed: dict = {}
             for nk in candidates:
                 try:
-                    acct = amap.account_for_char(nk)
-                    if acct is None:
+                    if amap.account_for_char(nk) is None:
                         continue
-                    label = amap.label_for_account(acct)
+                    label = self._preview_effective_account_of(nk)
                 except Exception:
                     continue
                 if label:
