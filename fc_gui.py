@@ -169,6 +169,9 @@ import gamelog_monitor
 from gamelog_monitor import GamelogMonitor
 import preview_tile
 from preview_tile import TileWindow
+# The 'Text over video' band: read here for ONE constant, its default text
+# colour. No Tk / ctypes at import time.
+import preview_band
 # Linux (Proton/Wine) previews. Wine's dwmapi is a permanent E_NOTIMPL stub, so
 # under Wine the tiles' `dwm=` seam is handed a native X11 backend instead:
 # wine_detect reports the runtime facts (is_wine, unix paths, HWND -> X window
@@ -20518,6 +20521,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         "highlight_active": True, "highlight_color": "#00d4ff", "highlight_px": 3,
         "zoom_enabled": False, "zoom_factor": 2.0, "zoom_anchor": "nw",
         "captions": True, "labels_on_video": True, "show_location": True,
+        # Where a tile draws its bottom text (label, location, decloak banner):
+        # "caption" = strips below the video (every earlier build's layout),
+        # "over_video" = a translucent band over the picture (preview_band;
+        # Windows only). Read ONLY through _preview_text_band_wanted: anything
+        # but the exact string "over_video" is "caption". The band's text has
+        # its own colour key; preview_band owns the default hex.
+        "text_placement": "caption",
+        "text_over_video_color": preview_band.TEXT_COLOR_DEFAULT,
         "show_role_chip": True,
         "intel_flash": False, "intel_flash_color": "#ff3b30",
         "intel_flash_secs": 10, "intel_report_types": ["hostile"],
@@ -21229,6 +21240,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             set_style(color=ocfg.get("color", "#ffffff"),
                       size=int(damage_flash.finite_or(ocfg.get("font_size", 11), 11.0)),
                       anchor=ocfg.get("anchor", "top-left"))
+        # 'Label text' switch: push the EFFECTIVE bottom-text layout (band or
+        # strips). An unchanged call is one compare on the tile, and this runs
+        # BEFORE the tick's compose pass, so the text moves in the same tick.
+        set_band = getattr(tile, "set_text_band", None)
+        if set_band is not None:
+            set_band(FCToolGUI._preview_text_band_effective(
+                cfg, getattr(self, "_preview_thumb_backend", None)))
         # BUG B: keep the tile's lock_layout flag in lockstep with config so a
         # live toggle gates drag-moves without respawning the tile.
         set_lock = getattr(tile, "set_lock_layout", None)
@@ -21898,9 +21916,46 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             self._save_config()
 
     @staticmethod
-    def _preview_expected_bottom_h(cfg, font_size, is_login=False):
+    def _preview_text_band_wanted(cfg):
+        """True iff config asks for the bottom text on a band OVER the video
+        ('Label text' = 'Text over video'). The ONE reader of
+        preview.text_placement: only the exact string "over_video" counts -
+        any other value or type (a hand-edited list, number, null,
+        "OVER_VIDEO") is "caption", the strips. Never raises, never writes."""
+        try:
+            value = cfg.get("text_placement")
+        except Exception:
+            return False
+        return isinstance(value, str) and value == "over_video"
+
+    @staticmethod
+    def _preview_text_band_supported():
+        """False under Wine / Proton: the band is a Win32 layered window."""
+        try:
+            return not wine_detect.is_wine()
+        except Exception:
+            return False
+
+    @staticmethod
+    def _preview_text_band_effective(cfg, thumb_backend=None):
+        """The layout tiles actually get: wanted AND a Windows (DWM) preview.
+        `thumb_backend` is the caller's `_preview_thumb_backend`; non-None =
+        the X11 helper, where a tile refuses the band anyway. The style, fit
+        and compose passes all ask HERE, so they cannot disagree. Called
+        class-qualified (as its two helpers are): no harness bind entry."""
+        return (thumb_backend is None
+                and FCToolGUI._preview_text_band_wanted(cfg)
+                and FCToolGUI._preview_text_band_supported())
+
+    @staticmethod
+    def _preview_expected_bottom_h(cfg, font_size, is_login=False,
+                                   text_band=False):
         """The STEADY-STATE total height of a tile's bottom strips, derived from
         CONFIG — never sampled from a live tile.
+
+        `text_band` is the EFFECTIVE 'Text over video' layout
+        (_preview_text_band_effective): the text is drawn on a band over the
+        picture then, no strip is carved out of the body, and the answer is 0.
 
         Sampling is the trap. `set_bottom_label("")` / `set_location_label("")`
         pack_forget their strip, so a tile's real `_bottom_h()` drops by ~20 px
@@ -21922,7 +21977,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         ~40% of the body — both make the real strip SMALLER. This estimate is
         therefore an UPPER bound, and such a tile keeps a few px of residual
         band. That is the deliberate trade: jitter-free beats pixel-exact."""
-        if is_login:
+        if is_login or text_band:
             return 0
         one = preview_tile.strip_h_for(font_size)
         total = 0
@@ -21995,6 +22050,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             font_size = int(self._overlay_cfg().get("font_size", 11))
         except (TypeError, ValueError, AttributeError, OverflowError):
             font_size = 11
+        # 'Text over video' carves no strip out of the body, so the fit expects
+        # 0. Resolved once per pass, from CONFIG. A switch change forces no
+        # pass: heights follow on this cadence, as with 'Show location'.
+        text_band = FCToolGUI._preview_text_band_effective(
+            cfg, getattr(self, "_preview_thumb_backend", None))
         faults = [0]
 
         def _fault(exc, msg, hwnd):
@@ -22042,7 +22102,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 if not callable(ask):
                     continue                  # a fake/legacy tile: nothing to ask
                 target = ask(bottom_h=self._preview_expected_bottom_h(
-                    cfg, font_size, client.is_login))
+                    cfg, font_size, client.is_login, text_band=text_band))
                 if target is None:
                     continue                  # undeterminable → leave it alone
                 w, _cur = self._preview_resolve_size(cfg, client.key)
@@ -22949,11 +23009,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         Two channels (caption-onvideo):
           - the STRIP (name + status dot + role chip) is gated by `captions`;
-          - the ON-VIDEO activity label ('<label> - <ShipType>') is drawn on the
-            tile body at the configured corner, gated by `labels_on_video`. The
-            activity label reuses the same rule/override/doctrine precedence
-            (_preview_caption_parts' `tag`) and is joined with the pilot's ship
-            TYPE name via preview_tile.format_tile_label."""
+          - the BOTTOM activity label ('<label> - <ShipType>'), gated by
+            `labels_on_video`. The TILE decides where it is drawn: a strip
+            below the video or, in the 'Text over video' layout, its band over
+            the picture - this pass calls the same setters either way and only
+            picks the text colour. The activity label reuses the same
+            rule/override/doctrine precedence (_preview_caption_parts' `tag`)
+            and is joined with the pilot's ship TYPE name via
+            preview_tile.format_tile_label."""
         cfg = self._preview_cfg()
         # Fallbacks come from _PREVIEW_DEFAULTS (the single owner), not literals:
         # `labels_on_video` used to fall back to False here while
@@ -22974,10 +23037,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
          overrides_norm) = self._preview_caption_bundle()
         doctrine_tag_captions = bool(cfg.get("doctrine_tag_captions", True))
         show_chip = bool(cfg.get("show_role_chip", True))
-        # Bottom-strip label style (shared with the eveo overlay): config['overlay']
-        # color + font_size. The label now shows in a strip BELOW each tile's video
-        # (set_bottom_label) — never over it — so no topmost overlay is driven.
+        # Bottom-text style (shared with the eveo overlay): config['overlay']
+        # color + font_size. The tile draws the text on a strip BELOW its video
+        # or ('Text over video') on its own band over the picture; no topmost
+        # overlay is driven either way. On the band the text takes its OWN
+        # colour key - resolved ONCE, outside the per-tile try, through
+        # normalize_hex_color (never raises; garbage reads as the default).
         bottom_color = ocfg.get("color", "#ffffff")
+        if FCToolGUI._preview_text_band_effective(
+                cfg, getattr(self, "_preview_thumb_backend", None)):
+            bottom_color = normalize_hex_color(
+                cfg.get("text_over_video_color"),
+                preview_band.TEXT_COLOR_DEFAULT)
         try:
             # OverflowError joins the tuple 2026-09-27 (same reason as
             # _preview_fit_tile_heights's identical guard): a hand-edited
@@ -23063,7 +23134,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         separate topmost, click-through OverlayWindow re-topped on every tick,
         which caused massive in-game FPS drops. The label now renders in each
         tile's BOTTOM STRIP (see _preview_compose_captions → tile.set_bottom_label),
-        below the video, so NO overlay is created or re-topped in native mode.
+        below the video - or, in the 'Text over video' layout, on that tile's
+        own preview_band window, which is owned by the tile and never re-topped
+        by us - so NO overlay is created or re-topped in native mode.
 
         This is a no-op kept so the native tick's call site never breaks. It must
         NEVER call _overlay_ensure_window() or overlay.set_labels() with native
@@ -26382,9 +26455,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             activeforeground=FG_TEXT)
         cblv.grid(row=0, column=2, padx=(0, 8))
         w.append(cblv)
-        _tip(cblv, "Show the label and ship type (e.g. 'Logi - Onyx') in a small "
-                   "strip at the BOTTOM of each preview tile — below the video, "
-                   "never over it — using the colour and font size set above.")
+        _tip(cblv, "Show the label and ship type (e.g. 'Logi - Onyx') at the "
+                   "BOTTOM of each preview tile, at the font size set above. "
+                   "The 'Label text' switch below chooses where it is drawn: "
+                   "Caption = a strip below the video, in the colour set "
+                   "above; Text over video = a band over the picture, in its "
+                   "own 'Text color'.")
 
         self._preview_show_location_var = tk.BooleanVar(
             value=bool(pcfg.get("show_location", True)))
@@ -26399,7 +26475,80 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         _tip(cbloc, "Shows each pilot's current system on its own line under the "
                     "ship label.")
 
-        # ── Display ▸ row 3 (native): markers drawn on the tile itself ───────
+        # -- Display > row 3 (native): WHERE that bottom text is drawn --------
+        # A two-segment switch on ONE StringVar (preview.text_placement) plus
+        # the band's text colour; both vars ride _PREVIEW_NATIVE_VARS. SEED
+        # POLICY: only the exact stored "over_video", and only where the band
+        # exists (not under Wine), shows 'Text over video'. Anything else
+        # shows 'Caption' and is NOT written back - the apply's shadow is
+        # snapshotted from this var, so an untouched switch never writes.
+        # Runs inside __init__ before any heal: nothing here may raise.
+        rowNText = tk.Frame(cat_display, bg=BG_DARK)
+        rowNText.pack(fill=tk.X, pady=2)
+        _band_ok = FCToolGUI._preview_text_band_supported()
+        self._preview_text_placement_var = tk.StringVar(
+            value=("over_video" if _band_ok
+                   and FCToolGUI._preview_text_band_wanted(pcfg) else "caption"))
+        _band_wine_tip = ("" if _band_ok else
+                          " Text over video needs Windows - it is not "
+                          "available under Wine / Proton, so previews keep "
+                          "the Caption layout here.")
+        _place_tip = (
+            "Where each preview draws its label, location and DECLOAKED text. "
+            "Caption: in strips below the video, which take their height out "
+            "of the picture. Text over video: on a translucent band over the "
+            "bottom of the picture, so the text costs no picture height."
+            + _band_wine_tip)
+        lbl_place = tk.Label(rowNText, text="Label text:", font=("Consolas", 10),
+                             fg=FG_TEXT, bg=BG_DARK)
+        lbl_place.grid(row=0, column=0, padx=(0, 4), sticky=tk.W)
+        _tip(lbl_place, _place_tip)
+        self._preview_text_placement_buttons = {}
+        for _col, (_value, _text) in enumerate(
+                (("caption", "Caption"), ("over_video", "Text over video")), 1):
+            # indicatoron=False draws a push button that stays SUNKEN (and
+            # takes selectcolor) while its value is the var's; RIDGE when off,
+            # like the category buttons above.
+            seg = tk.Radiobutton(
+                rowNText, text=_text, value=_value, indicatoron=False,
+                variable=self._preview_text_placement_var,
+                command=self._preview_apply_native_state, font=("Consolas", 10),
+                fg=FG_TEXT, bg=BG_ENTRY, selectcolor=BG_SELECT,
+                activebackground=BG_ENTRY, activeforeground=FG_TEXT,
+                offrelief=tk.RIDGE, bd=1, padx=8, pady=1, cursor="hand2")
+            seg.grid(row=0, column=_col, padx=(0, 0 if _col == 1 else 16))
+            w.append(seg)
+            _tip(seg, _place_tip)
+            self._preview_text_placement_buttons[_value] = seg
+        # The band's text colour: the damage-flash swatch shape (seeded
+        # normalised, untouched never writes, right-click resets, no trace).
+        # Enabled in either layout - the colour may be picked first.
+        _band_default = preview_band.TEXT_COLOR_DEFAULT
+        _band_color_tip = (
+            "Click to choose the color of the text drawn over the video (the "
+            "'Text over video' layout; Caption keeps the label color set "
+            f"above). Right-click to reset to {_band_default}." + _band_wine_tip)
+        lbl_band_color = tk.Label(rowNText, text="Text color",
+                                  font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK)
+        lbl_band_color.grid(row=0, column=3, padx=(0, 4), sticky=tk.W)
+        _tip(lbl_band_color, _band_color_tip)
+        self._preview_text_over_video_color_var = tk.StringVar(
+            value=normalize_hex_color(pcfg.get("text_over_video_color"),
+                                      _band_default))
+        sw_band = make_color_swatch(
+            rowNText, self._preview_text_over_video_color_var, _band_default,
+            title="Text over video color",
+            on_change=self._preview_apply_native_state)
+        sw_band.grid(row=0, column=4, padx=(0, 8))
+        w.append(sw_band)
+        _tip(sw_band, _band_color_tip)
+        self._preview_text_over_video_color_swatch = sw_band
+        # Second gate (Wine), applied by _preview_sync_native_widgets AFTER its
+        # bulk loop - the Tile "h" Spinbox pattern.
+        self._preview_text_band_widgets = (
+            *self._preview_text_placement_buttons.values(), sw_band)
+
+        # ── Display ▸ row 4 (native): markers drawn on the tile itself ───────
         rowNMark = tk.Frame(cat_display, bg=BG_DARK)
         rowNMark.pack(fill=tk.X, pady=2)
         self._preview_highlight_var = tk.BooleanVar(
@@ -27295,6 +27444,16 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                                            else "disabled"))
             except tk.TclError:
                 pass
+        # Third dependent gate, same shape: under Wine the 'Label text' switch
+        # and its swatch stay greyed in EVERY mode (the band is Win32-only).
+        # Widget STATE only - the var was seeded on 'Caption' at build and the
+        # stored value is never touched.
+        if not FCToolGUI._preview_text_band_supported():
+            for widget in getattr(self, "_preview_text_band_widgets", ()):
+                try:
+                    widget.configure(state="disabled")
+                except tk.TclError:
+                    pass
 
     def _preview_sync_anchor_enabled(self):
         """Grey out the shared Position (anchor) control in native mode.
@@ -27403,6 +27562,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         ("_preview_doctrine_tag_var", "doctrine_tag_captions", bool),
         ("_preview_labels_on_video_var", "labels_on_video", bool),
         ("_preview_show_location_var", "show_location", bool),
+        # The 'Label text' switch + the band's text colour (2026-10-13). Each
+        # var holds what would be STORED and is seeded without writing, so an
+        # untouched control over a hand-edited value never writes it back.
+        ("_preview_text_placement_var", "text_placement", str),
+        ("_preview_text_over_video_color_var", "text_over_video_color", str),
         ("_preview_highlight_var", "highlight_active", bool),
         ("_preview_lock_var", "lock_layout", bool),
         ("_preview_snap_var", "snap_enabled", bool),
