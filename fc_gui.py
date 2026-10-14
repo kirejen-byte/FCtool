@@ -21250,8 +21250,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # 'Band background' is pushed first (keep this order). It matters only
         # when BOTH keys change between two ticks on a tile that already shows
         # text: the band then comes up below already outlined - one sync, not a
-        # dark-band sync then an outlined one. A spawned tile has no text at
-        # its spawn-time style pass, so either order gives it one sync.
+        # dark-band sync then an outlined one. In the reverse case (both keys
+        # change while LEAVING the band) the order costs one extra band sync
+        # just before the band is destroyed - harmless. A spawned tile has no
+        # text at its spawn-time style pass, so either order gives it one sync.
         set_bg = getattr(tile, "set_band_background", None)
         if set_bg is not None:
             set_bg(FCToolGUI._preview_band_background_wanted(cfg))
@@ -26502,9 +26504,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # -- Display > row 3 (native): WHERE that bottom text is drawn --------
         # A two-segment switch on ONE StringVar (preview.text_placement) plus
         # the band's text colour and 'Band background'; all three vars ride
-        # _PREVIEW_NATIVE_VARS. SEED
-        # POLICY: 'Text over video' only where _preview_text_band_wanted says
-        # so and the band exists (not under Wine); else 'Caption', NOT
+        # _PREVIEW_NATIVE_VARS.
+        # SEED POLICY: 'Text over video' only where _preview_text_band_wanted
+        # says so and the band exists (not under Wine); else 'Caption', NOT
         # written back - the apply's shadow is snapshotted from this var, so
         # an untouched switch never writes.
         # Runs inside __init__ before any heal: nothing here may raise.
