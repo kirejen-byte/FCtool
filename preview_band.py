@@ -13,7 +13,8 @@ stays DIRECTLY above it through every re-top of the tile or of an
 overlapping neighbour, the tile's own placement, its opacity flip and its
 withdraw / deiconify - with no call made on the band. So nothing here ever
 re-stacks the band. What the relationship does NOT do: the band does not move
-with its tile and is not hidden when the tile is withdrawn. The tile says both through BandWindow.sync().
+with its tile and is not hidden when the tile is withdrawn. The tile says both
+through BandWindow.sync().
 
 THE TWO FPS INVARIANTS (a change that breaks either is a regression):
   1. the band is never re-stacked by our code - the one window-position call
@@ -65,7 +66,8 @@ _BAND_MAX_FRAC = 0.60
 _TEXT_PAD = 4
 
 # Bold Consolas' GDI cell height : em height, as 2398 : 2048 (see
-# _glyph_px_max - the ratio that keeps a drawn line inside its row).
+# _glyph_px_max and _row_px_for_glyph - the ratio that keeps a drawn line
+# inside its row).
 _CELL_EM_NUM, _CELL_EM_DEN = 2398, 2048
 
 _FG_FALLBACK = (255, 255, 255)      # a garbage text colour draws white
@@ -172,6 +174,25 @@ def _size_or_none(value):
     return value if 1 <= value <= _MAX_SIZE_PX else None
 
 
+def _empty_size(value):
+    """True for a plain int below 1: a size that means "no area", not
+    garbage (a bool or a float is garbage, see _size_or_none)."""
+    return (isinstance(value, int) and not isinstance(value, bool)
+            and value < 1)
+
+
+def _row_px_for_glyph(font_px):
+    """The smallest row height whose glyph ceiling (_glyph_px_max) admits a
+    glyph `font_px` px tall: ceil(font_px * 2398 / 2048), the whole bold
+    Consolas cell. 0 for a garbage or non-positive font_px - such a row asks
+    for nothing beyond its own height. Never raises."""
+    px = _int_or(font_px, 0)
+    if px < 1:
+        return 0
+    px = min(px, _MAX_SIZE_PX)
+    return -(-px * _CELL_EM_NUM // _CELL_EM_DEN)
+
+
 def layout_band(tile_w, body_h, lines):
     """Where the band's rows go. Pure.
 
@@ -179,13 +200,19 @@ def layout_band(tile_w, body_h, lines):
     or a tile_w / body_h that is not a plain int in 1.._MAX_SIZE_PX (0, a
     negative, a float, a word, None, 10 ** 400). Otherwise
     BandLayout(height, rows): one (y, h) per line, in the order given,
-    stacked top-down with no gap; height == sum of the row heights.
+    stacked top-down with no gap; height == sum of the row heights. These
+    are the heights BandWindow draws and places - nothing re-sizes a row
+    after this.
 
-    Each row asks for its line's `height`. When the total exceeds
-    int(body_h * 0.60) the rows shrink in proportion - but every row stays
-    >= 1, so on a body too small for that the band is one px per row (and the
-    floor, not the cap, wins). A garbage row height reads as 1. Never raises:
-    anything unforeseen reads as "nothing to lay out"."""
+    Each row asks for the larger of its line's `height` and the row its
+    `font_px` glyph needs to be drawn whole (_row_px_for_glyph): the ROW
+    grows, so the text keeps the size the caller asked for - the size it has
+    on a strip. When the total exceeds int(body_h * 0.60) the rows shrink in
+    proportion (and only then does the renderer shrink a glyph to fit its
+    row, _glyph_px_max) - but every row stays >= 1, so on a body too small
+    for that the band is one px per row (and the floor, not the cap, wins).
+    A garbage row height reads as 1, a garbage font_px asks for nothing.
+    Never raises: anything unforeseen reads as "nothing to lay out"."""
     try:
         tile_w, body_h = _size_or_none(tile_w), _size_or_none(body_h)
         if tile_w is None or body_h is None:
@@ -193,7 +220,9 @@ def layout_band(tile_w, body_h, lines):
         lines = tuple(lines or ())
         if not lines:
             return None
-        heights = [max(1, _int_or(getattr(line, "height", 1), 1)) for line in lines]
+        heights = [max(1, _int_or(getattr(line, "height", 1), 1),
+                       _row_px_for_glyph(getattr(line, "font_px", 0)))
+                   for line in lines]
         target = max(int(body_h * _BAND_MAX_FRAC), len(heights))
         if sum(heights) > target:
             heights = _shrink_rows(heights, target)
@@ -263,10 +292,11 @@ def _glyph_px_max(row_h):
     Measured on a hidden desktop (2026-10-13), rows 3..60 px, five texts
     with ascenders, descenders, brackets and '|': row_h * 2048 // 2398
     never clips; row_h - 2 clipped at rows 19, 23 and every row from 28.
-    A row with room to spare is untouched (this is only a ceiling): at
-    100 % scaling the label sizes up to 13 pt keep their font, at 150 % up
-    to 8 pt; above that the glyph shrinks to fit its row instead of being
-    cut. Strictly smaller than the row from row_h = 2 on."""
+    Only a ceiling: layout_band already grows each row to
+    _row_px_for_glyph(font_px), so the glyph keeps its size; this bites only
+    when the 60 % body cap squeezed the rows, and then the glyph shrinks to
+    fit its row instead of being cut. Strictly smaller than the row from
+    row_h = 2 on."""
     return max(1, int(row_h) * _CELL_EM_DEN // _CELL_EM_NUM)
 
 
@@ -349,16 +379,24 @@ class BandWindow:
         BandLine (top-down), `alpha` the tile's own opacity.
 
         True when the window now matches the request - "nothing to show,
-        window hidden (or never created)" included. False on any backend
-        failure (last_failure says which step); the caller falls back to its
-        strips. NEVER raises: this is reached from the preview tick, where an
-        escaping exception counts against the whole preview subsystem.
+        window hidden (or never created)" included: not visible, no lines,
+        or a zero / negative int size. False on any backend failure, and on
+        visible lines with a size layout_band refuses (a float, a bool, an
+        out-of-range int) - never True while drawing nothing (last_failure
+        says which step). NEVER raises: this is reached from the preview
+        tick, where an escaping exception counts against the whole preview
+        subsystem.
+
+        On False, BandWindow itself only records why, and forgets its hwnd
+        if the window is gone (so a later sync would create a fresh one). The
+        TILE treats any False as a fault: preview_tile switches that tile to
+        its strips for the rest of the session and never syncs it again.
 
         Blind spot, accepted by design: being zero-write, an UNCHANGED request
         makes no backend call at all, so a window destroyed behind the band's
         back (not by its owner dying with it - that is the tile's own
         teardown) is noticed only on the next CHANGED sync, whose failing call
-        finds the hwnd dead and starts over with a fresh window."""
+        finds the hwnd dead - and that False sends the tile to its strips."""
         self._step = "request"
         try:
             ok = self._sync(x, y, w, body_h, lines, alpha, visible)
@@ -369,10 +407,18 @@ class BandWindow:
         return ok
 
     def _sync(self, x, y, w, body_h, lines, alpha, visible):
-        layout = layout_band(w, body_h, lines) if visible else None
-        if layout is None:
+        if not visible:
             return self._hide()
-        lines = tuple(lines)            # iterable: layout_band said so
+        # ONE materialisation: a one-shot iterator handed to layout_band would
+        # otherwise be spent there and then drawn as nothing.
+        lines = tuple(lines or ())
+        if not lines:
+            return self._hide()
+        layout = layout_band(w, body_h, lines)
+        if layout is None:
+            if _empty_size(w) or _empty_size(body_h):
+                return self._hide()     # a tile with no area: nothing to show
+            return self._failed()       # step "request": a size it refuses
         bx, by = int(x), int(y) + body_h - layout.height
         alpha255 = _alpha255(alpha)
         win32 = self._backend()
@@ -619,8 +665,11 @@ class _RealBandWin32:  # pragma: no cover - the one real-Win32 test + live use
 
     # -- ownership / liveness (reads) ----------------------------------------
     def is_own_window(self, hwnd) -> bool:
-        """True only for a live window of THIS process created on THIS thread."""
+        """True only for a live window of THIS process created on THIS thread.
+        Clears the last-error code first, like the acting methods: its answer
+        is BandWindow's "owner" step, whose failure reports last_error()."""
         try:
+            self._clear_error()
             hwnd = int(hwnd or 0)
             if hwnd <= 0:
                 return False
@@ -641,8 +690,9 @@ class _RealBandWin32:  # pragma: no cover - the one real-Win32 test + live use
     # -- the window ----------------------------------------------------------
     def last_error(self) -> int:
         """The Win32 error code of the last failed call in this backend's
-        current method (0 = none recorded). Each acting method clears it on
-        entry, so a stale code from an earlier call is never reported."""
+        current method (0 = none recorded). Each acting method - and the
+        ownership probe is_own_window - clears it on entry, so a stale code
+        from an earlier call is never reported."""
         return int(self._ctypes.get_last_error())
 
     def _clear_error(self):

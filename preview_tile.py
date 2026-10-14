@@ -1213,9 +1213,11 @@ class TileWindow:
     # ── corner-hover resize (any of the 4 corners; opposite corner anchored) ──
     def _detect_corner(self, event):
         """Which corner (if any) the pointer is over, as an inset zone. Uses the
-        pointer position relative to the tile's PHYSICAL top-left (self._pos) vs
-        the tile's known w / (body_h + STRIP_H). This matches the move/resize
-        gestures which also delta event.x_root against the physical self._pos —
+        pointer position relative to the window's PHYSICAL top-left as last
+        placed (self._placed_pos, falling back to self._pos before the first
+        placement) vs the tile's known w / (body_h + STRIP_H). _placed_pos, not
+        _pos: while hover-zoomed on a non-"nw" anchor the window sits away from
+        _pos. Physical px like the move/resize gestures' event.x_root deltas -
         under PMv2 the tile's monitor makes Tk root coords 1:1 with physical px,
         so no scale factor is needed (FLAG: re-verify on mixed-DPI monitors)."""
         w = self._w
@@ -1747,9 +1749,6 @@ class TileWindow:
         # a failed write still leaves the mirror behind and retries next tick.
         self._resting_applied = (self._alpha == self._applied_alpha(target))
 
-    def _dragging(self):
-        return self._press_root is not None or self._mode is not None
-
     @property
     def in_gesture(self) -> bool:
         """True while the user is actively dragging or resizing THIS tile:
@@ -2264,7 +2263,9 @@ class TileWindow:
         """One band row for `text`: fitted with the SAME auto-fit the strips
         use (_fit_label_text - shrink the font, ellipsize only at the floor)
         and given the SAME row height (strip_h_for), so a line reads alike in
-        both layouts. The 60 %-of-body cap is the band's own (layout_band)."""
+        both layouts. layout_band grows a row the glyph needs more room in
+        (so the text keeps the strip's size), and the 60 %-of-body cap is the
+        band's own (layout_band)."""
         shown, drawn = self._fit_label_text(text, self._band_base_size(size))
         return preview_band.BandLine(shown, self._band_font_px(drawn),
                                      strip_h_for(drawn), fg, **style)
