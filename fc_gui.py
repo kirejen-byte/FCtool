@@ -30131,11 +30131,17 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         character can own a saved rect without owning a size override and the
         two blocks must each pick the first member that can actually answer.
 
-        The manual grouping is seeded first; a SECOND pass then seeds accounts
-        known only by observation (the read-time overlay, spec §9.3) so an
-        auto-detected alt keeps its hand-placed position on opt-in. That pass
-        reads the ground-truth map only and never writes preview.char_accounts
-        (manual wins, structurally); it is inert when no map is present.
+        The manual grouping is seeded first; a SECOND (observed-only) pass then
+        labels each unlabelled character that has saved geometry and a
+        ground-truth account by its EFFECTIVE account
+        (`_preview_effective_account_of`: a same-account sibling's manual label,
+        sorted-first, before the observed auto label), so an auto-detected alt
+        keeps its hand-placed position on opt-in and lands in the slot the
+        runtime reads. Because manual groups are seeded first, a hand-labelled
+        main's own well-formed entry wins over an alt's for the shared slot.
+        That pass reads the ground-truth map only and never writes
+        preview.char_accounts (manual wins, structurally); it is inert when no
+        map is present.
 
         - An EXISTING slot is never overwritten: the user has already placed
           that account's tile and this is not the moment to move it.
