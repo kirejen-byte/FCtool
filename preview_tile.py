@@ -2257,7 +2257,9 @@ class TileWindow:
                 self._band_px_per_pt = scale
             else:
                 scale = 96.0 / 72.0
-        return max(1, int(round(points * scale)))
+        # Halves round DOWN, as Tk does (round() goes to even: 9 pt at
+        # 108 dpi is 13.5 -> Tk 13, round() 14). Plain-arithmetic ceil(x - .5).
+        return max(1, -int(-(points * scale - 0.5) // 1))
 
     def _band_line(self, text, size, fg, **style):
         """One band row for `text`: fitted with the SAME auto-fit the strips

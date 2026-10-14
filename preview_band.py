@@ -382,7 +382,8 @@ class BandWindow:
         window hidden (or never created)" included: not visible, no lines,
         or a zero / negative int size. False on any backend failure, and on
         visible lines with a size layout_band refuses (a float, a bool, an
-        out-of-range int) - never True while drawing nothing (last_failure
+        out-of-range int), and when a line is garbage or `lines` is not
+        iterable ("request failed" / "request raised <Type>") - never True while drawing nothing (last_failure
         says which step). NEVER raises: this is reached from the preview
         tick, where an escaping exception counts against the whole preview
         subsystem.
