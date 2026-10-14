@@ -29853,9 +29853,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         return self._preview_char_accounts().get(key, "")
 
     def _preview_effective_account_of(self, char_key) -> str:
-        """The account this character is EFFECTIVELY on: the manual
-        char_accounts label if the user set one, else the observed account's
-        label from the ground-truth map, else "".
+        """The account this character is EFFECTIVELY on, three steps in order:
+        (1) the character's own manual char_accounts label; (2) else a manual
+        label carried by a DIFFERENT character on the same observed account
+        (the sorted-first labelled sibling wins when they disagree), so an
+        unlabelled alt shares its hand-labelled main's slot; (3) else the
+        observed account's auto label from the ground-truth map; else "".
 
         The read-time overlay behind auto-grouping (spec §9.3). "Manual wins" is
         STRUCTURAL, not a merge: this NEVER writes an observed account back into
@@ -30063,6 +30066,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # account_slots-off path byte-identical. The map read is the same
         # documented-harmless kind as the label lookup below -- the FLAG gate
         # above stayed RAW, so the per-tick no-write contract is intact.
+        # Representative choice: a LIVE char wins; with none live, a member
+        # carrying a MANUAL label (sorted-first, found via account_for_char ==
+        # id, the same rule as the sibling inheritance) beats the plain
+        # sorted-first sidecar member, so the login shares the hand-labelled
+        # main's slot rather than an unlabelled alt's auto slot.
         if isinstance(char_key, str) and char_key.startswith("login:"):
             amap = getattr(self, "_account_map", None)
             if amap is not None:
@@ -30078,12 +30086,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     # No LIVE char on the account: prefer a member carrying a
                     # manual label (sorted-first among those) over the plain
                     # sorted-first sidecar member, so the login lands on the
-                    # slot the hand-labelled main uses.
+                    # slot the hand-labelled main uses. Found by the SAME rule
+                    # as the unlabelled-sibling inheritance in
+                    # `_preview_effective_account_of`: account_for_char(k) == id.
                     try:
                         if not amap.char_for_account(acct_id):
-                            manual_all = self._preview_char_accounts()
-                            labelled = [m for m in amap.chars_for_account(acct_id)
-                                        if m in manual_all]
+                            labelled = sorted(
+                                k for k in self._preview_char_accounts()
+                                if amap.account_for_char(k) == acct_id)
                             if labelled:
                                 rep = labelled[0]
                     except Exception:
@@ -30158,8 +30168,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # wins" stays structural (manually-labelled keys are skipped, and an
         # already-seeded slot is never overwritten by the unified loop below).
         # Inert without a map, which is why the manual behaviour above is
-        # unchanged for every no-map host. Same manual→observed precedence as
-        # `_preview_effective_account_of`, resolved here in bulk.
+        # unchanged for every no-map host. The label is the EFFECTIVE one
+        # (`_preview_effective_account_of`): a same-account sibling's manual
+        # label (sorted-first labelled sibling) before the observed auto label,
+        # so the seeded slot is exactly the one the runtime reads.
         amap = getattr(self, "_account_map", None)
         if amap is not None:
             manual_keys = set(self._preview_char_accounts())
@@ -30177,10 +30189,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             observed: dict = {}
             for nk in candidates:
                 try:
-                    acct = amap.account_for_char(nk)
-                    if acct is None:
+                    if amap.account_for_char(nk) is None:
                         continue
-                    label = amap.label_for_account(acct)
+                    label = self._preview_effective_account_of(nk)
                 except Exception:
                     continue
                 if label:
