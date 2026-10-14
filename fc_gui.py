@@ -29880,6 +29880,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             acct = amap.account_for_char(char_key)
             if acct is None:
                 return ""
+            # Same account, same slot: an unlabelled alt on an account that a
+            # DIFFERENT character hand-labelled shares that label (sorted-first
+            # labelled char wins when they disagree). Pure dict pass, no IO; any
+            # fault falls through to the auto label below.
+            try:
+                own = str(char_key).strip().lower()
+                manual_all = self._preview_char_accounts()
+                for other in sorted(manual_all):
+                    if other != own and amap.account_for_char(other) == acct:
+                        return manual_all[other]
+            except Exception:
+                pass
             return amap.label_for_account(acct)
         except Exception:
             return ""
@@ -30063,6 +30075,19 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                         rep = amap.any_char_for_account(acct_id)
                     except Exception:
                         rep = None
+                    # No LIVE char on the account: prefer a member carrying a
+                    # manual label (sorted-first among those) over the plain
+                    # sorted-first sidecar member, so the login lands on the
+                    # slot the hand-labelled main uses.
+                    try:
+                        if not amap.char_for_account(acct_id):
+                            manual_all = self._preview_char_accounts()
+                            labelled = [m for m in amap.chars_for_account(acct_id)
+                                        if m in manual_all]
+                            if labelled:
+                                rep = labelled[0]
+                    except Exception:
+                        pass
                     if rep:
                         return self._preview_layout_key(rep)
             return char_key                 # no representative yet -> login:<id>

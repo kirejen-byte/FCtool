@@ -402,6 +402,22 @@ class AccountMap:
             if isinstance(entry, dict) and entry.get("account") == account_id)
         return members[0] if members else None
 
+    def chars_for_account(self, account_id: int) -> list[str]:
+        """Every character key known on *account_id* (live + sidecar), sorted.
+
+        Pure and total: reads only in-memory caches, never raises; empty list
+        when none is known."""
+        try:
+            members = {
+                key for key, entry in self._sidecar.items()
+                if isinstance(entry, dict) and entry.get("account") == account_id}
+            live = self._live_acct_to_char.get(account_id)
+            if live:
+                members.add(live)
+            return sorted(members)
+        except Exception:
+            return []
+
     def known_accounts(self) -> list[int]:
         """All account ids in play: union of live (login + logged-in), sidecar,
         and alias keys. Sorted; non-integer alias keys are ignored."""
