@@ -1168,6 +1168,7 @@ class TileWindow:
                 return  # still within jitter → treat as a click, not a drag yet
             self._strip_moving = True
             self._hide_implant_tip()   # only now is it a drag, not a click
+            self._settle_zoom()
         x = self._strip_press_pos[0] + dx
         y = self._strip_press_pos[1] + dy
         x, y = self._maybe_snap(x, y)     # magnetic edge-snap (no-op when off)
@@ -1268,6 +1269,7 @@ class TileWindow:
         strip-move and activate paths are already gated on _corner_resizing."""
         if self._lock_layout or self._corner is None:
             return
+        self._settle_zoom()
         x, y = self._pos
         w, h = self._w, self._body_h + STRIP_H
         # anchor = the corner OPPOSITE the grabbed one; it stays put through drag.
@@ -1365,6 +1367,10 @@ class TileWindow:
         dy = event.y_root - self._press_root[1]
         if self._mode == "resize":
             self._hide_implant_tip()   # a right-drag resize is under way
+            if self._zoomed:
+                # _press_size was captured from the zoomed size at press time.
+                self._settle_zoom()
+                self._press_size = (self._w, self._body_h)
             w, body_h = preview_layout.clamp_size(self._press_size[0] + dx,
                                                   self._press_size[1] + dy)
             self._w, self._body_h = w, body_h
@@ -1375,6 +1381,7 @@ class TileWindow:
             if self._lock_layout:
                 return  # locked layout → right-drag move is a no-op (BUG B)
             self._hide_implant_tip()   # the tile is about to move
+            self._settle_zoom()
             x = self._press_pos[0] + dx
             y = self._press_pos[1] + dy
             x, y = self._maybe_snap(x, y)     # magnetic edge-snap (no-op when off)
@@ -1773,6 +1780,17 @@ class TileWindow:
         self._band_follow(zx, zy)
         self._win32.retop(self._hwnd)
         self._relift_tooltips()
+
+    def _settle_zoom(self):
+        """A drag or resize is about to start: take the hover zoom off first.
+
+        While zoomed, _pos is still the PRE-zoom origin but _w/_body_h are the
+        zoomed size, so a gesture anchored on them persisted the zoomed size and
+        left _prezoom_rect stale - <Leave> then snapped the tile back to where
+        it was BEFORE the drag. Settling first means every gesture starts from
+        the true rect, and the later <Leave> is a no-op."""
+        if self._zoomed:
+            self._restore_zoom()
 
     def _restore_zoom(self):
         if not self._zoomed or self._prezoom_rect is None:
