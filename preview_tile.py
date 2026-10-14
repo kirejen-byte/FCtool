@@ -8,8 +8,15 @@ Design (spec §5):
 - A caption strip (tk.Frame height STRIP_H) with name/dot/chip/tag labels and the
   optional major-implants icon, over a black body frame. The DWM thumbnail is
   composited by the compositor OVER the body area; it is letterboxed so it never
-  covers the strip — which is why anything readable lives on a strip, never on
-  the body.
+  covers the strip. A child widget inside the thumbnail rect is therefore
+  invisible, which is why every widget that must be read lives on a strip,
+  never on the body.
+- Bottom text (activity label, location line, decloak banner) has TWO layouts.
+  Strips (the default): thin strips below the video, carved out of the body.
+  Band (set_text_band(True), Windows only): the same lines on preview_band's
+  popup, a SEPARATE window owned by this tile and drawn over the bottom of the
+  body, so the text costs the picture no height. The tile fits the text either
+  way; _sync_band() is the one place it tells the band where the tile is.
 - Placement is ONLY via win32.set_window_pos(GA_ROOT, x, y, w, h) in physical px —
   never Tk geometry (Tk geometry is logical px under PMv2 and would misplace).
 - Mouse model (EVE-O parity): LEFT on the BODY acts on PRESS — activate (Ctrl =
@@ -33,15 +40,19 @@ a fake. Tk-thread only touches this object (house rule #1).
 """
 from __future__ import annotations
 
+import logging
 import os
 import sys
 
 import tkinter as tk
 
+import preview_band
 import preview_layout
 import ui_helpers
 from app_path import bundle_dir
 from dwm_thumbs import Thumbnail, aspect_fit
+
+log = logging.getLogger(__name__)
 
 STRIP_H = 20
 _MOVE_JITTER = 4          # left-release within this many px still counts as a click
@@ -72,7 +83,10 @@ _CORNER_CURSOR = {"nw": "size_nw_se", "se": "size_nw_se",
 # the owner approved. Tk 8.6 reads PNG natively, so there is no Pillow at
 # runtime. It lives in the CAPTION STRIP and never over the video: the DWM
 # compositor draws each tile's live thumbnail OVER any child widget inside the
-# thumbnail rect (the retired on-video label is the lesson).
+# thumbnail rect (the on-video label canvas, deleted 2026-09-17, is the
+# lesson). Only a SEPARATE top-level window can draw over the picture - that
+# is what the text band is (preview_band) - and an icon that needs a tooltip
+# and a click has no business on a click-through popup.
 IMPLANT_ICON_FILE = "implant_icon_16.png"
 IMPLANT_ICON_PX = 16
 # Shown instead of the image when the asset cannot be loaded at all — a missing
@@ -473,7 +487,8 @@ class TileWindow:
     def __init__(self, root, char_key, palette, win32=None, dwm=None,
                  on_activate=None, on_minimize=None, on_move_end=None,
                  on_resize_end=None, on_exclude=None, on_switch_external=None,
-                 on_snap_others=None, on_snap_screens=None, lock_layout=False):
+                 on_snap_others=None, on_snap_screens=None, lock_layout=False,
+                 *, band_factory=None):
         self._win32 = win32 or _real_tile_win32()
         self._lock_layout = bool(lock_layout)   # when True, all drag-moves are no-ops
         self._dwm_backend = dwm
@@ -532,6 +547,33 @@ class TileWindow:
         # Cleared by set_bottom_label (both the hide and the restore path) so
         # the banner->normal restore can never be skipped, and by a TclError.
         self._alert_applied = None    # (shown, drawn_size, strip_h, w, body_h)
+
+        # -- text band over the video (set_text_band) -------------------------
+        # The LAST REQUEST of each bottom-text setter, recorded in BOTH layouts
+        # so a layout switch (or a band fault) can replay it on the other side.
+        # None = that line is off. The alert REPLACES the label line while it
+        # is set; set_bottom_label is what clears it (the restore contract).
+        self._label_req = None        # (text, color, size) of set_bottom_label
+        self._location_req = None     # (text, color, size) of set_location_label
+        self._alert_req = None        # (text, size) of set_bottom_alert
+        # band_factory(owner_hwnd) -> an object with BandWindow's sync /
+        # destroy / hwnd. None = preview_band.BandWindow, resolved at first
+        # need; tests inject a recording fake.
+        self._band_factory = band_factory
+        self._text_band = False       # EFFECTIVE layout: True = band, False = strips
+        self._band_off = False        # latched by a band fault (or destroy()):
+                                      # strips for the rest of this tile's life
+        self._band = None             # the band object; None until first NEEDED
+        # What the band was last successfully told: (x, y, w, body_h, lines,
+        # alpha, visible). An unchanged _sync_band() stops at this compare and
+        # never reaches the band - the tile's half of the zero-write rule.
+        self._band_synced = None
+        # Top-left last handed to set_window_pos, i.e. where the window REALLY
+        # is. Not always _pos: a hover zoom on any anchor but "nw" places the
+        # window away from _pos and leaves _pos alone. The band is placed from
+        # this. None until the first placement.
+        self._placed_pos = None
+        self._band_px_per_pt = None   # cached Tk scaling (see _band_font_px)
 
         self._thumb = None
         self._src_size = (0, 0)
@@ -738,10 +780,12 @@ class TileWindow:
                                   place_above=True, place_fn=self._place_implant_tip)
 
         # ── bottom caption strip (mirror of the top strip) ──────────────────
-        # The activity label ('<label> - <ShipType>') lives in a small strip
-        # BELOW the video, never over it. The old on-video child-canvas is
-        # DWM-occluded and the topmost-overlay workaround caused in-game lag, so
-        # the label now draws here. Packed side="bottom" BEFORE the body so the
+        # In the STRIPS layout (the default) the activity label
+        # ('<label> - <ShipType>') lives in a small strip BELOW the video. A
+        # child widget over the video is DWM-occluded, so the only way to draw
+        # text over the picture is a separate window - the BAND layout
+        # (set_text_band), in which this strip and the location strip stay
+        # unpacked. Packed side="bottom" BEFORE the body so the
         # body expands into the middle, between the top strip and this one; the
         # window total height (body_h + STRIP_H) is unchanged — the strip is
         # carved out of the body area via _push_thumb_rect's avail_h.
@@ -776,17 +820,23 @@ class TileWindow:
         self._body = tk.Frame(self.top, bg="#000000")
         self._body.pack(fill="both", expand=True, side="top")
 
-        # On-video activity label (RETIRED, and its widget DELETED 2026-09-17):
-        # the DWM compositor draws each tile's live thumbnail OVER any child
-        # widget inside the thumbnail rect, so the child Canvas that used to
-        # live here was occluded, and routing the label through a separate
-        # topmost overlay caused massive in-game FPS drops. The activity label
-        # renders in the bottom strip (see set_bottom_label). The canvas and its
-        # `_draw_video_label` painter were kept as dead code "so references
-        # never break" — but `set_label_style` still ran the painter (a
-        # Canvas.delete("all") on a never-placed canvas) for every tile on every
-        # 250 ms tick, so both are gone. `set_video_label` /
-        # `video_label_text()` keep their signatures and the text stash.
+        # NO child widget is ever drawn on the body: the DWM compositor draws
+        # each tile's live thumbnail OVER any child widget inside the thumbnail
+        # rect, so the child Canvas that used to live here (the first on-video
+        # label, widget DELETED 2026-09-17) was occluded. Its replacement of
+        # the time - ONE colour-keyed overlay window spanning the whole
+        # desktop, redrawn and re-topped on every 250 ms tick - caused massive
+        # in-game FPS drops and was retired too (2026-07-03).
+        #
+        # What draws text over the video TODAY is the text band
+        # (preview_band.BandWindow, layout chosen by set_text_band): one small
+        # layered popup per tile, OWNED by this tile's hwnd, painted only when
+        # its text / style / width changes and never re-stacked by our code -
+        # it shares none of the old overlay's per-tick cost. In the default
+        # STRIPS layout the same text renders in the bottom strips (see
+        # set_bottom_label). `set_video_label` / `video_label_text()` are the
+        # canvas-era API: they keep their signatures and a text stash, and draw
+        # nothing in either layout.
 
         # caption text mirror for tests / logging (badge overrides name display)
         self._name = ""
@@ -1031,6 +1081,10 @@ class TileWindow:
         the tile back at the head of the topmost band."""
         if not self._x11_backend:
             self._win32.set_window_pos(self._hwnd, x, y, w, h)
+            # Same motion event, same position: the band does not move with
+            # its owner by itself. Every caller has already written the new
+            # _w / _body_h, so (x, y) is all the band still needs.
+            self._band_follow(x, y)
             return
         self._pending_move = (x, y, w, h)
         if self._move_after_id is not None:
@@ -1054,6 +1108,9 @@ class TileWindow:
         x, y, w, h = pend
         self._win32.set_window_pos(self._hwnd, x, y, w, h,
                                    zorder=False, redraw=False)
+        # X11-only path, where the band is refused (set_text_band): this keeps
+        # _placed_pos honest and is otherwise a no-op.
+        self._band_follow(x, y)
 
     def _flush_drag_move(self):
         """Cancel the armed flush and apply any pending position RIGHT NOW.
@@ -1364,6 +1421,7 @@ class TileWindow:
         # guard means an unchanged budget costs nothing, so this is free on the
         # arrange paths that re-place a tile at the size it already had.
         self._render_caption()
+        self._band_follow(x, y)
 
     def body_screen_rect(self):
         """(left, top, right, bottom) of the BODY region (below the caption strip)
@@ -1427,6 +1485,8 @@ class TileWindow:
         self._press_root = None
         self._strip_moving = False
         self._corner_resizing = False
+        # An owned popup is NOT hidden with its owner: say so (visible=False).
+        self._sync_band()
 
     def show(self):
         """Re-map a tile hidden by hide(). Idempotent; re-pushes the thumbnail rect
@@ -1441,6 +1501,9 @@ class TileWindow:
             self._win32.set_window_pos(self._hwnd, self._pos[0], self._pos[1],
                                        self._w, self._body_h + STRIP_H)
             self._push_thumb_rect()
+            # Inside the try on purpose: a tile whose Tk window is gone must
+            # not be handed a band (it would only fail and log).
+            self._band_follow(self._pos[0], self._pos[1])
         except tk.TclError:
             pass
 
@@ -1458,7 +1521,14 @@ class TileWindow:
 
         The combined height is capped at ~60% of the body as a safety net so the
         two bottom lines can never swallow the whole video, even if both request
-        their per-strip 40% cap on a squat tile."""
+        their per-strip 40% cap on a squat tile.
+
+        0 in the BAND layout: the text is drawn over the video by a separate
+        window and carves nothing out of the body - which is the whole point
+        of that layout, and why _push_thumb_rect and fitted_body_h need no
+        second code path."""
+        if self._text_band:
+            return 0
         total = (self._bottom_strip_h if self._bottom_visible else 0)
         total += (self._location_strip_h if self._location_visible else 0)
         if self._body_h and self._body_h > 0:
@@ -1595,12 +1665,17 @@ class TileWindow:
         try:
             self.top.attributes("-alpha", a)
         except tk.TclError:
-            pass                               # never record a failed write
+            wrote = False                      # never record a failed write
         else:
             self._alpha = a                    # latch only AFTER the write succeeds
+            wrote = True
         # Tk's -alpha rewrites GWL_EXSTYLE on the opaque↔layered transition,
         # wiping WS_EX_TOOLWINDOW → re-assert the Alt-Tab exclusion every time.
         self._exclude_from_alt_tab()
+        if wrote:
+            # The text band fades WITH its tile, from the APPLIED alpha (the
+            # mirror just latched) - so never after a failed write.
+            self._sync_band()
 
     def current_alpha(self):
         """Last requested window alpha (mirror for tests / logging)."""
@@ -1692,6 +1767,9 @@ class TileWindow:
         self._w, self._body_h = zw, zbody
         self._win32.set_window_pos(self._hwnd, zx, zy, zw, zbody + STRIP_H)
         self._push_thumb_rect()
+        # (zx, zy), NOT _pos: on any anchor but "nw" the zoomed window sits
+        # away from _pos, which this method deliberately leaves alone.
+        self._band_follow(zx, zy)
         self._win32.retop(self._hwnd)
         self._relift_tooltips()
 
@@ -1704,6 +1782,7 @@ class TileWindow:
         self._w, self._body_h = w, body_h
         self._win32.set_window_pos(self._hwnd, x, y, w, body_h + STRIP_H)
         self._push_thumb_rect()
+        self._band_follow(x, y)
         self._win32.retop(self._hwnd)
         self._relift_tooltips()
 
@@ -2027,21 +2106,257 @@ class TileWindow:
             self._label_anchor = anchor
 
     def set_video_label(self, text):
-        """RETIRED no-op. The on-video label drew over the DWM thumbnail (which
-        occludes it) and the topmost-overlay workaround caused in-game lag, so the
-        activity label now renders in the bottom strip (set_bottom_label). The
-        method + signature are kept so callers never break; it does NOT draw."""
+        """RETIRED no-op. The child canvas this drew on sat under the DWM
+        thumbnail (which occludes it), and the desktop-wide overlay that
+        replaced it caused in-game lag. The activity label is shown by
+        set_bottom_label - on the bottom strip, or on the text band over the
+        video (set_text_band). The method + signature are kept so callers never
+        break; it does NOT draw."""
         self._label_text = text or ""
 
     def video_label_text(self) -> str:
         """The last text handed to the retired set_video_label — for tests/logging.
-        (The visible activity label now lives in the bottom strip.)"""
+        (The visible activity label is set_bottom_label's: strip or band.)"""
         return self._label_text
+
+    # -- bottom text over the video: the BAND layout (set_text_band) ---------
+    @property
+    def text_band(self) -> bool:
+        """The EFFECTIVE bottom-text layout: True = the band over the video,
+        False = the strips below it. Read-only; set_text_band changes it."""
+        return self._text_band
+
+    def set_text_band(self, on) -> bool:
+        """Choose where the bottom text (activity label, location line, decloak
+        banner) is drawn, and return the EFFECTIVE layout after the call:
+        True = on the band over the video, False = on the strips below it.
+
+        The answer is False whatever was asked under the X11 (Wine) backend -
+        the band is Win32-only - and for the rest of this tile's life once its
+        band has failed (see _band_fault): text must never silently disappear.
+
+        Switching replays the recorded requests on the other side, so the text
+        (a live decloak banner included) is in place when this returns:
+          to the band   - both strips are unpacked, the picture is
+                          re-letterboxed into the WHOLE body, the band is synced;
+          to the strips - the band is destroyed and the three setters run
+                          again down their strip path.
+
+        A per-tick setter (the style pass pushes it for every tile on every
+        ~250 ms tick): an unchanged call returns at the first compare - no Tk
+        call, no band call."""
+        want = bool(on) and not self._x11_backend and not self._band_off
+        if want == self._text_band:
+            return self._text_band
+        self._text_band = want
+        if want:
+            self._unpack_bottom_strips()
+            self._sync_band()         # a fault here lands back on the strips
+        else:
+            self._destroy_band()
+            self._replay_strips()
+        return self._text_band
+
+    def band_lines(self):
+        """The lines the band is asked to show right now, top-down, as a tuple
+        of preview_band.BandLine - () in the strips layout or with nothing to
+        show. For tests / logging; in the band layout the strip accessors
+        (bottom_label_text, location_label_text, is_bottom_alert) all read
+        "nothing", because no strip is up."""
+        if not self._text_band:
+            return ()
+        try:
+            return self._band_lines()
+        except Exception:
+            return ()
+
+    def _unpack_bottom_strips(self):
+        """Take both bottom strips off the tile (band layout) and hand the
+        freed height back to the picture. Their zero-write mirrors are dropped,
+        so a later replay always writes. No Tk call when neither was up."""
+        was_up = self._bottom_visible or self._location_visible
+        for strip, up in ((self._strip_bottom, self._bottom_visible),
+                          (self._strip_location, self._location_visible)):
+            if up:
+                try:
+                    strip.pack_forget()
+                except tk.TclError:
+                    pass
+        self._bottom_visible = False
+        self._location_visible = False
+        self._bottom_alert = False
+        self._bottom_applied = None
+        self._location_applied = None
+        self._alert_applied = None
+        if was_up:
+            self._push_thumb_rect()   # _bottom_h() is 0 now: the whole body
+
+    def _replay_strips(self):
+        """Run the recorded requests down the STRIP path (the layout is strips
+        again): the banner if one is live, else the label; then the location.
+        Each setter re-records the request it is handed, unchanged."""
+        if self._alert_req is not None:
+            self.set_bottom_alert(*self._alert_req)
+        elif self._label_req is not None:
+            self.set_bottom_label(*self._label_req)
+        if self._location_req is not None:
+            self.set_location_label(*self._location_req)
+
+    @staticmethod
+    def _band_base_size(size):
+        """The requested font size, as the strip setters read it: 9 when none
+        (or junk) is given, clamped to the label range."""
+        try:
+            fsize = int(size) if size is not None else 9
+        except (TypeError, ValueError, OverflowError):
+            fsize = 9
+        return max(_LABEL_MIN_SIZE, min(fsize, _LABEL_MAX_SIZE))
+
+    def _band_font_px(self, points):
+        """Glyph height in PHYSICAL px of a font drawn at `points` - what the
+        band's own renderer needs, since it draws with GDI, not Tk. Tk's
+        scaling factor IS pixels per point, so this is the size the same text
+        has on a strip.
+
+        One Tcl round-trip for the tile's whole life: the factor is cached once
+        read. A failed or senseless read falls back to 96 dpi (96 / 72 px per
+        point) and is NOT cached, so a transient failure retries on the next
+        call instead of sticking (the set_alpha latch lesson)."""
+        scale = self._band_px_per_pt
+        if scale is None:
+            try:
+                scale = float(self.top.tk.call("tk", "scaling"))
+            except Exception:
+                scale = 0.0
+            if 0.0 < scale < float("inf"):        # False for NaN as well
+                self._band_px_per_pt = scale
+            else:
+                scale = 96.0 / 72.0
+        return max(1, int(round(points * scale)))
+
+    def _band_line(self, text, size, fg, **style):
+        """One band row for `text`: fitted with the SAME auto-fit the strips
+        use (_fit_label_text - shrink the font, ellipsize only at the floor)
+        and given the SAME row height (strip_h_for), so a line reads alike in
+        both layouts. The 60 %-of-body cap is the band's own (layout_band)."""
+        shown, drawn = self._fit_label_text(text, self._band_base_size(size))
+        return preview_band.BandLine(shown, self._band_font_px(drawn),
+                                     strip_h_for(drawn), fg, **style)
+
+    def _band_lines(self):
+        """The band's rows from the recorded requests, top-down: the decloak
+        banner IN PLACE OF the label line while it is live (hazard colours,
+        centred - what set_bottom_alert draws on the strip), else the label;
+        then the location. Colour-agnostic like the strips: a line is drawn in
+        whatever colour its caller passed, the panel fg when it passed none."""
+        lines = []
+        if self._alert_req is not None:
+            text, size = self._alert_req
+            lines.append(self._band_line(text, size, _ALERT_FG, alert=True,
+                                         bg=_ALERT_BG, align="center"))
+        elif self._label_req is not None:
+            text, color, size = self._label_req
+            lines.append(self._band_line(text, size, color or self._fg_text))
+        if self._location_req is not None:
+            text, color, size = self._location_req
+            lines.append(self._band_line(text, size, color or self._fg_text))
+        return tuple(lines)
+
+    def _band_follow(self, x, y):
+        """Called right after EVERY set_window_pos on this tile, with the
+        top-left it was handed: record where the window really is and bring
+        the band along (it does not move with its owner by itself)."""
+        self._placed_pos = (x, y)
+        self._sync_band()
+
+    def _sync_band(self):
+        """Make the band match the tile: its lines, the rect the window really
+        has, the tile's applied alpha, shown or hidden. THE one place the tile
+        talks to its band; a no-op in the strips layout.
+
+        Reached from everything the band depends on - the three text setters,
+        set_text_band, set_alpha (after a successful write), hide(), and every
+        placement through _band_follow (place, show, zoom in / out, each drag
+        and resize motion).
+
+        NEVER raises. Callers include place() and the per-tick setters, and an
+        exception escaping into fc_gui's per-tile `try` retires the tile (five
+        failed ticks disable every preview). Any fault - the factory or sync
+        raising, sync answering False - ends in _band_fault instead: this tile
+        goes back to its strips, visibly, for good."""
+        if not self._text_band:
+            return
+        try:
+            ok, why = self._sync_band_now(), "the band could not be shown"
+        except Exception as exc:
+            ok, why = False, type(exc).__name__
+        if not ok:
+            self._band_fault(why)
+
+    def _sync_band_now(self) -> bool:
+        """_sync_band's body; may raise (the caller turns that into a fault).
+
+        Geometry is the tile's own PHYSICAL numbers - _placed_pos, _w, _body_h,
+        STRIP_H, the same ones that place the window - never winfo_root*
+        (logical px under per-monitor DPI, and stale until Tk has pumped an
+        external move). ZERO-WRITE: a request equal to the last one the band
+        accepted returns before the band is touched. No band object is created
+        while there is nothing to show (no line, tile hidden or never placed)."""
+        lines = self._band_lines()
+        visible = (not self._hidden) and self._w > 0 and self._body_h > 0
+        if self._band is None:
+            if not (lines and visible):
+                return True
+            factory = self._band_factory
+            if factory is None:
+                factory = preview_band.BandWindow
+            self._band = factory(self._hwnd)
+        x, y = self._placed_pos if self._placed_pos is not None else self._pos
+        req = (x, y + STRIP_H, self._w, self._body_h, lines, self._alpha, visible)
+        if req == self._band_synced:
+            return True
+        if not self._band.sync(x, y + STRIP_H, self._w, self._body_h, lines,
+                               alpha=self._alpha, visible=visible):
+            return False
+        self._band_synced = req       # latch only AFTER the band accepted it
+        return True
+
+    def _band_fault(self, why):
+        """The band cannot be shown on this tile: latch that, destroy the
+        band, and put the text back on the strips - at once, so it never
+        silently disappears - with ONE log line. The latch makes set_text_band
+        answer False from now on, so this runs at most once per tile and the
+        line cannot repeat. Names no character (the log may be shared).
+        Never raises (see _sync_band)."""
+        self._band_off = True
+        self._text_band = False
+        self._destroy_band()
+        try:
+            log.warning("preview: text over video is unavailable for one tile "
+                        "(%s); that tile shows caption strips instead", why)
+        except Exception:
+            pass
+        try:
+            self._replay_strips()
+        except Exception:
+            pass
+
+    def _destroy_band(self):
+        """Drop the band object, if any. Tolerates a band that is already gone
+        (an owned popup dies with its tile's window) and never raises."""
+        band, self._band = self._band, None
+        self._band_synced = None
+        if band is not None:
+            try:
+                band.destroy()
+            except Exception:
+                pass
 
     # ── bottom caption strip label ('<label> - <ShipType>', below the video) ──
     def set_bottom_label(self, text, color=None, size=None):
-        """Show the activity label ('<label> - <ShipType>') in the bottom strip,
-        BELOW the video (never over it). This replaces the retired on-video label.
+        """Show the activity label ('<label> - <ShipType>'): in the bottom strip
+        BELOW the video (the default layout), or as the band's label line over
+        the video (set_text_band). The rest of this docstring is the strip path.
 
         Empty/falsy text hides the strip and lets the video reclaim the space.
         A non-empty text ellipsizes to the tile width, applies the given fill
@@ -2053,8 +2368,23 @@ class TileWindow:
         background + given fg and clears the decloak-alert flag, so after a
         decloak banner's window expires the next compose-tick call here brings the
         normal 'Label - ShipType' text and panel bg back automatically — a yellow
-        strip is never left behind."""
+        strip is never left behind. (Band layout: the same contract - this call
+        ends a live banner and the label line takes its row back.)"""
         text = "" if not text else str(text)
+        # Record the request in BOTH layouts (set_text_band replays it), and
+        # end any banner: the restore contract above.
+        req = (text, color, size) if text else None
+        unchanged = (req == self._label_req and self._alert_req is None)
+        self._label_req = req
+        self._alert_req = None
+        if self._text_band:
+            # BAND layout: nothing is packed. The compose pass re-pushes the
+            # same label on every tick, so an unchanged request stops here -
+            # no Tk, no band. (Geometry, alpha and visibility reach the band
+            # through their own hooks, never through this guard.)
+            if not unchanged:
+                self._sync_band()
+            return
         if not text:
             if self._bottom_visible:
                 try:
@@ -2136,8 +2466,21 @@ class TileWindow:
         banner every ~250 ms tick for the whole decloak window, an UNCHANGED
         banner must cost no widget configure and no _push_thumb_rect — the
         repeated writes were repainting black over the preview child under
-        Wine (field-reported flicker)."""
+        Wine (field-reported flicker).
+
+        BAND layout (set_text_band): the banner takes the band's label row
+        instead - same wording, same fit, opaque hazard yellow - and the
+        picture does not move when it starts or ends."""
         text = DECLOAK_BANNER_TEXT if not text else str(text)
+        # Record the request in BOTH layouts (set_text_band replays it). It
+        # stays set until set_bottom_label ends the banner.
+        req = (text, size)
+        unchanged = (req == self._alert_req)
+        self._alert_req = req
+        if self._text_band:
+            if not unchanged:         # re-pushed every tick while it is live
+                self._sync_band()
+            return
         try:
             fsize = int(size) if size is not None else 9
         except (TypeError, ValueError):
@@ -2302,8 +2645,19 @@ class TileWindow:
         overflows (keeping the chosen size when it fits), sizes the strip to the
         drawn font (clamped so it can never exceed ~40% of the body, with the
         combined bottom-strips height capped at ~60% of the body via _bottom_h),
-        packs it below the label strip, and re-letterboxes the thumbnail."""
+        packs it below the label strip, and re-letterboxes the thumbnail.
+
+        BAND layout (set_text_band): the same text is the band's LAST row,
+        over the video; no strip is packed."""
         text = "" if not text else str(text)
+        # Record the request in BOTH layouts (set_text_band replays it).
+        req = (text, color, size) if text else None
+        unchanged = (req == self._location_req)
+        self._location_req = req
+        if self._text_band:
+            if not unchanged:         # same zero-write rule as set_bottom_label
+                self._sync_band()
+            return
         if not text:
             if self._location_visible:
                 try:
@@ -2385,6 +2739,13 @@ class TileWindow:
         self._press_root = None
         self._strip_moving = False
         self._corner_resizing = False
+        # The band goes BEFORE its owner (it would die with the Toplevel
+        # anyway; this is the explicit path). The layout drops back to strips
+        # and stays there, so nothing that still reaches this dead tile can
+        # ask for a new band - the strip paths all swallow a TclError.
+        self._band_off = True
+        self._text_band = False
+        self._destroy_band()
         try:
             self.top.destroy()
         except tk.TclError:
