@@ -36,7 +36,12 @@ def describe_write_failure(status, detail="") -> str:
         msg = ("ESI says this character is not the fleet boss, or its login "
                "lacks the fleet-write permission (re-authorize it).")
     elif status == 404:
-        msg = ("That fleet no longer exists. Click 'Refresh fleet' and try again.")
+        msg = ("ESI can't find that fleet for this character: the fleet was "
+               "re-formed or closed, or this character is no longer in it / "
+               "its boss. Click 'Refresh fleet' and try again.")
+    elif status == 401:
+        msg = ("This character's login has expired or was revoked "
+               "(re-authorize the character).")
     elif status in (400, 422):
         msg = "ESI rejected the MOTD text itself."
     elif status in (420, 429):
@@ -910,7 +915,7 @@ class ESIAuth:
             except Exception:
                 pass
             if not detail:
-                detail = (getattr(resp, "text", "") or "").strip()
+                detail = str(getattr(resp, "text", "") or "").strip()
             detail = detail[:200]
             log.warning("ESI PUT %s returned %s: %s", path, resp.status_code, detail)
             return False, resp.status_code, detail
