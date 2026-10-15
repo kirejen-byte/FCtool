@@ -1154,6 +1154,25 @@ class ESIAuth:
             }
         return None
 
+    def get_fleet_info_ex(self) -> tuple:
+        """Like get_fleet_info but tells "not in a fleet" from "could not ask".
+
+        Returns (info, 200) on a fleet body (same dict shape as get_fleet_info),
+        (None, 404) when ESI says the character is not in a fleet, and
+        (None, status) otherwise (status 0 = no token / no character / the
+        request raised)."""
+        if not self._character_id:
+            return None, 0
+        data, status, _hdrs = self.esi_get_ex(
+            f"/characters/{self._character_id}/fleet/")
+        if status == 200 and isinstance(data, dict) and "fleet_id" in data:
+            return {
+                "fleet_id": data["fleet_id"],
+                "fleet_boss_id": data.get("fleet_boss_id"),
+                "role": data.get("role"),
+            }, 200
+        return None, (status if status != 200 else 0)
+
     @staticmethod
     def is_boss(info, character_id) -> bool:
         """True iff `info` (from get_fleet_info) shows `character_id` is the fleet

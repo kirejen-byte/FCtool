@@ -17109,11 +17109,21 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 # Re-resolve the fleet: the stored id goes stale when the FC
                 # re-forms / joins another fleet while this tab stays open.
                 # Any failure to ask falls back to the stored id.
+                # Only a 404 means "not in a fleet"; a 5xx / timeout / no
+                # token is "could not ask" and falls back to the stored id.
                 info = _MOTD_NO_INFO
                 try:
-                    _gfi = getattr(auth, "get_fleet_info", None)
-                    if _gfi is not None:
-                        info = _gfi()
+                    _gex = getattr(auth, "get_fleet_info_ex", None)
+                    _gr = _gex() if _gex is not None else None
+                    if isinstance(_gr, tuple) and len(_gr) == 2:
+                        if _gr[1] == 200 and _gr[0]:
+                            info = _gr[0]
+                        elif _gr[1] == 404:
+                            info = None
+                    else:
+                        _gfi = getattr(auth, "get_fleet_info", None)
+                        if _gfi is not None:
+                            info = _gfi()
                 except Exception:
                     info = _MOTD_NO_INFO
                 if info is not _MOTD_NO_INFO:
