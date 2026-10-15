@@ -26,6 +26,28 @@ from rate_limiter import rate_limit
 
 log = get_logger(__name__)
 
+
+def describe_write_failure(status, detail="") -> str:
+    """Plain-English meaning of a failed ESI fleet write (status None = no
+    HTTP answer), with ESI's own detail text appended when present."""
+    if status is None:
+        msg = "No answer from ESI (network error, or this character has no valid login)."
+    elif status == 403:
+        msg = ("ESI says this character is not the fleet boss, or its login "
+               "lacks the fleet-write permission (re-authorize it).")
+    elif status == 404:
+        msg = ("That fleet no longer exists. Click 'Refresh fleet' and try again.")
+    elif status in (400, 422):
+        msg = "ESI rejected the MOTD text itself."
+    elif status in (420, 429):
+        msg = "ESI is rate-limiting requests. Wait a minute and try again."
+    elif status >= 500:
+        msg = "ESI / EVE server error. Try again shortly."
+    else:
+        msg = "ESI rejected the request."
+    head = f"ESI {status}: " if status is not None else ""
+    return head + msg + (f"\n\nESI said: {detail}" if detail else "")
+
 SSO_AUTH_URL = "https://login.eveonline.com/v2/oauth/authorize"
 SSO_TOKEN_URL = "https://login.eveonline.com/v2/oauth/token"
 
@@ -858,9 +880,18 @@ class ESIAuth:
         status, a missing token, or a network error — mirroring the
         non-raising error convention of esi_post so failures don't surface
         into the GUI as exceptions."""
+        return self.esi_put_ex(path, json_data)[0]
+
+    def esi_put_ex(self, path: str, json_data: dict = None) -> tuple:
+        """esi_put with a diagnosis: returns (ok, status_code_or_None, detail).
+
+        detail is ESI's JSON "error" text when the body has one, else a short
+        snippet of the response text, the exception text for a network error,
+        or "no access token". Failures are logged (never the token or body)."""
         token = self.access_token
         if not token:
-            return False
+            log.warning("ESI PUT %s skipped: no access token", path)
+            return False, None, "no access token"
         try:
             rate_limit('esi')
             resp = self._session.put(
@@ -870,11 +901,22 @@ class ESIAuth:
                 timeout=10,
             )
             if resp.ok:
-                return True
-            print(f"[ESI] PUT {path} returned {resp.status_code}")
+                return True, resp.status_code, ""
+            detail = ""
+            try:
+                body = resp.json()
+                if isinstance(body, dict) and body.get("error"):
+                    detail = str(body["error"])
+            except Exception:
+                pass
+            if not detail:
+                detail = (getattr(resp, "text", "") or "").strip()
+            detail = detail[:200]
+            log.warning("ESI PUT %s returned %s: %s", path, resp.status_code, detail)
+            return False, resp.status_code, detail
         except Exception as e:
-            print(f"[ESI] Error: {e}")
-        return False
+            log.warning("ESI PUT %s failed: %s", path, e)
+            return False, None, str(e)[:200]
 
     def esi_delete(self, path: str) -> bool:
         """Make an authenticated DELETE request to ESI.
@@ -1207,6 +1249,10 @@ class ESIAuth:
         callers; the GUI gates on fleet_boss_id before calling. Returns True
         on success, False otherwise (esi_put convention)."""
         return self.esi_put(f"/fleets/{fleet_id}/", {"motd": motd})
+
+    def set_fleet_motd_ex(self, fleet_id: int, motd: str) -> tuple:
+        """set_fleet_motd with the esi_put_ex diagnosis (ok, status, detail)."""
+        return self.esi_put_ex(f"/fleets/{fleet_id}/", {"motd": motd})
 
     # ── Character Fittings ───────────────────────────────────────────────────
 

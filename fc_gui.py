@@ -90,7 +90,7 @@ import wh_overlay
 from autocomplete import AutocompleteEntry
 import system_cache
 from system_cache import get_system_names, get_region_map
-from esi_auth import ESIAuth, load_all_tokens, IMPLANTS_SCOPE as _IMPLANTS_SCOPE
+from esi_auth import ESIAuth, load_all_tokens, IMPLANTS_SCOPE as _IMPLANTS_SCOPE, describe_write_failure as _describe_write_failure
 from loss_tracker import FleetLossTracker
 import loss_reconciler
 from loss_reconciler import SOURCE_ESI as _LOSS_SOURCE_ESI, SOURCE_ZKILL as _LOSS_SOURCE_ZKILL
@@ -17099,13 +17099,20 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         def worker():
             ok = False
             err = None
+            status = None
+            edetail = ""
             try:
-                ok = auth.set_fleet_motd(fleet_id, markup)
+                _ex = getattr(auth, "set_fleet_motd_ex", None)
+                _r = _ex(fleet_id, markup) if _ex is not None else None
+                if isinstance(_r, tuple) and len(_r) == 3:
+                    ok, status, edetail = _r
+                else:
+                    ok = auth.set_fleet_motd(fleet_id, markup)
             except Exception as e:
                 err = str(e)
-            self._post_ui(_done, ok, err)
+            self._post_ui(_done, ok, err, status, edetail)
 
-        def _done(ok, err):
+        def _done(ok, err, status=None, edetail=""):
             if ok:
                 self._motd_fleet_status.config(
                     text="MOTD set successfully (204).", fg=FG_GREEN)
@@ -17117,10 +17124,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 self._motd_record_manual_push(markup)
             else:
                 detail = (f"\n\n{err}" if err else
-                          "\n\nESI rejected the request (403 if you are no "
-                          "longer the boss, or the MOTD was too long).")
+                          "\n\n" + _describe_write_failure(status, edetail))
                 self._motd_fleet_status.config(
-                    text="Failed to set MOTD.", fg=FG_RED)
+                    text=("Failed to set MOTD"
+                          + (f" (ESI {status})." if status else ".")), fg=FG_RED)
                 messagebox.showerror("Set MOTD failed",
                                      f"Could not set the fleet MOTD.{detail}", parent=getattr(self, "root", None))
 
