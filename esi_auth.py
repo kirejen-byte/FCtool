@@ -37,8 +37,8 @@ def describe_write_failure(status, detail="") -> str:
                "lacks the fleet-write permission (re-authorize it).")
     elif status == 404:
         msg = ("ESI can't find that fleet for this character: the fleet was "
-               "re-formed or closed, or this character is no longer in it / "
-               "its boss. Click 'Refresh fleet' and try again.")
+               "re-formed or closed, or this character is no longer in it or "
+               "no longer its boss. Click 'Refresh fleet' and try again.")
     elif status == 401:
         msg = ("This character's login has expired or was revoked "
                "(re-authorize the character).")

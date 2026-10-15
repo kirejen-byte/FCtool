@@ -1284,6 +1284,9 @@ def _preview_alert_border(peak_hex, started, now, steady):
     return preview_tile.pulse_color(peak_hex, now - started, 0.5)
 
 
+_MOTD_NO_INFO = object()   # "fleet could not be re-resolved" marker (set-MOTD push)
+
+
 class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
     def __init__(self):
         _apply_dpi_awareness(_read_overlay_dpi_pref())
@@ -17101,13 +17104,44 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             err = None
             status = None
             edetail = ""
+            push_fid = fleet_id
             try:
+                # Re-resolve the fleet: the stored id goes stale when the FC
+                # re-forms / joins another fleet while this tab stays open.
+                # Any failure to ask falls back to the stored id.
+                info = _MOTD_NO_INFO
+                try:
+                    _gfi = getattr(auth, "get_fleet_info", None)
+                    if _gfi is not None:
+                        info = _gfi()
+                except Exception:
+                    info = _MOTD_NO_INFO
+                if info is not _MOTD_NO_INFO:
+                    fresh = info.get("fleet_id") if info else None
+                    if not fresh:
+                        err = "Not in a fleet."
+                        self._post_ui(self._apply_motd_fleet_status,
+                                      None, False, err)
+                    elif not auth.is_boss(info, auth.character_id):
+                        err = "This character is no longer the fleet boss."
+                        self._post_ui(self._apply_motd_fleet_status,
+                                      fresh, False, err)
+                    else:
+                        push_fid = fresh
+                        if fresh != fleet_id:
+                            self._post_ui(
+                                self._apply_motd_fleet_status, fresh, True,
+                                "You are the fleet boss " + chr(0x2014)
+                                + " Set is enabled.")
+                if err is not None:
+                    self._post_ui(_done, False, err, None, "")
+                    return
                 _ex = getattr(auth, "set_fleet_motd_ex", None)
-                _r = _ex(fleet_id, markup) if _ex is not None else None
+                _r = _ex(push_fid, markup) if _ex is not None else None
                 if isinstance(_r, tuple) and len(_r) == 3:
                     ok, status, edetail = _r
                 else:
-                    ok = auth.set_fleet_motd(fleet_id, markup)
+                    ok = auth.set_fleet_motd(push_fid, markup)
             except Exception as e:
                 err = str(e)
             self._post_ui(_done, ok, err, status, edetail)
