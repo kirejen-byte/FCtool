@@ -2611,7 +2611,8 @@ class TileWindow:
         """Cached tkfont.Font for the bottom-line labels (C5-03).
 
         Creating a Font is a Tcl round-trip; _fit_label_text needed up to ~21 of
-        them PER CALL and runs once per tile per ~250 ms tick (the one bottom line). Bounded by construction: `size` is clamped to
+        them PER CALL and runs once per tile per ~250 ms tick (the one bottom
+        line). Bounded by construction: `size` is clamped to
         [_LABEL_MIN_SIZE, _LABEL_MAX_SIZE] by every caller and family/weight are
         fixed. PER-INSTANCE, never module-level: a Font belongs to the
         interpreter that created it, so a shared cache would hand a destroyed

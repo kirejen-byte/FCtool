@@ -23180,9 +23180,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 text = preview_tile.format_caption_line(system, ship_name)
                 self._preview_video_labels[hwnd] = text  # kept for tests/logging
                 # The second (location) strip is retired: the system rides the
-                # bottom line below. Pushing '' FIRST hides a strip a tile still
-                # shows from the old two-strip layout BEFORE the bottom line is
-                # (re)painted, so an upgrading tile re-letterboxes once, not twice.
+                # bottom line below. Pushing '' first means a strip left over
+                # from the old two-strip layout is dropped before the bottom
+                # line repaints, so it is never re-pinned under it.
                 tile.set_location_label("")
                 # DECLOAK banner overrides the bottom line while the window is
                 # live (login screens never alert). Once it expires, the normal
