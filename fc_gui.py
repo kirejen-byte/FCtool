@@ -20591,7 +20591,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # never Ansiblexes). 0 = the pilot's own system, i.e. the original
         # behaviour; clamped 0.._PREVIEW_INTEL_JUMPS_MAX at every read.
         "intel_flash_jumps": _PREVIEW_INTEL_JUMPS_DEFAULT,
-        "doctrine_tag_captions": True,       # caveat #4 (Task B1)
+        "doctrine_tag_captions": True,       # caveat #4 (Task B1); UNREAD since the role label left the tile
         "damage_flash": True,                # caveat #3 / P1 (Task B6)
         # Since 2026-09-26 the mode gates NPC (orange) damage ONLY — player
         # damage always flashes red, in either mode. Default 'any' (log-only,
@@ -22029,12 +22029,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         auto-fit asks "which strips does config say this pilot's tile SHOWS?"
         and sizes for that, whether or not they happen to be packed right now.
 
-        `labels_on_video` (the activity strip) and `show_location` (the location
-        line) each contribute one strip. A LOGIN tile shows neither — the
-        caption composer feeds login screens "" on both channels — so it expects
-        0 regardless of the flags. Each strip's height comes from preview_tile's
-        OWN formula (`strip_h_for`), never a re-typed 20, so a user who raised
-        the overlay font size gets the taller strips accounted for.
+        The ship type (`labels_on_video`) and the system (`show_location`) share
+        ONE line ('Jita · Onyx'), so EITHER flag - or both - contributes exactly
+        one strip; neither contributes none. A LOGIN tile shows no line — the
+        caption composer feeds login screens "" — so it expects 0 regardless of
+        the flags. The strip's height comes from preview_tile's OWN formula
+        (`strip_h_for`), never a re-typed 20, so a user who raised the overlay
+        font size gets the taller strip accounted for.
 
         ACCEPTED IMPRECISION: preview_tile's `_fit_label_text` may auto-shrink
         the font on a narrow tile, and the setters additionally cap a strip at
@@ -22043,8 +22044,6 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         band. That is the deliberate trade: jitter-free beats pixel-exact."""
         if is_login or text_band:
             return 0
-        one = preview_tile.strip_h_for(font_size)
-        total = 0
         # _PREVIEW_DEFAULTS is the SINGLE source of truth for what an absent key
         # means — read it rather than re-typing a literal. In production neither
         # fallback fires (_preview_cfg materializes both keys before anyone reads
@@ -22054,11 +22053,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # Referenced via the CLASS, not `self` — this is a staticmethod and the
         # unit tests call it unbound.
         _defaults = FCToolGUI._PREVIEW_DEFAULTS
-        if cfg.get("labels_on_video", _defaults["labels_on_video"]):
-            total += one
-        if cfg.get("show_location", _defaults["show_location"]):
-            total += one
-        return total
+        if (cfg.get("labels_on_video", _defaults["labels_on_video"])
+                or cfg.get("show_location", _defaults["show_location"])):
+            return preview_tile.strip_h_for(font_size)
+        return 0
 
     def _preview_fit_tile_heights(self, cfg, *, force=False, clients=None):
         """Resize live tiles to the height at which each client's video exactly
@@ -23070,20 +23068,22 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         return bundle
 
     def _preview_compose_captions(self, cur):
-        """Set each live tile's caption from its staleness-checked ESI state +
-        rules/overrides + (optionally) the active doctrine's tag for its hull.
-        Built once per tick: one doctrine tag index shared across all tiles.
+        """Set each live tile's caption from its staleness-checked ESI state.
+        Built once per tick: one caption bundle shared across all tiles.
 
         Two channels (caption-onvideo):
           - the STRIP (name + status dot + role chip) is gated by `captions`;
-          - the BOTTOM activity label ('<label> - <ShipType>'), gated by
-            `labels_on_video`. The TILE decides where it is drawn: a strip
-            below the video or, in the 'Text over video' layout, its band over
-            the picture - this pass calls the same setters either way and only
-            picks the text colour. The activity label reuses the same
-            rule/override/doctrine precedence (_preview_caption_parts' `tag`)
-            and is joined with the pilot's ship TYPE name via
-            preview_tile.format_tile_label."""
+          - the ONE bottom line '<System> · <ShipType>' (e.g. 'Jita · Onyx'):
+            the system is shown iff `show_location`, the ship type iff
+            `labels_on_video`; an empty part is dropped, none hides the line.
+            Joined by preview_tile.format_caption_line and pushed through
+            set_bottom_label, which auto-fits the font to the tile width. The
+            TILE decides where it is drawn: a strip below the video or, in the
+            'Text over video' layout, its band over the picture - this pass
+            calls the same setters either way and only picks the text colour.
+            The role / activity label (rule, override, doctrine tag) is NOT
+            drawn on the tile any more; the location setter is always fed ''
+            so the second strip never shows."""
         cfg = self._preview_cfg()
         # Fallbacks come from _PREVIEW_DEFAULTS (the single owner), not literals:
         # `labels_on_video` used to fall back to False here while
@@ -23100,9 +23100,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # inputs" memoised on `_preview_caption_memo` — see
         # `_preview_caption_bundle` for the key and why the block is a method
         # (the roles-cycle ring shares its tag_index).
-        (_doctrine, tag_index, rules, ocfg,
-         overrides_norm) = self._preview_caption_bundle()
-        doctrine_tag_captions = bool(cfg.get("doctrine_tag_captions", True))
+        # Only `ocfg` (the shared text style) is used here: the rule / override /
+        # doctrine-tag label those other members feed is no longer drawn.
+        (_doctrine, _tag_index, _rules, ocfg,
+         _overrides_norm) = self._preview_caption_bundle()
         show_chip = bool(cfg.get("show_role_chip", True))
         # Bottom-text style (shared with the eveo overlay): config['overlay']
         # color + font_size. The tile draws the text on a strip BELOW its video
@@ -23129,8 +23130,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         except (TypeError, ValueError, OverflowError):
             bottom_size = 11
         # Decloak hazard banner: while a char's decloak window (edge-armed in
-        # _preview_on_decloak) is live, its label strip shows the DECLOAKED banner
-        # INSTEAD of the normal '<label> - <ShipType>' text. Gated by decloak_flash.
+        # _preview_on_decloak) is live, its bottom line shows the DECLOAKED banner
+        # INSTEAD of the normal '<System> · <ShipType>' text. Gated by decloak_flash.
         decloak_on = bool(cfg.get("decloak_flash", True))
         # Major-implants strip icon: the poller publishes the SUMMARISED verdict
         # per char key (_preview_implant_refresh); this pass only turns it into
@@ -23146,26 +23147,32 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 continue
             state = None if client.is_login else self._preview_state_for(client.key)
             role_chip = self._preview_role_chip(client) if show_chip else ""
-            name, dot, chip, activity = self._preview_caption_parts(
-                client, state, rules, overrides_norm, role_chip, tag_index,
-                doctrine_tag_captions)
+            # The 4th member (the role / doctrine-tag label) is never drawn:
+            # empty rules / overrides / tag index and the tag toggle off make
+            # it "" without the per-tile rule walk.
+            name, dot, chip, _activity = self._preview_caption_parts(
+                client, state, [], {}, role_chip, {}, False)
             try:
                 bottom_color = (band_color if band_color is not None
                                 and getattr(tile, "text_band", True)
                                 else overlay_color)
                 if do_strip:
-                    tile.set_caption(name, dot, chip, activity)
-                # Bottom-strip activity label: '<label> - <ShipType>'. Login
-                # screens and rule-less pilots with no ship resolve to '' → the
-                # strip hides and the video reclaims the space. Composed here
-                # (rule/override/doctrine precedence) and pushed straight to the
-                # tile's bottom strip; the retired on-video path (DWM-occluded +
-                # laggy topmost overlay) is no longer used.
-                ship_name = "" if (client.is_login or state is None) \
-                    else (state.ship_type_name or "")
-                text = preview_tile.format_tile_label(activity, ship_name)
+                    tile.set_caption(name, dot, chip, "")
+                # The ONE bottom line: '<System> · <ShipType>'. Each part is
+                # gated by its own flag (show_location / labels_on_video); login
+                # screens and pilots with no ESI state have neither → '' hides
+                # the strip and the video reclaims the space. Pushed straight to
+                # the tile's bottom strip (or band), which auto-fits the font; the
+                # retired on-video path (DWM-occluded + laggy topmost overlay) is
+                # no longer used.
+                no_state = client.is_login or state is None
+                ship_name = ("" if (no_state or not do_video)
+                             else (state.ship_type_name or ""))
+                system = ("" if (no_state or not do_location)
+                          else (state.system_name or ""))
+                text = preview_tile.format_caption_line(system, ship_name)
                 self._preview_video_labels[hwnd] = text  # kept for tests/logging
-                # DECLOAK banner overrides the label strip while the window is
+                # DECLOAK banner overrides the bottom line while the window is
                 # live (login screens never alert). Once it expires, the normal
                 # branch below runs again and set_bottom_label repaints the panel
                 # bg + label text (explicit restore in preview_tile) — no yellow
@@ -23177,20 +23184,15 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 if decloak_live:
                     tile.set_bottom_alert(preview_tile.DECLOAK_BANNER_TEXT,
                                           bottom_size)
-                elif do_video:
+                elif do_video or do_location:
+                    # (text may be '' - a pilot with no ship/system yet - which
+                    # hides the strip; the style still rides along)
                     tile.set_bottom_label(text, bottom_color, bottom_size)
                 else:
-                    tile.set_bottom_label("")   # flag off → hide the strip
-                # Location line (its own thin strip UNDER the label strip): the
-                # pilot's current system, gated by show_location. Login screens /
-                # no-state pilots have no system → '' hides the line. Same colour
-                # + font-size source as the label bar; the tile auto-fits the font.
-                system = "" if (client.is_login or state is None) \
-                    else (state.system_name or "")
-                if do_location and system:
-                    tile.set_location_label(system, bottom_color, bottom_size)
-                else:
-                    tile.set_location_label("")
+                    tile.set_bottom_label("")   # both flags off → hide the strip
+                # The second (location) strip is retired: the system rides the
+                # line above. Pushing '' keeps it hidden on every tile.
+                tile.set_location_label("")
                 # Major-implants icon. A login screen has no character, so it
                 # never carries one — and never reads a verdict published under
                 # the shared login key "".
@@ -26509,19 +26511,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         _tip(cbc, "Show a text caption on each preview tile (character name or its "
                   "label rule).")
 
-        self._preview_doctrine_tag_var = tk.BooleanVar(
-            value=bool(pcfg.get("doctrine_tag_captions", True)))
-        cbd = tk.Checkbutton(
-            rowNCap, text="Default caption = doctrine tag",
-            variable=self._preview_doctrine_tag_var,
-            command=self._preview_apply_native_state, font=("Consolas", 10),
-            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
-            activeforeground=FG_TEXT)
-        cbd.grid(row=0, column=1, padx=(0, 16))
-        w.append(cbd)
-        _tip(cbd, "Caption a hull with its active-doctrine tag unless a label "
-                  "rule or override already labels it.")
-
+        # (The "Default caption = doctrine tag" checkbox is gone: the role /
+        # doctrine-tag label is no longer drawn on a tile. Its config key
+        # `doctrine_tag_captions` stays in _PREVIEW_DEFAULTS, unread.)
         self._preview_labels_on_video_var = tk.BooleanVar(
             value=bool(pcfg.get("labels_on_video", True)))
         cblv = tk.Checkbutton(
@@ -26530,10 +26522,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cblv.grid(row=0, column=2, padx=(0, 8))
+        cblv.grid(row=0, column=1, padx=(0, 8))
         w.append(cblv)
-        _tip(cblv, "Show the label and ship type (e.g. 'Logi - Onyx') at the "
-                   "BOTTOM of each preview tile, at the font size set above. "
+        _tip(cblv, "Show the ship type on the ONE bottom line of each preview "
+                   "tile (with Show location on, the system comes first: "
+                   "Jita, then Onyx), at "
+                   "the font size set above; the font shrinks to fit a long "
+                   "name. "
                    "The 'Label text' switch below chooses where it is drawn: "
                    "Caption = a strip below the video, in the colour set "
                    "above; Text over video = a band over the picture, in its "
@@ -26547,10 +26542,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             command=self._preview_apply_native_state, font=("Consolas", 10),
             fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
             activeforeground=FG_TEXT)
-        cbloc.grid(row=0, column=3, padx=(0, 8))
+        cbloc.grid(row=0, column=2, padx=(0, 8))
         w.append(cbloc)
-        _tip(cbloc, "Shows each pilot's current system on its own line under the "
-                    "ship label.")
+        _tip(cbloc, "Adds each pilot's current system to the same bottom line "
+                    "as the ship type (system first, then the ship, split by a "
+                    "dot); "
+                    "the font shrinks to fit a long name.")
 
         # -- Display > row 3 (native): WHERE that bottom text is drawn --------
         # A two-segment switch on ONE StringVar (preview.text_placement) plus
@@ -27661,7 +27658,6 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         ("_preview_implant_icon_var", "implant_icon", bool),
         ("_preview_opacity_var", "opacity_inactive", float),
         ("_preview_captions_var", "captions", bool),
-        ("_preview_doctrine_tag_var", "doctrine_tag_captions", bool),
         ("_preview_labels_on_video_var", "labels_on_video", bool),
         ("_preview_show_location_var", "show_location", bool),
         # The 'Label text' switch + the band's text colour (2026-10-13). Each

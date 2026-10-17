@@ -11,7 +11,8 @@ Design (spec §5):
   covers the strip. A child widget inside the thumbnail rect is therefore
   invisible, which is why every widget that must be read lives on a strip,
   never on the body.
-- Bottom text (activity label, location line, decloak banner) has TWO layouts.
+- Bottom text (the one '<System> · <ShipType>' line, decloak banner) has TWO
+  layouts.
   Strips (the default): thin strips below the video, carved out of the body.
   Band (set_text_band(True), Windows only): the same lines on preview_band's
   popup, a SEPARATE window owned by this tile and drawn over the bottom of the
@@ -116,7 +117,7 @@ def _load_implant_icon(widget):
 
 
 # ── on-video activity label (caption-onvideo) ────────────────────────────────
-# The activity label ("<label> - <ShipType>") is drawn directly on the tile BODY
+# The bottom line ("<System> · <ShipType>") was once drawn directly on the tile BODY
 # (over the DWM thumbnail) at a configurable corner, as a black 8-direction
 # outline with a coloured fill on top — the same legibility trick eveo_overlay
 # uses, so the text reads on both bright and dark video.
@@ -250,19 +251,22 @@ def pulse_color(peak_hex, elapsed_s, period_s) -> str:
     return f"#{r:02x}{g:02x}{b:02x}"
 
 
-def format_tile_label(activity_label, ship_type_name) -> str:
-    """Join the activity label and ship TYPE name as '<label> - <ShipType>',
-    omitting empty/whitespace-only parts.
+# The separator of the one-line bottom caption: space, U+00B7 MIDDLE DOT, space.
+# Built with chr() so the source stays pure ASCII.
+CAPTION_SEP = " " + chr(0xB7) + " "
 
-    label only -> 'Cyno'; ship only -> 'Onyx'; both -> 'Cyno - Onyx';
-    neither -> '' (caller hides the label entirely). When both parts are present
-    and equal case-insensitively (e.g. a rule labels an Onyx hull "Onyx"), the
-    value is shown ONCE -> 'Onyx' rather than 'Onyx - Onyx'. Pure/Tk-free."""
-    parts = [p.strip() for p in (activity_label, ship_type_name)
+
+def format_caption_line(system_name, ship_type_name) -> str:
+    """Join the pilot's system and ship TYPE name as '<System> · <ShipType>' (the
+    tile's ONE bottom line), omitting empty/whitespace-only parts.
+
+    both -> 'Jita · Onyx'; system only -> 'Jita'; ship only -> 'Onyx';
+    neither -> '' (caller hides the line entirely). Each part is stripped. The
+    tile auto-fits the font to the joined text (set_bottom_label), so a long
+    system or ship name shrinks the type instead of clipping. Pure/Tk-free."""
+    parts = [str(p).strip() for p in (system_name, ship_type_name)
              if p and str(p).strip()]
-    if len(parts) == 2 and parts[0].casefold() == parts[1].casefold():
-        return parts[0]
-    return " - ".join(parts)
+    return CAPTION_SEP.join(parts)
 
 
 def _ellipsize(text: str, max_chars: int) -> str:
@@ -785,8 +789,8 @@ class TileWindow:
                                   place_above=True, place_fn=self._place_implant_tip)
 
         # ── bottom caption strip (mirror of the top strip) ──────────────────
-        # In the STRIPS layout (the default) the activity label
-        # ('<label> - <ShipType>') lives in a small strip BELOW the video. A
+        # In the STRIPS layout (the default) the ONE bottom line
+        # ('<System> · <ShipType>') lives in a small strip BELOW the video. A
         # child widget over the video is DWM-occluded, so the only way to draw
         # text over the picture is a separate window - the BAND layout
         # (set_text_band), in which this strip and the location strip stay
@@ -2414,9 +2418,10 @@ class TileWindow:
             except Exception:
                 pass
 
-    # ── bottom caption strip label ('<label> - <ShipType>', below the video) ──
+    # ── bottom caption line ('<System> · <ShipType>', below the video) ──────
     def set_bottom_label(self, text, color=None, size=None):
-        """Show the activity label ('<label> - <ShipType>'): in the bottom strip
+        """Show the bottom line ('<System> · <ShipType>', see
+        format_caption_line): in the bottom strip
         BELOW the video (the default layout), or as the band's label line over
         the video (set_text_band). The rest of this docstring is the strip path.
 
@@ -2429,7 +2434,7 @@ class TileWindow:
         RESTORE PATH: this always repaints the strip/label to the normal panel
         background + given fg and clears the decloak-alert flag, so after a
         decloak banner's window expires the next compose-tick call here brings the
-        normal 'Label - ShipType' text and panel bg back automatically — a yellow
+        normal '<System> · <ShipType>' text and panel bg back automatically — a yellow
         strip is never left behind. (Band layout: the same contract - this call
         ends a live banner and the label line takes its row back.)"""
         text = "" if not text else str(text)
@@ -2696,6 +2701,9 @@ class TileWindow:
             return self._ellipsize_bottom(text, base), base
 
     # ── location caption strip (its own thin line, below the label strip) ─────
+    # NOTE: fc_gui no longer drives this strip - the system rides the ONE bottom
+    # line via set_bottom_label (format_caption_line) and compose always pushes
+    # ''. The strip API is kept intact (and tested) but unused.
     def set_location_label(self, text, color=None, size=None):
         """Show the pilot's current system/location on its OWN thin strip BELOW
         the activity-label strip (the lowest line of the tile). Mirrors
