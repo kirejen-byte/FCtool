@@ -21034,9 +21034,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             self._overlay_enable()
 
     def _overlay_seed_rules_if_empty(self):
-        """Plant the starter label rules once, the first time either consumer
-        of the shared rules is enabled (Eve-O overlay labels OR native tile
-        captions — both read the same overlay.rules list)."""
+        """Plant the starter label rules once, the first time the Eve-O overlay
+        labels are enabled (the only consumer of overlay.rules; native tile
+        captions no longer read them). Also called at native start-up, which is
+        now just harmless - it keeps the list non-empty for a later Eve-O mode."""
         cfg = self._overlay_cfg()
         if not cfg.get("rules"):
             cfg["rules"] = [
@@ -22973,6 +22974,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
           doctrine tag (first, sorted) > "". An empty-string override means
           "hide" and still wins.
 
+        NOTE: the native compose pass (_preview_compose_captions) no longer draws
+        the tag - it passes empty rules / overrides / tag index and
+        doctrine_tag_captions=False, so the tag (4th member) is always "" there.
+        The precedence below is kept (and tested) as a pure function.
+
         `overrides_norm` is the overlay overrides map with keys ALREADY stripped
         and lowercased. PV3: that normalization used to run here, i.e. once per
         tile per tick over the whole override map; it now rides the caption memo
@@ -23040,10 +23046,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         invalidation key — no second memo, no new staleness class.
 
         SECOND CONSUMER (2026-08-29, design §B3): a roles-mode cycle group takes
-        its `tag_index` from here, so a Tag criterion and a doctrine-tag caption
-        can never disagree about what a hull is. That is the whole reason this
-        block is a method — the memo attribute name, key and rebuild semantics
-        are unchanged. Every edge is getattr-guarded (the `fittings` idiom this
+        its `tag_index` from here. (It was once shared with the doctrine-tag
+        caption, which no longer reaches a tile; the compose pass now reads only
+        `ocfg` - the roles ring is the sole `tag_index` consumer.) That is the
+        whole reason this block is a method — the memo attribute name, key and
+        rebuild semantics are unchanged. Every edge is getattr-guarded (the `fittings` idiom this
         block already used) so a bare SimpleNamespace host answers with an empty
         bundle instead of raising."""
         store = getattr(self, "fittings", None)
@@ -23172,6 +23179,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                           else (state.system_name or ""))
                 text = preview_tile.format_caption_line(system, ship_name)
                 self._preview_video_labels[hwnd] = text  # kept for tests/logging
+                # The second (location) strip is retired: the system rides the
+                # bottom line below. Pushing '' FIRST hides a strip a tile still
+                # shows from the old two-strip layout BEFORE the bottom line is
+                # (re)painted, so an upgrading tile re-letterboxes once, not twice.
+                tile.set_location_label("")
                 # DECLOAK banner overrides the bottom line while the window is
                 # live (login screens never alert). Once it expires, the normal
                 # branch below runs again and set_bottom_label repaints the panel
@@ -23190,9 +23202,6 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     tile.set_bottom_label(text, bottom_color, bottom_size)
                 else:
                     tile.set_bottom_label("")   # both flags off → hide the strip
-                # The second (location) strip is retired: the system rides the
-                # line above. Pushing '' keeps it hidden on every tile.
-                tile.set_location_label("")
                 # Major-implants icon. A login screen has no character, so it
                 # never carries one — and never reads a verdict published under
                 # the shared login key "".
@@ -24191,9 +24200,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                      "%dx%d floor", preview_layout.MIN_TILE_W,
                      preview_layout.MIN_TILE_BODY_H)
             self._save_config()
-        # Native captions consume the SAME overlay.rules list as the Eve-O label
-        # overlay — a native-only fresh user must get the seed rules too (same
-        # condition _overlay_enable uses).
+        # Native captions no longer consume overlay.rules (only the Eve-O label
+        # overlay does); the seed is kept so a native-first user who later
+        # switches to Eve-O mode finds the starter rules (same as _overlay_enable).
         self._overlay_seed_rules_if_empty()
         # C2: resolve the real foreground/win32 backend for the hide-on-lost-focus
         # and hide-active rules (lazy real singleton; tests inject their own fake
@@ -26290,21 +26299,22 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # video' band). Grey it out when mode == native.
         self._preview_sync_anchor_enabled()
 
-        # Row 3 (shared): Label rules… button (rules + manual tags modal). Native
-        # captions reuse these same rules, so it lives in the shared frame too.
+        # Row 3 (shared frame): Label rules… button (rules + manual tags modal).
+        # Only the Eve-O overlay consumes these rules / overrides now (an FCPreview
+        # tile no longer draws a role label), so _preview_show_mode_panel packs
+        # this row in Eve-O Enhancement mode and hides it in FCPreview mode.
         row3 = tk.Frame(shared, bg=BG_DARK)
         row3.pack(fill=tk.X, pady=2)
+        self._overlay_labels_row = row3
         labels_btn = ttk.Button(row3, text="Labels", style="Dark.TButton",
                                 command=self._open_overlay_rules_dialog)
         labels_btn.pack(side=tk.LEFT)
         self._overlay_labels_button = labels_btn
         _labels_tip = (
-            "Define how thumbnails/tiles are labelled from your own ESI data "
+            "Define how thumbnails are labelled from your own ESI data "
             "(ship group, type, system…). Overrides pin custom text per "
-            "character. Shared by Eve-O Enhancement and FCPreview.")
-        labels_btn.bind(
-            "<Enter>", lambda e, t=_labels_tip: self._show_tooltip(e, t))
-        labels_btn.bind("<Leave>", lambda e: self._hide_tooltip())
+            "character. Eve-O Enhancement mode only.")
+        _tip(labels_btn, _labels_tip)
 
         # ── FCPreview settings categories ────────────────────────────────────
         # ~30 controls in one always-visible wall is what this section grew
@@ -26508,8 +26518,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             activeforeground=FG_TEXT)
         cbc.grid(row=0, column=0, padx=(0, 8))
         w.append(cbc)
-        _tip(cbc, "Show a text caption on each preview tile (character name or its "
-                  "label rule).")
+        _tip(cbc, "Show a text caption on each preview tile (the character "
+                  "name, status dot and role chip).")
 
         # (The "Default caption = doctrine tag" checkbox is gone: the role /
         # doctrine-tag label is no longer drawn on a tile. Its config key
@@ -26524,11 +26534,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             activeforeground=FG_TEXT)
         cblv.grid(row=0, column=1, padx=(0, 8))
         w.append(cblv)
-        _tip(cblv, "Show the ship type on the ONE bottom line of each preview "
-                   "tile (with Show location on, the system comes first: "
-                   "Jita, then Onyx), at "
-                   "the font size set above; the font shrinks to fit a long "
-                   "name. "
+        _tip(cblv, "Show each pilot's ship type on the tile's single bottom "
+                   "line. With Show location also on, the system comes first "
+                   "and the ship second, on that same line. The font starts "
+                   "at the size set above and shrinks to fit a long name. "
                    "The 'Label text' switch below chooses where it is drawn: "
                    "Caption = a strip below the video, in the colour set "
                    "above; Text over video = a band over the picture, in its "
@@ -26544,10 +26553,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             activeforeground=FG_TEXT)
         cbloc.grid(row=0, column=2, padx=(0, 8))
         w.append(cbloc)
-        _tip(cbloc, "Adds each pilot's current system to the same bottom line "
-                    "as the ship type (system first, then the ship, split by a "
-                    "dot); "
-                    "the font shrinks to fit a long name.")
+        _tip(cbloc, "Puts each pilot's current system at the front of the same "
+                    "bottom line as the ship type, separated by a dot. The "
+                    "font shrinks to fit a long name.")
 
         # -- Display > row 3 (native): WHERE that bottom text is drawn --------
         # A two-segment switch on ONE StringVar (preview.text_placement) plus
@@ -26569,7 +26577,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                           "available under Wine / Proton, so previews keep "
                           "the Caption layout here.")
         _place_tip = (
-            "Where each preview draws its label, location and DECLOAKED text. "
+            "Where each preview draws its bottom line and the DECLOAKED banner. "
             "Caption: in strips below the video, which take their height out "
             "of the picture. Text over video: on a translucent band over the "
             "bottom of the picture, so the text costs no picture height."
@@ -27470,6 +27478,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         if shared is not None:
             try:
                 shared.pack_forget()
+            except tk.TclError:
+                pass
+        # The Labels button row (rules + overrides) feeds the Eve-O overlay only:
+        # shown in Eve-O Enhancement mode, hidden in FCPreview mode. It is the
+        # LAST child of the shared frame, so re-packing it restores its place.
+        labels_row = getattr(self, "_overlay_labels_row", None)
+        if labels_row is not None:
+            try:
+                if active == "native":
+                    labels_row.pack_forget()
+                else:
+                    labels_row.pack(fill=tk.X, pady=2)
             except tk.TclError:
                 pass
         panel = panels.get(active)
