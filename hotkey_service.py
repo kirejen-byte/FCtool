@@ -11,6 +11,11 @@ Verified facts this design rests on (do not "simplify" them away):
   and declining to act on the WM_HOTKEY would not give the keystroke back. Only
   UNREGISTERING releases the key, so an "only while EVE is focused" gate has to
   be dynamic registration — see suspend() below.
+- The worker must create its message queue BEFORE the first RegisterHotKey.
+  Windows creates it implicitly; Wine does not (wineserver records the hotkey
+  with a NULL queue), so a bound key then crashes wineserver on keypress and a
+  restart orphans the registration (every key reports 1409). PeekMessageW
+  with PM_NOREMOVE forces the queue into existence and is harmless on Windows.
 - ERROR_HOTKEY_ALREADY_REGISTERED == 1409 → surfaced per-binding via .failures.
 """
 from __future__ import annotations
@@ -22,6 +27,7 @@ from ctypes import wintypes
 
 MOD_ALT, MOD_CONTROL, MOD_SHIFT, MOD_WIN, MOD_NOREPEAT = 0x1, 0x2, 0x4, 0x8, 0x4000
 WM_HOTKEY, WM_QUIT = 0x0312, 0x0012
+WM_USER, PM_NOREMOVE = 0x0400, 0x0000
 
 _VK = {**{f"F{i}": 0x6F + i for i in range(1, 25)}}          # F1=0x70 … F24=0x87
 _VK.update({c: ord(c) for c in "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"})
@@ -241,11 +247,22 @@ class _RealBackend:  # pragma: no cover — exercised by spike S2 + live
                                            wintypes.UINT, wintypes.UINT]
         self._u.RegisterHotKey.restype = wintypes.BOOL
         self._u.UnregisterHotKey.argtypes = [wintypes.HWND, ctypes.c_int]
+        self._u.PeekMessageW.argtypes = [ctypes.POINTER(wintypes.MSG),
+                                         wintypes.HWND, wintypes.UINT,
+                                         wintypes.UINT, wintypes.UINT]
+        self._u.PeekMessageW.restype = wintypes.BOOL
         self._u.PostThreadMessageW.argtypes = [wintypes.DWORD, wintypes.UINT,
                                                wintypes.WPARAM, wintypes.LPARAM]
 
     def current_thread_id(self):
         return self._k.GetCurrentThreadId()
+
+    def ensure_queue(self):
+        # Microsoft's documented idiom to force this thread's message queue
+        # into existence (a no-op peek of a WM_USER..WM_USER range).
+        msg = wintypes.MSG()
+        self._u.PeekMessageW(ctypes.byref(msg), None, WM_USER, WM_USER,
+                             PM_NOREMOVE)
 
     def register(self, hk_id, mods, vk):
         return bool(self._u.RegisterHotKey(None, hk_id, mods, vk))
@@ -353,6 +370,17 @@ class HotkeyService:
     def _run(self, bindings):
         be = self._backend
         self._tid = be.current_thread_id()
+        # Create the thread's message queue BEFORE the first RegisterHotKey.
+        # Windows makes it implicitly; Wine does not, and wineserver then
+        # stores the hotkey with a NULL queue: a keypress crashes wineserver
+        # (EVE + FCTool die) and the unmatched UnregisterHotKey on restart
+        # leaves it orphaned, so every key reports "in use" (1409).
+        ensure_queue = getattr(be, "ensure_queue", None)
+        if ensure_queue is not None:
+            try:
+                ensure_queue()
+            except Exception:
+                pass  # best effort: registration must still be attempted
         registered = []
         for hk_id, (mods, vk) in bindings.items():
             if be.register(hk_id, mods, vk):
