@@ -1770,9 +1770,12 @@ class _Controller:
                        the Import page: the file, and the plan of it
       ``doctrine_pairs``   ``{record key: doctrine_match.Pair}`` - the file's doctrines that
                        look like the importer's (``group_apply.plan_matches``, ONCE per file)
-      ``doctrine_choices`` ``{record key: action}`` - the choices MADE for them (remembered
-                       ones pre-set), each one sent; a pair without one is not sent and
-                       has its default (``pair_default``)
+      ``doctrine_choices`` ``{record key: action}`` - the choices MADE for them (clicked,
+                       or pre-set from the remembered ones); a pair without one has its
+                       default (``pair_default``). What is sent while its row is ticked
+                       (D8): a pair of different names ALWAYS - its choice, else a merge;
+                       a pair of the same name only once a choice is made for it
+                       (clicked or remembered), else it follows the item's radio
       ``imports`` / ``attention_flags`` / ``pending``    the History page
 
     Methods: ``show_page(name)``, ``set_mode(mode)``, ``toggle(row)``, ``select(row)``,
@@ -3723,9 +3726,11 @@ class _Controller:
         self._write(text, parts, subject=("import", row))
 
     def _show_options(self) -> None:
-        """The choices of the selected item, above the text: how its list is merged (only
-        an item that knows both ways), who wins a same-named entry (only an item that can
-        have one)."""
+        """The choices of the selected row, above the text: on an item's row (and any
+        record of it but a paired doctrine) how its list is merged (only an item that
+        knows both ways) and who wins a same-named entry (only an item that can have one);
+        on a paired doctrine's row ONLY "This doctrine:" - the item's radios stay on the
+        item's row, so the text under them keeps its room."""
         frame, view = self._options_frame, self._views["import"]
         try:
             for child in frame.winfo_children():
@@ -3735,33 +3740,37 @@ class _Controller:
             item_id = self._item_of(view, view.sel) if self.bundle is not None else None
             item = _item(item_id) if item_id in self.file_payloads else None
             groups = []
-            if item is not None and all(mode in item.modes for mode, _text in MODE_CHOICES):
-                groups.append(("mode", "Your own entries:", MODE_CHOICES,
-                               self.item_modes.get(item_id, item.modes[0])))
-            conflicts = item_conflict_choices(item)     # three for the doctrines
-            if conflicts:
-                groups.append(("conflict", "An entry of the same name:", conflicts,
-                               self.item_conflicts.get(item_id, conflicts[0][0])))
-            # A paired doctrine's own choice, under the item's (spec "doctrine merge" 9).
+            # A paired doctrine's own choice (spec "doctrine merge" 9) stands alone.
             pair_key = self._pair_key(view.sel) if item is not None else None
             if pair_key is not None:
                 groups.append(("doctrine", "This doctrine:",
                                pair_choices(self.doctrine_pairs[pair_key]),
                                self.doctrine_choice(pair_key)))
+            else:
+                if item is not None \
+                        and all(mode in item.modes for mode, _text in MODE_CHOICES):
+                    groups.append(("mode", "Your own entries:", MODE_CHOICES,
+                                   self.item_modes.get(item_id, item.modes[0])))
+                conflicts = item_conflict_choices(item)     # three for the doctrines
+                if conflicts:
+                    groups.append(("conflict", "An entry of the same name:", conflicts,
+                                   self.item_conflicts.get(item_id, conflicts[0][0])))
             if not groups:
                 frame.pack_forget()
                 return
             self._option_item, self._option_pair = item_id, pair_key
             self._option_rows = {}
-            for index, (kind, caption, choices, current) in enumerate(groups):
-                parent, row = frame, 3 * index
+            base = 0
+            for kind, caption, choices, current in groups:
+                parent, row = frame, base
                 if kind == "doctrine":
-                    # Its own frame, so its choices (four for a pair of different names) do
-                    # not share - and widen - the columns of the item's above it; it spans
-                    # column 2 too (weight 1, _build_import), which takes whatever it is
-                    # wider by (the item's third radio there is anchored west: it stays).
+                    # Its own frame, gridded at its group's first row across all three
+                    # columns: its choices (four for a pair of different names) make
+                    # columns of their own and never set the item radios' widths.
                     parent, row = tk.Frame(frame, bg=BG_DARK), 0
-                    parent.grid(row=3 * index, column=0, columnspan=3, sticky=tk.W)
+                    parent.grid(row=base, column=0, columnspan=3, sticky=tk.W)
+                # The caption, then one row per radio: _place_options may stack them all.
+                base += 1 + len(choices)
                 self._option_rows[kind] = row
                 self._label(parent, caption, font=_HINT_FONT, fg=FG_DIM, anchor=tk.W).grid(
                     row=row, column=0, columnspan=len(choices), sticky=tk.W)
@@ -3863,8 +3872,10 @@ class _Controller:
         item's "An entry of the same name" radio for that doctrine, and it is SENT
         (``_import_options``) even when it equals the pair's default. Anything else is
         refused (False), and so is the choice already made for it (False: nothing changed).
-        Otherwise True: what is sent changed, so the plan runs again, behind the debounce.
-        The choice is kept while the row is unticked; it is only not sent."""
+        Otherwise every explicit click is recorded and True: the plan runs again, behind
+        the debounce - though what is sent may be unchanged (a pair of different names
+        clicked on its default, the merge it was already sent as). The choice is kept
+        while the row is unticked; it is only not sent."""
         pair = self.doctrine_pairs.get(record_key) if isinstance(record_key, str) else None
         if self._closed or self.bundle is None or pair is None \
                 or not isinstance(action, str) or action not in dict(pair_choices(pair)) \
