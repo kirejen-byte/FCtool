@@ -740,6 +740,42 @@ def plan_import(app_dir, bundle, options, *, ctx=None):
     return results, problems
 
 
+DOCTRINES_ITEM = "fittings.doctrines"   # the one item whose pairs the window asks about
+
+
+def _no_matches() -> dict:
+    return {"pairs": {}, "remembered": {}}
+
+
+def plan_matches(app_dir, bundle, *, ctx=None) -> dict:
+    """The group file's doctrines that look like ones the importer already has, for the
+    window to ask about next to ``plan_import``. -> ``{"pairs": {record_key: Pair},
+    "remembered": {record_key: {"action", "local_id"}}}`` (``remembered``: the choices made
+    for this group's last file - always ``{}`` for now).
+
+    Writes nothing and never raises: a build that is missing item modules, a
+    ``config.json`` or library that cannot be read or is in use right now, no library at
+    all (nothing to pair with) and any exception all give the empty answer. Whether the
+    library is one this build can pair against at all (a newer format) is the doctrines
+    item's own question, answered in its ``matches``."""
+    try:
+        if _incomplete():
+            return _no_matches()
+        busy = []
+        state = group_state.load_state(app_dir, busy_out=busy)
+        if {"config", "fittings"} & set(busy) or not isinstance(state.config, dict) \
+                or not isinstance(state.fittings, dict):
+            return _no_matches()
+        payloads, _problems = group_items.validate_bundle(bundle, ctx)
+        pairs = group_items.matches(state, payloads, ctx).get(DOCTRINES_ITEM)
+        found = _no_matches()
+        if isinstance(pairs, dict):
+            found["pairs"] = {key: pair for key, pair in pairs.items() if isinstance(key, str)}
+        return found
+    except Exception:
+        return _no_matches()
+
+
 def stage_error_text(exc) -> str:
     """The sentence the window shows for an exception of ``stage_import`` / ``stage_restore``:
     ``MSG_TOO_BIG`` (``group_state.StateTooBigError``), ``MSG_APPLYING`` (another FCTool

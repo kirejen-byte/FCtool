@@ -13,7 +13,7 @@ it (``apply``). This module holds
   ``config.json`` fields) and :class:`NameListItem` (a list of names at one config path);
 * the engine: ``register`` / ``registry`` / ``get_item``, ``export_all``,
   ``collect_export_notes``, ``build_bundle``, ``validate_bundle``, ``apply_bundle``,
-  ``preview``. ``registry()`` loads the item modules (``group_items_*``) on its first call.
+  ``preview``, ``matches``. ``registry()`` loads the item modules (``group_items_*``) on its first call.
 
 Two rules hold everywhere (spec section 4): **absent means untouched** - a field, record or
 item that is not in the payload is not read, compared or written - and **an import never
@@ -62,6 +62,7 @@ import re
 import sys
 import threading
 import uuid
+from collections import namedtuple
 from copy import deepcopy
 from dataclasses import dataclass, field as _dc_field
 from datetime import datetime, timezone
@@ -106,7 +107,10 @@ KINDS = ("value", "collection")
 FIELD_KINDS = ("bool", "int", "str", "enum", "system", "names")
 STATUSES = ("applied", "unchanged", "skipped", "failed")
 CONFLICTS = ("theirs", "mine")
-MAX_LIST = 500                          # spec section 5: 500 systems / channels per list
+# What the importer may choose for ONE record the detector paired with one of theirs
+# (``Options.resolutions``). Only an item with ``resolves = True`` is ever handed them.
+RESOLUTION_ACTIONS = ("theirs", "mine", "both", "merge")
+MAX_LIST = 500                         # spec section 5: 500 systems / channels per list
 MAX_PROBLEMS = 50                       # problem lines of one validate_bundle, then "and <n> more"
 MAX_RESULT_LINES = 50                   # warnings / notes of one ItemResult, and the export
 #                                         notes of one item; then "and <n> more"
@@ -121,10 +125,24 @@ _ITEM_MODULE_PREFIX = "group_items_"    # the name every item module starts with
 
 # ── State and context ───────────────────────────────────────────────────────
 
+# Where an incoming doctrine (by its name in the group file) landed in the importer's
+# library: ``name`` = the importer's doctrine name, ``keep_mine`` = the importer kept theirs.
+Alias = namedtuple("Alias", "name keep_mine")
+
+
 @dataclass
 class State:
     """The five files, parsed. Each value is a ``dict``, ``None`` (the file does not exist)
-    or ``UNREADABLE`` (it exists and must never be written)."""
+    or ``UNREADABLE`` (it exists and must never be written).
+
+    ``aliases`` is NOT a file: an in-memory map ``{incoming doctrine name: Alias}`` that the
+    doctrines item leaves for the items after it within ONE apply (MOTD and ping templates
+    follow the importer's doctrine). It is a plain instance attribute set in
+    ``__post_init__``, deliberately NOT a dataclass field - the fields are exactly the
+    ``FILE_NAMES`` keys - so it is not part of equality, ``repr`` or a constructor call, is
+    never loaded or written (everything that touches disk walks ``FILE_NAMES``), and
+    ``copy`` gives the twin its own. The engine clears it when a ``resolves`` item fails
+    or is skipped."""
 
     config: object
     fittings: object = None
@@ -132,8 +150,13 @@ class State:
     infra: object = None
     palette: object = None
 
+    def __post_init__(self):
+        self.aliases = {}
+
     def copy(self):
-        return State(**{key: deepcopy(getattr(self, key)) for key in FILE_NAMES})
+        twin = State(**{key: deepcopy(getattr(self, key)) for key in FILE_NAMES})
+        twin.aliases = deepcopy(self.aliases)
+        return twin
 
     def readable(self, key) -> bool:
         """True when an item may work on this file: it parsed, or it is missing and can be
@@ -432,12 +455,18 @@ class Options:
     item's ``modes``, ``conflicts[item_id]`` is ``theirs`` or ``mine``; both fall back to the
     item's default. ``apply_tag`` says whether an import may set the group tag - the engine
     ignores it, ``group_apply`` reads it.
+
+    ``resolutions[item_id][record_key] = {"action": a, "local_id": id}`` (``a`` one of
+    ``RESOLUTION_ACTIONS``): the importer's choice for one record the detector paired with
+    one of theirs. Handed - as ``resolutions=`` - only to an item with ``resolves = True``.
+    It is the LAST field: ``Options(selected, modes, conflicts, apply_tag)`` still builds.
     """
 
     selected: dict = _dc_field(default_factory=dict)
     modes: dict = _dc_field(default_factory=dict)
     conflicts: dict = _dc_field(default_factory=dict)
     apply_tag: bool = True
+    resolutions: dict = _dc_field(default_factory=dict)
 
     @classmethod
     def everything(cls, payloads):
@@ -447,16 +476,26 @@ class Options:
         return cls(selected={item_id: True for item_id, payload in payloads.items()
                              if isinstance(item_id, str) and payload is not ABSENT})
 
+    def _fields(self) -> dict:
+        return {"selected": self.selected, "modes": self.modes, "conflicts": self.conflicts,
+                "apply_tag": self.apply_tag, "resolutions": self.resolutions}
+
     def to_json(self) -> dict:
-        clean = Options.from_json({"selected": self.selected, "modes": self.modes,
-                                   "conflicts": self.conflicts, "apply_tag": self.apply_tag})
-        return {"selected": clean.selected, "modes": clean.modes,
+        """The options as plain JSON. ``resolutions`` is written only when there is one,
+        so options without any stage exactly what they did before the field existed."""
+        clean = Options.from_json(self._fields())
+        data = {"selected": clean.selected, "modes": clean.modes,
                 "conflicts": clean.conflicts, "apply_tag": clean.apply_tag}
+        if clean.resolutions:
+            data["resolutions"] = clean.resolutions
+        return data
 
     @classmethod
     def from_json(cls, data):
         """Tolerant: garbage reads as empty options; a missing or non-bool ``apply_tag``
-        reads as ``True``. The result shares nothing with ``data``."""
+        reads as ``True``; a resolution that is not ``{"action": <one of
+        RESOLUTION_ACTIONS>, "local_id": <non-empty str>}`` under a ``str`` item id and a
+        ``str`` record key is dropped. The result shares nothing with ``data``."""
         if not isinstance(data, dict):
             return cls()
         selected = {}
@@ -478,14 +517,33 @@ class Options:
 
         return cls(selected=selected, modes=_words(data.get("modes")),
                    conflicts=_words(data.get("conflicts")),
-                   apply_tag=data.get("apply_tag") is not False)
+                   apply_tag=data.get("apply_tag") is not False,
+                   resolutions=_clean_resolutions(data.get("resolutions")))
+
+
+def _clean_resolutions(raw) -> dict:
+    """``Options.resolutions`` rebuilt from scratch out of anything: only well-formed
+    entries, only their two keys; an item left with no entry is left out. Total."""
+    clean = {}
+    for item_id, entries in (raw.items() if isinstance(raw, dict) else ()):
+        if not isinstance(item_id, str) or not isinstance(entries, dict):
+            continue
+        kept = {}
+        for record_key, entry in entries.items():
+            if not isinstance(record_key, str) or not isinstance(entry, dict):
+                continue
+            action, local_id = entry.get("action"), entry.get("local_id")
+            if isinstance(action, str) and action in RESOLUTION_ACTIONS \
+                    and isinstance(local_id, str) and local_id:
+                kept[record_key] = {"action": action, "local_id": local_id}
+        if kept:
+            clean[item_id] = kept
+    return clean
 
 
 def _options(options) -> Options:
     if isinstance(options, Options):
-        return Options.from_json({"selected": options.selected, "modes": options.modes,
-                                  "conflicts": options.conflicts,
-                                  "apply_tag": options.apply_tag})
+        return Options.from_json(options._fields())
     return Options.from_json(options)
 
 
@@ -663,6 +721,10 @@ class Item:
     ``never_saved`` human lines: what this item leaves out of a file on purpose
     ``partial_ok``  True when the item copes with an unreadable SIDE file itself; an
                     unreadable ``config.json`` skips every item that names it regardless
+    ``resolves``    True when the item takes per-record choices: the engine then calls
+                    ``apply(..., resolutions=options.resolutions.get(id, {}))`` - every
+                    other item is called exactly as before - and clears ``state.aliases``
+                    when the item fails or is skipped
     """
 
     id = ""
@@ -676,6 +738,7 @@ class Item:
     conflicts = False
     never_saved = ()
     partial_ok = False
+    resolves = False
 
     def __init__(self, **attrs):
         for name, value in attrs.items():
@@ -749,8 +812,16 @@ class Item:
             return ABSENT
         return [entry for entry, key in zip(payload, row_keys) if key in wanted] or ABSENT
 
+    def matches(self, state, payload) -> dict:
+        """``{record_key: doctrine_match.Pair}``: the records of a validated payload that
+        look like ones this setup already has - what the importer is asked to choose for
+        (``Options.resolutions``). ``{}`` when the item pairs nothing (the default). Reads
+        only; ``group_items.matches`` contains a failure."""
+        return {}
+
     def apply(self, state, payload, mode, conflict, ctx) -> ItemResult:
-        """Land a validated payload in ``state`` and say what changed."""
+        """Land a validated payload in ``state`` and say what changed. An item with
+        ``resolves = True`` also takes the keyword ``resolutions``."""
         raise NotImplementedError(f"{type(self).__name__}.apply")
 
 
@@ -1579,7 +1650,11 @@ def _distrust(result, before, state) -> list:
 
 def _apply(state, payloads, options, ctx, broken=None):
     """``apply_bundle``. With ``broken`` (an exception type name: the state could not even
-    be copied) nothing runs and every item that would have run is ``failed`` with it."""
+    be copied) nothing runs and every item that would have run is ``failed`` with it.
+
+    A ``resolves`` item that ends ``failed`` or ``skipped`` clears ``state.aliases``: no
+    later item may follow an alias onto a doctrine the group's never reached. (Not with
+    ``broken``: nothing ran, and that state is the caller's own.)"""
     options = _options(options)
     ctx = default_ctx() if ctx is None else ctx
     results = []
@@ -1588,50 +1663,65 @@ def _apply(state, payloads, options, ctx, broken=None):
     for item in registry():
         if item.id not in payloads or item.id not in options.selected:
             continue
-        try:
-            payload = _selection(item, payloads[item.id], options.selected[item.id])
-        except Exception as exc:
-            results.append(_failed(item, type(exc).__name__))
+        result = _apply_item(state, item, payloads[item.id], options, ctx, broken)
+        if result is None:
             continue
-        if payload is ABSENT or payload is None:
-            continue
-        if broken is not None:
-            results.append(_failed(item, broken))
-            continue
-
-        unreadable = [key for key in item.files if not state.readable(key)]
-        if unreadable and ("config" in unreadable or not item.partial_ok):
-            results.append(ItemResult(item.id, status="skipped", warnings=[
-                f"{FILE_NAMES.get(key, key)} could not be read" for key in unreadable]))
-            continue
-
-        mode = options.modes.get(item.id)
-        if not isinstance(mode, str) or mode not in item.modes:
-            mode = item.modes[0]
-        conflict = options.conflicts.get(item.id)
-        if not isinstance(conflict, str) or conflict not in CONFLICTS:
-            conflict = CONFLICTS[0]
-
-        try:                                    # nothing has run yet: nothing to roll back
-            before = {key: deepcopy(getattr(state, key)) for key in item.files}
-            own_payload = deepcopy(payload)
-        except Exception as exc:                # RecursionError: nested too deep to copy
-            results.append(_failed(item, type(exc).__name__))
-            continue
-        try:
-            result = item.apply(state, own_payload, mode, conflict, ctx)
-            if not isinstance(result, ItemResult):
-                raise TypeError("apply returned no ItemResult")
-            doubts = _distrust(result, before, state)
-        except Exception as exc:
-            doubts = [type(exc).__name__]
-        if doubts:
-            for key, value in before.items():   # ONLY the declared files, EXACTLY as before
-                setattr(state, key, value)
-            result = _failed(item, *doubts)
-        result.item_id = item.id
-        results.append(result.bound())          # an item need not have settled its result
+        results.append(result)
+        if broken is None and getattr(item, "resolves", False) is True \
+                and result.status in ("failed", "skipped"):
+            aliases = getattr(state, "aliases", None)
+            if isinstance(aliases, dict):
+                aliases.clear()
     return state, results
+
+
+def _apply_item(state, item, raw_payload, options, ctx, broken):
+    """One item of ``_apply``: its (bounded) ``ItemResult``, or ``None`` when the options
+    select nothing of its payload."""
+    try:
+        payload = _selection(item, raw_payload, options.selected[item.id])
+    except Exception as exc:
+        return _failed(item, type(exc).__name__)
+    if payload is ABSENT or payload is None:
+        return None
+    if broken is not None:
+        return _failed(item, broken)
+
+    unreadable = [key for key in item.files if not state.readable(key)]
+    if unreadable and ("config" in unreadable or not item.partial_ok):
+        return ItemResult(item.id, status="skipped", warnings=[
+            f"{FILE_NAMES.get(key, key)} could not be read" for key in unreadable])
+
+    mode = options.modes.get(item.id)
+    if not isinstance(mode, str) or mode not in item.modes:
+        mode = item.modes[0]
+    conflict = options.conflicts.get(item.id)
+    if not isinstance(conflict, str) or conflict not in CONFLICTS:
+        conflict = CONFLICTS[0]
+
+    try:                                    # nothing has run yet: nothing to roll back
+        before = {key: deepcopy(getattr(state, key)) for key in item.files}
+        own_payload = deepcopy(payload)
+    except Exception as exc:                # RecursionError: nested too deep to copy
+        return _failed(item, type(exc).__name__)
+    try:
+        if getattr(item, "resolves", False) is True:
+            # its own copy, like the payload (``_options`` already rebuilt it from scratch)
+            result = item.apply(state, own_payload, mode, conflict, ctx,
+                                resolutions=deepcopy(options.resolutions.get(item.id, {})))
+        else:
+            result = item.apply(state, own_payload, mode, conflict, ctx)
+        if not isinstance(result, ItemResult):
+            raise TypeError("apply returned no ItemResult")
+        doubts = _distrust(result, before, state)
+    except Exception as exc:
+        doubts = [type(exc).__name__]
+    if doubts:
+        for key, value in before.items():   # ONLY the declared files, EXACTLY as before
+            setattr(state, key, value)
+        result = _failed(item, *doubts)
+    result.item_id = item.id
+    return result.bound()                   # an item need not have settled its result
 
 
 def preview(state, payloads, options, ctx=None) -> list:
@@ -1643,3 +1733,34 @@ def preview(state, payloads, options, ctx=None) -> list:
     except Exception as exc:
         return _apply(state, payloads, options, ctx, broken=type(exc).__name__)[1]
     return _apply(twin, payloads, options, ctx)[1]
+
+
+def matches(state, payloads, ctx=None) -> dict:
+    """``{item_id: {record_key: Pair}}`` for every registered item that has a payload in
+    ``payloads`` (the output of ``validate_bundle``), in registry order: what each item's
+    ``matches`` pairs with this setup. Never raises: an item whose ``matches`` raises or
+    answers anything but a dict gets ``{}``, and a record key that is not text is left
+    out. Reads only: each item is handed a copy of its payload, and all of them one copy
+    of the state (one that cannot be copied gives every item ``{}``). ``ctx`` is accepted
+    for symmetry with ``preview`` (``Item.matches`` takes none)."""
+    found = {}
+    if not isinstance(payloads, dict):
+        return found
+    try:
+        twin = state.copy()
+    except Exception:
+        twin = None
+    for item in registry():
+        payload = payloads.get(item.id, ABSENT)
+        if payload is ABSENT or payload is None:
+            continue
+        pairs = {}
+        if twin is not None:
+            try:
+                answer = item.matches(twin, deepcopy(payload))
+                if isinstance(answer, dict):
+                    pairs = {key: pair for key, pair in answer.items() if isinstance(key, str)}
+            except Exception:
+                pairs = {}
+        found[item.id] = pairs
+    return found
