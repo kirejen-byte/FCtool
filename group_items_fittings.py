@@ -272,7 +272,7 @@ def _merge_note(incoming, local, counts) -> str:
         (counts.tags, "tag", "tags")) if n]
     text = (f"{fittings_store._share_shown(incoming)} merged into your "
             f"{fittings_store._share_shown(local)}")
-    return f"{text}: {', '.join(parts)}" if parts else text
+    return f"{text}: {', '.join(parts) if parts else 'description added'}"
 
 
 def _fits_note(merged) -> list:
