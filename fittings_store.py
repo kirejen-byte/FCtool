@@ -296,8 +296,10 @@ class MergeResult:
 
 class MergeCounts(NamedTuple):
     """What a merge (`FittingsStore._merge_into`) added to the importer's
-    doctrine: fits added as refits of its own slots, slots only the group had,
-    tags added to its own slots."""
+    doctrine: fits added as refits of its own slots, and slots only the group
+    had. `tags` is always 0 - a merge never changes the tags of a slot of
+    mine (an appended slot's tags travel with it and count as the slot); the
+    field stays so the shape does not change."""
 
     refits: int
     slots: int
@@ -2112,9 +2114,9 @@ class FittingsStore:
         * **Merge** (a "merge" choice, or ``on_conflict`` "merge" for every
           exact-name match without a choice) - "keep mine, add what the group
           has that I don't", in MY doctrine: my id, created, name,
-          exemptions, seed target and every slot value stay; the group's
-          fits, slots and slot tags I lack are added (`_merge_into`); the
-          description is filled only when mine is blank. Nothing is ever
+          exemptions, seed target and every slot value (tags included)
+          stay; the group's fits and slots I lack are added (`_merge_into`);
+          the description is filled only when mine is blank. Nothing is ever
           removed, and merging the same payload again adds nothing (the
           doctrine is then `doctrines_unchanged`).
 
@@ -2421,35 +2423,39 @@ class FittingsStore:
         already remapped by `_merge_slots`) has that they lack, and how much
         that is. Reads only: `local` is not modified.
 
-        "Keep mine, add what the group has that I don't" (spec section 6).
-        Fits are compared BY CONTENT (`fit_content_hash`): one fit stored
-        under two ids is one fit. Each group slot, in the group's order:
+        "Keep mine, add what the group has that I don't" (spec section 6, D3:
+        the importer's values always win - tags included). Fits are compared
+        BY CONTENT (`fit_content_hash`): one fit stored under two ids is one
+        fit. A merge NEVER changes the tags of a slot I already have, so it
+        never changes that slot's role. Each group slot, in the group's order:
 
         * pairs with my FIRST still-unpaired slot of its hull that already
-          flies one of its fits (any refit); failing that, when it brings a
-          fit my doctrine does not fly yet, with my first still-unpaired slot
-          of its hull. The pair keeps my active fit, my default
-          (``refits[0]``) and every value of mine; the group's fits it lacks
-          are appended as refits (a plain slot of mine becomes ``refits = [my
-          fit, ...]``) and the group's tags it lacks are appended to its tags.
-          So tags only ever land on a slot that shares or gains a fit.
-        * a slot of the group with a new fit and no slot of mine left to pair
-          with is appended after mine, with its own values and an `order`
-          after my highest (kept in ``0 .. MAX_SHARE_COUNT``, the range
-          `validate_share` takes); it counts as paired.
+          flies one of its fits (any refit); failing that - and only when it
+          brings a fit my doctrine does not fly yet - with my first
+          still-unpaired slot of its hull whose tag set (after the store's
+          tag migration) is exactly the group slot's. A slot of mine pairs at
+          most once. The pair keeps my active fit, my default
+          (``refits[0]``), my tags and every value of mine; the group's fits
+          it lacks are appended as refits (a plain slot of mine becomes
+          ``refits = [my fit, ...]``).
+        * a group slot with a new fit and no such slot of mine is appended
+          after mine with only the fits my doctrine does not fly yet, its own
+          tags and values, and an `order` after my highest (kept in
+          ``0 .. MAX_SHARE_COUNT``, the range `validate_share` takes).
         * a fit another slot of my doctrine already flies is never added a
           second time - one its partner has is silently there, any other is
           dropped and said in `dropped` (``"<name> / <the group's fit name>:
           same fit as another slot"``). A group slot ALL of whose fits other
-          slots of mine fly adds nothing - no tag, no slot - and pairs with
-          nothing.
+          slots of mine fly adds nothing and pairs with nothing.
 
         A slot only I have is kept. A written slot of mine whose active fit is
         not among its refits (hand-edited) gets it first, as
         `_normalise_slot` does. Refits share the slot's hull: a paired slot's
         by the pairing, an appended slot's by `_merge_slots`. A second merge
-        of the same slots pairs every group slot as the first did and adds
-        nothing. `shown_as` maps a local fit id to the group's name for it."""
+        of the same slots pairs every group slot with the slot the first one
+        wrote its fits into and adds nothing. `shown_as` maps a local fit id
+        to the group's name for it. `MergeCounts.tags` is always 0: tags only
+        arrive on appended slots, which `slots` counts."""
         fits = self._fits
         contents: dict[str, object] = {}
 
@@ -2473,16 +2479,18 @@ class FittingsStore:
 
         out = list(local.members)
         held: list[set] = []                     # per slot of mine: its contents
+        tag_sets: list[set] = []                 # per slot of mine: its tags
         flown: set = set()                       # every content my doctrine flies
         unpaired: dict = {}                      # hull -> my unpaired slots, in order
         for index, member in enumerate(out):
             held.append({content(fit_id) for fit_id in [member.fit_id, *member.refits]})
+            tag_sets.append(set(_migrate_tag_list(member.tags)))
             flown |= held[index]
             unpaired.setdefault(hull_of(member.fit_id), []).append(index)
         order = max((member.order for member in out if type(member.order) is int),
                     default=-1) + 1
         added_slots: list[DoctrineMember] = []
-        refits = tags = 0
+        refits = 0
 
         for member in members:
             ids = slot_fit_ids(member)
@@ -2503,7 +2511,10 @@ class FittingsStore:
             if partner is None:
                 if not new_fits:
                     continue                     # other slots of mine fly it all
-                if not free:
+                tags = set(member.tags)          # migrated by `_merge_slots`
+                partner = next((index for index in free if tag_sets[index] == tags),
+                               None)
+                if partner is None:
                     added_slots.append(replace(
                         member,
                         fit_id=new_fits[0],
@@ -2513,22 +2524,18 @@ class FittingsStore:
                     ))
                     order += 1
                     continue
-                partner = free[0]
             free.remove(partner)
-            current = out[partner]
-            new_tags = [tag for tag in member.tags if tag not in current.tags]
-            if not (new_fits or new_tags):
+            if not new_fits:
                 continue
+            current = out[partner]
             base = list(current.refits)
             if base and current.fit_id not in base:
                 base.insert(0, current.fit_id)   # as _normalise_slot does
-            if new_fits and not base:
+            if not base:
                 base = [current.fit_id]
-            out[partner] = replace(current, tags=list(current.tags) + new_tags,
-                                   refits=base + new_fits)
+            out[partner] = replace(current, refits=base + new_fits)
             refits += len(new_fits)
-            tags += len(new_tags)
-        return out + added_slots, MergeCounts(refits, len(added_slots), tags)
+        return out + added_slots, MergeCounts(refits, len(added_slots), 0)
 
     @staticmethod
     def _same_slots(mine: list[DoctrineMember], theirs: list[DoctrineMember]) -> bool:

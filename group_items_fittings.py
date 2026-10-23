@@ -264,12 +264,11 @@ def _doctrine_detail(doctrine) -> str:
 
 
 def _merge_note(incoming, local, counts) -> str:
-    """``"<incoming> merged into your <local>: +2 refits, +1 slot, +3 tags"`` - a part that
-    is zero left out (``counts``: ``fittings_store.MergeCounts``); names as a line quotes
-    them."""
+    """``"<incoming> merged into your <local>: +2 refits, +1 slot"`` - a part that is zero
+    left out (``counts``: ``fittings_store.MergeCounts``; a merge never tags a slot of mine,
+    so ``counts.tags`` is never said); names as a line quotes them."""
     parts = [f"+{_count(n, one, many)}" for n, one, many in (
-        (counts.refits, "refit", "refits"), (counts.slots, "slot", "slots"),
-        (counts.tags, "tag", "tags")) if n]
+        (counts.refits, "refit", "refits"), (counts.slots, "slot", "slots")) if n]
     text = (f"{fittings_store._share_shown(incoming)} merged into your "
             f"{fittings_store._share_shown(local)}")
     return f"{text}: {', '.join(parts) if parts else 'description added'}"
@@ -434,7 +433,7 @@ class DoctrinesItem(_LibraryItem):
     "merge" for one pair): the group's doctrine merged into the importer's, which keeps
     its id, name and every value (``FittingsStore._merge_into``); a merge that added
     something is ``updated`` with a note ``"<incoming> merged into your <local>: +N
-    refits, +N slots, +N tags"``, one that added nothing ``unchanged``. A merge onto a
+    refits, +N slots"``, one that added nothing ``unchanged``. A merge onto a
     doctrine of another name leaves an alias like "theirs" (the templates follow the
     item's own radio).
     """
