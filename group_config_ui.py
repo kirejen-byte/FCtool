@@ -1173,15 +1173,21 @@ def result_summary(report) -> list:
 # -- doctrine pairs (spec "doctrine merge" 5, 9) --------------------------------------------
 #
 # A doctrine of the file that looks like one the importer has (``group_apply.plan_matches``
-# -> ``doctrine_match.Pair``) is offered a choice of its own. The defaults are today's
-# (D4): a pair of the same name follows the item's "An entry of the same name" radio, a
-# pair of different names keeps both.
+# -> ``doctrine_match.Pair``) is offered a choice of its own. A pair of the same name
+# follows the item's "An entry of the same name" radio (D4); a pair of different names is
+# merged into the importer's doctrine (D8, the owner, 2026-10-23) - and that default is
+# SENT, the engine never decides it at boot.
 
 DOCTRINES_ITEM = "fittings.doctrines"   # the one item whose records are paired
-PAIR_CHOICES_EXACT = (("theirs", "Use the group's version"), ("mine", "Keep mine"))
-PAIR_CHOICES_OTHER = (("both", "Keep both"),
+PAIR_CHOICES_EXACT = (("theirs", "Use the group's version"), ("mine", "Keep mine"),
+                      ("merge", "Merge"))
+PAIR_CHOICES_OTHER = (("merge", "Merge"),
+                      ("both", "Keep both"),
                       ("theirs", "Use the group's version (keeps your name)"),
                       ("mine", "Keep mine"))
+PAIR_DEFAULT_OTHER = "merge"            # D8: a pair of different names nobody chose for
+# The "This doctrine:" line of the detail text says more than the radio for these.
+PAIR_CHOICE_LINES = {"merge": "Merge - adds the group's refits, slots and tags to yours"}
 MAX_HULLS_SHOWN = 8                     # pair_detail_lines: hull names per list
 
 
@@ -1191,16 +1197,16 @@ def _exact(pair) -> bool:
 
 def pair_choices(pair) -> tuple:
     """``((action, label), ...)``: what a pair offers - "keep both" only to a pair of
-    different names (one of the same name would make a name twin)."""
+    different names (one of the same name would make a name twin), "merge" to both."""
     return PAIR_CHOICES_EXACT if _exact(pair) else PAIR_CHOICES_OTHER
 
 
 def pair_default(pair, conflict="theirs") -> str:
     """The choice a pair gets when none is made for it: a pair of the same name follows
-    the item's ``conflict`` (``theirs`` | ``mine``; anything else reads as ``theirs``), a
-    pair of different names keeps both."""
+    the item's ``conflict`` (``theirs`` | ``mine`` | ``merge``; anything else reads as
+    ``theirs``), a pair of different names is merged (D8)."""
     if not _exact(pair):
-        return "both"
+        return PAIR_DEFAULT_OTHER
     return conflict if conflict in dict(PAIR_CHOICES_EXACT) else "theirs"
 
 
@@ -1228,8 +1234,8 @@ def pair_detail_lines(pair, action) -> list:
     """The lines a paired record row shows first: ``"Looks like your <local> - <why>"``,
     the hulls only one side flies (at most ``MAX_HULLS_SHOWN`` names each, then
     ``"and <n> more"``; a list with nothing in it is left out) and ``"This doctrine:
-    <label of action>"`` (left out for an action the pair does not offer). Total: no pair
-    -> ``[]``."""
+    <label of action>"`` (``PAIR_CHOICE_LINES`` says what a merge adds; left out for an
+    action the pair does not offer). Total: no pair -> ``[]``."""
     local = getattr(pair, "local_name", None)
     try:
         why = _show(pair.reason())
@@ -1245,7 +1251,7 @@ def pair_detail_lines(pair, action) -> list:
             lines.append(lead + text)
     label = dict(pair_choices(pair)).get(action) if isinstance(action, str) else None
     if label:
-        lines.append(f"This doctrine: {label}")
+        lines.append(f"This doctrine: {PAIR_CHOICE_LINES.get(action, label)}")
     return lines
 
 
@@ -1344,6 +1350,24 @@ MODE_HINTS = {
 }
 MODE_CHOICES = (("merge", "Add to mine"), ("replace", "Replace mine"))
 CONFLICT_CHOICES = (("theirs", "Use the group's version"), ("mine", "Keep mine"))
+# The labels of every word an item's ``conflict_choices`` may hold (the doctrines add "merge").
+CONFLICT_LABELS = {"theirs": "Use the group's version", "mine": "Keep mine", "merge": "Merge"}
+
+
+def item_conflict_choices(item) -> tuple:
+    """``((value, label), ...)`` of an item's "An entry of the same name:" radio: its
+    ``conflict_choices`` that have a label, in its order - the first is its default. The
+    doctrines offer three, every other item that can meet a same-named entry the two of
+    ``CONFLICT_CHOICES``; an item that cannot (or no item) offers none."""
+    if item is None or not getattr(item, "conflicts", False):
+        return ()
+    words = getattr(item, "conflict_choices", None)
+    choices = tuple((word, CONFLICT_LABELS[word]) for word in
+                    (words if isinstance(words, tuple) else ())
+                    if isinstance(word, str) and word in CONFLICT_LABELS)
+    return choices or CONFLICT_CHOICES
+
+
 FILE_TYPES = [("FCTool group configuration", "*" + group_bundle.EXTENSION),
               ("All files", "*.*")]
 
@@ -3463,8 +3487,9 @@ class _Controller:
                             self.item_conflicts.get(DOCTRINES_ITEM, CONFLICT_CHOICES[0][0]))
 
     def doctrine_choice(self, key):
-        """What happens to a paired doctrine: the choice made for it, else its default;
-        ``None`` for a record key that is no pair."""
+        """What happens to a paired doctrine: the choice made for it, else its default
+        (``pair_default``: merge for a pair of different names, the item radio's for one of
+        the same name); ``None`` for a record key that is no pair."""
         if key not in self.doctrine_pairs:
             return None
         return self.doctrine_choices.get(key) or self._pair_default(key)
@@ -3473,9 +3498,10 @@ class _Controller:
         """What is ticked, with the choices made per item - and per paired doctrine: every
         choice MADE for it is sent - clicked, or pre-set from what an earlier import of this
         group honoured (so it is remembered again) - even one that equals its default. A
-        pair nobody chose for is not sent: it follows the item's radio, as before (D4). A
-        doctrine whose row is not ticked is not imported: nothing is sent for it, its
-        choice stays here."""
+        pair of different names nobody chose for is sent as its default, a merge (D8); one
+        of the same name nobody chose for is not sent: it follows the item's radio, as
+        before (D4). A doctrine whose row is not ticked is not imported: nothing is sent
+        for it, its choice stays here."""
         view = self._views["import"]
         options = options_from_tree(view.tree, self.file_payloads)
         options.modes.update(self.item_modes)
@@ -3485,6 +3511,8 @@ class _Controller:
             if view.tree is None or view.tree.state(DOCTRINES_ITEM + LEAF_SEP + key) != "on":
                 continue
             action = self.doctrine_choices.get(key)
+            if action is None and not _exact(pair):
+                action = pair_default(pair)
             if action is not None:
                 chosen[key] = {"action": action, "local_id": pair.local_id}
         if chosen:
@@ -3710,9 +3738,10 @@ class _Controller:
             if item is not None and all(mode in item.modes for mode, _text in MODE_CHOICES):
                 groups.append(("mode", "Your own entries:", MODE_CHOICES,
                                self.item_modes.get(item_id, item.modes[0])))
-            if item is not None and item.conflicts:
-                groups.append(("conflict", "An entry of the same name:", CONFLICT_CHOICES,
-                               self.item_conflicts.get(item_id, CONFLICT_CHOICES[0][0])))
+            conflicts = item_conflict_choices(item)     # three for the doctrines
+            if conflicts:
+                groups.append(("conflict", "An entry of the same name:", conflicts,
+                               self.item_conflicts.get(item_id, conflicts[0][0])))
             # A paired doctrine's own choice, under the item's (spec "doctrine merge" 9).
             pair_key = self._pair_key(view.sel) if item is not None else None
             if pair_key is not None:
@@ -3727,9 +3756,10 @@ class _Controller:
             for index, (kind, caption, choices, current) in enumerate(groups):
                 parent, row = frame, 3 * index
                 if kind == "doctrine":
-                    # Its own frame, so its three choices do not share - and widen - the
-                    # columns of the item's two above it; it spans the spare column 2 too
-                    # (weight 1, _build_import), which takes whatever it is wider by.
+                    # Its own frame, so its choices (four for a pair of different names) do
+                    # not share - and widen - the columns of the item's above it; it spans
+                    # column 2 too (weight 1, _build_import), which takes whatever it is
+                    # wider by (the item's third radio there is anchored west: it stays).
                     parent, row = tk.Frame(frame, bg=BG_DARK), 0
                     parent.grid(row=3 * index, column=0, columnspan=3, sticky=tk.W)
                 self._option_rows[kind] = row
@@ -3792,9 +3822,10 @@ class _Controller:
     def set_item_option(self, item_id, mode=None, conflict=None) -> bool:
         """Choose how one item of the file comes in: ``mode`` (one of the item's modes -
         ``merge`` adds to mine, ``replace`` replaces mine) and / or ``conflict``
-        (``theirs`` | ``mine``, for an item that can meet an entry of the same name). A
-        choice the item does not have is ignored. True when something changed: the plan
-        then runs again, behind the debounce."""
+        (``theirs`` | ``mine``, and ``merge`` for the doctrines - ``item_conflict_choices`` -
+        for an item that can meet an entry of the same name). A choice the item does not
+        have is ignored. True when something changed: the plan then runs again, behind the
+        debounce."""
         item = _item(item_id)
         if self._closed or self.bundle is None or item is None \
                 or item_id not in self.file_payloads:
@@ -3806,9 +3837,10 @@ class _Controller:
             if mode == item.modes[0]:
                 del self.item_modes[item_id]        # the item's own default: nothing to say
             changed = True
-        default = CONFLICT_CHOICES[0][0]
-        if isinstance(conflict, str) and item.conflicts \
-                and conflict in dict(CONFLICT_CHOICES) \
+        conflicts = item_conflict_choices(item)
+        default = conflicts[0][0] if conflicts else CONFLICT_CHOICES[0][0]
+        if isinstance(conflict, str) and conflicts \
+                and conflict in dict(conflicts) \
                 and conflict != self.item_conflicts.get(item_id, default):
             self.item_conflicts[item_id] = conflict
             if conflict == default:
