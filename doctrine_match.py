@@ -6,7 +6,8 @@ This module finds those pairs, so the Import page can ask what happens to each (
 ``2026-10-22-doctrine-merge-on-group-import-design.md`` section 4, decision D1).
 
 A doctrine is reduced to a ``Sig``: its name, the hull of every slot (a slot's hull is its
-ACTIVE fit's hull - every refit of a slot shares it) and the content hash of every fit and
+ACTIVE fit's hull - every refit of a slot shares it - or, when the active fit is missing, the
+first refit's that resolves) and the content hash of every fit and
 refit it names. Two doctrines are **similar** when:
 
 * their names are equal, or loosely equal (``loose_name``: case, blanks, punctuation,
@@ -28,6 +29,7 @@ ignored, never raised.
 """
 
 import re
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 
 from fit_models import fit_content_hash
@@ -57,12 +59,16 @@ def loose_name(name: str) -> str:
 
 @dataclass(frozen=True)
 class Sig:
-    """What the detector compares of one doctrine."""
+    """What the detector compares of one doctrine.
+
+    Hashable: ``hull_names`` (display only) takes no part in ``==`` or ``hash``.
+    """
 
     name: str
     hulls: tuple = ()                               # one hull type id per slot, slot order
     fits: frozenset = frozenset()                   # content hashes of every fit and refit
-    hull_names: dict = field(default_factory=dict)  # hull type id -> hull name
+    hull_names: dict = field(default_factory=dict, hash=False,
+                             compare=False)         # hull type id -> hull name
 
 
 def _content_hash(fit):
@@ -76,14 +82,16 @@ def _content_hash(fit):
 def sig_of_doctrine(doctrine, fits) -> Sig:
     """The ``Sig`` of ``doctrine`` against the library fits ``fits`` (fit id -> ``Fit``).
 
-    A slot's hull is its active fit's (``fit_id``) ``hull_type_id``; a fit id that is not in
-    ``fits`` is skipped - a slot whose active fit is missing has no hull here.
+    ``fits`` must be a mapping fit id -> ``Fit`` (e.g. the store's internal dict keyed by fit
+    id); a non-mapping reads as no fits.
+
+    A slot's hull is the ``hull_type_id`` of the first of its fits that is in ``fits``: its
+    active fit (``fit_id``), else - the active fit missing - its first refit that resolves
+    (the store guarantees every refit of a slot shares the slot's hull). A fit id that is not
+    in ``fits`` is skipped; a slot none of whose fits resolve has no hull here.
     """
-    if not isinstance(fits, dict):
-        try:
-            fits = dict(fits)
-        except Exception:
-            fits = {}
+    if not isinstance(fits, Mapping):
+        fits = {}
     name = getattr(doctrine, "name", "")
     members = getattr(doctrine, "members", None)
     hulls, hashes, hull_names = [], set(), {}
@@ -91,18 +99,20 @@ def sig_of_doctrine(doctrine, fits) -> Sig:
         active = getattr(member, "fit_id", None)
         refits = getattr(member, "refits", None)
         ids = [active] + (list(refits) if isinstance(refits, list) else [])
-        for position, fit_id in enumerate(ids):
+        hull_pending = True                         # the slot's hull is not read yet
+        for fit_id in ids:
             try:
                 fit = fits.get(fit_id)
-            except TypeError:                       # an unhashable id
+            except Exception:                       # an unhashable id, a broken mapping
                 fit = None
             if fit is None:
                 continue
             digest = _content_hash(fit)
             if digest is not None:
                 hashes.add(digest)
-            if position:                            # a refit: its hash, never the slot's hull
+            if not hull_pending:                    # a later fit: its hash, never a hull
                 continue
+            hull_pending = False
             hull = getattr(fit, "hull_type_id", None)
             if _is_hull(hull):
                 hulls.append(hull)
@@ -127,10 +137,17 @@ class Pair:
     same_fits: int
     mine_only: tuple                    # hull names only the importer's doctrine flies, sorted
     theirs_only: tuple                  # hull names only the group's doctrine flies, sorted
+    loose: bool = False                 # the names are loosely, not exactly, equal
 
     def reason(self) -> str:
-        """Why the pair was made, in words: ``"6 of 7 ships, 4 identical fits"``."""
-        if self.union_hulls:
+        """Why the pair was made, in words: ``"6 of 7 ships, 4 identical fits"``.
+
+        A pair of no shared hulls made by its name reads ``"same name"`` instead of
+        ``"0 of N ships"`` (``"same name, 1 identical fit"``).
+        """
+        if not self.shared_hulls and (self.exact or self.loose):
+            text = "same name"
+        elif self.union_hulls:
             text = "%d of %d ships" % (self.shared_hulls, self.union_hulls)
         else:
             text = "no ships"
@@ -145,8 +162,13 @@ def _is_hull(value):
 
 
 def _clean(sig):
-    """``(name or None, hull set, fit-hash set, hull names)`` of a ``Sig``; garbage -> empty."""
+    """``(name or None, hull set, fit-hash set, hull names, loose name)`` of a ``Sig``.
+
+    Garbage -> empty. The loose name is computed here, once per doctrine, never per pair.
+    """
     name = getattr(sig, "name", None)
+    if not isinstance(name, str):
+        name = None
     try:
         hulls = frozenset(h for h in getattr(sig, "hulls", ()) if _is_hull(h))
     except TypeError:
@@ -156,8 +178,8 @@ def _clean(sig):
     except TypeError:
         hashes = frozenset()
     names = getattr(sig, "hull_names", None)
-    return (name if isinstance(name, str) else None, hulls, hashes,
-            names if isinstance(names, dict) else {})
+    return (name, hulls, hashes, names if isinstance(names, dict) else {},
+            loose_name(name) if name is not None else "")
 
 
 def _hull_label(hull, names):
@@ -172,14 +194,12 @@ def _labels(hulls, names):
 
 def _similar(mine, theirs):
     """``(similar, loose_equal, shared, union, same_fits)`` for two cleaned sigs."""
-    m_name, m_hulls, m_fits, _ = mine
-    t_name, t_hulls, t_fits, _ = theirs
+    m_name, m_hulls, m_fits, _, m_loose = mine
+    t_name, t_hulls, t_fits, _, t_loose = theirs
     shared = len(m_hulls & t_hulls)
-    union = len(m_hulls | t_hulls)
+    union = len(m_hulls) + len(t_hulls) - shared
     same_fits = len(m_fits & t_fits)
-    m_loose = loose_name(m_name) if m_name is not None else ""
-    loose_equal = bool(m_loose) and m_loose == (loose_name(t_name) if t_name is not None
-                                                else "")
+    loose_equal = bool(m_loose) and m_loose == t_loose
     similar = (
         (m_name is not None and m_name == t_name)
         or loose_equal
@@ -189,12 +209,14 @@ def _similar(mine, theirs):
 
 
 def _pair(index, theirs, local_id, mine):
-    _, _, shared, union, same_fits = _similar(mine, theirs)
+    _, loose_equal, shared, union, same_fits = _similar(mine, theirs)
+    exact = mine[0] is not None and mine[0] == theirs[0]
     return Pair(incoming_index=index, incoming_name=theirs[0] or "", local_id=local_id,
-                local_name=mine[0] or "", exact=mine[0] is not None and mine[0] == theirs[0],
+                local_name=mine[0] or "", exact=exact,
                 shared_hulls=shared, union_hulls=union, same_fits=same_fits,
                 mine_only=_labels(mine[1] - theirs[1], mine[3]),
-                theirs_only=_labels(theirs[1] - mine[1], theirs[3]))
+                theirs_only=_labels(theirs[1] - mine[1], theirs[3]),
+                loose=loose_equal and not exact)
 
 
 def pair_doctrines(local, incoming) -> list:
