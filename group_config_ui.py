@@ -1747,7 +1747,8 @@ class _Controller:
       ``doctrine_pairs``   ``{record key: doctrine_match.Pair}`` - the file's doctrines that
                        look like the importer's (``group_apply.plan_matches``, ONCE per file)
       ``doctrine_choices`` ``{record key: action}`` - the choices MADE for them (remembered
-                       ones pre-set); a pair without one has its default (``pair_default``)
+                       ones pre-set), each one sent; a pair without one is not sent and
+                       has its default (``pair_default``)
       ``imports`` / ``attention_flags`` / ``pending``    the History page
 
     Methods: ``show_page(name)``, ``set_mode(mode)``, ``toggle(row)``, ``select(row)``,
@@ -1825,10 +1826,10 @@ class _Controller:
         self.header, self.warnings, self.notes = [], [], []
         self.item_modes, self.item_conflicts = {}, {}
         self.doctrine_pairs, self.doctrine_choices = {}, {}
-        self._doctrine_remembered = {}  # record key -> the action an earlier import honoured
         self.option_buttons, self._option_vars, self._option_item = {}, {}, None
         self._option_pair = None        # the record key of the pair the radios are for
         self._option_rows = {}          # group kind -> the grid row of its caption
+        self._option_widths = {}        # (kind, value) -> its radio's width on one line
         self._preview, self._extra_rows, self._import_unusable = {}, [], {}
         self._refusal = ""              # why the chosen file was refused (the reader's words)
         self._warn_count = 0            # the lines the warnings box holds
@@ -2213,6 +2214,9 @@ class _Controller:
         # The choices of the selected item (how a list is merged, who wins a name): side
         # by side where the pane is wide enough, else one under the other.
         self._options_frame = tk.Frame(right, bg=BG_DARK)
+        # A spare column right of the item's radios takes what is left - and what the
+        # doctrine's own row (spanning it) is wider by - so those radios never shift.
+        self._options_frame.grid_columnconfigure(2, weight=1)
         self._options_frame.bind("<Configure>",
                                  lambda event: self._place_options(event.width), add="+")
         frame, text = self._text_box(right)
@@ -3308,7 +3312,7 @@ class _Controller:
         self.read_notes, self.problems, self.file_payloads = [], [], {}
         self.header, self.warnings, self.notes = [], [], []
         self.item_modes, self.item_conflicts = {}, {}
-        self.doctrine_pairs, self.doctrine_choices, self._doctrine_remembered = {}, {}, {}
+        self.doctrine_pairs, self.doctrine_choices = {}, {}
         self._preview, self._extra_rows, self._import_unusable = {}, [], {}
         self._refusal = ""
         view = self._views["import"]
@@ -3362,14 +3366,16 @@ class _Controller:
                 facts.append(line)
         lines = [_SEPARATOR.join([" ".join(part for part in (name or "(no name)", tag)
                                            if part)] + facts)]
+        # The paired doctrines right under the title: the box shows four lines at most,
+        # and long notes must never scroll this line out of sight.
+        paired = doctrine_header_line(len(self.doctrine_pairs))
+        if paired:
+            lines.append(paired)
         if notes:
             lines.append(notes)
         before = self._imported_before()
         if before:
             lines.append(before)
-        paired = doctrine_header_line(len(self.doctrine_pairs))
-        if paired:
-            lines.append(paired)
         return lines
 
     def _find_pairs(self, payloads) -> None:
@@ -3392,12 +3398,12 @@ class _Controller:
                                if key in keys and isinstance(getattr(pair, "local_id", None),
                                                              str)} \
             if isinstance(pairs, dict) else {}
-        self.doctrine_choices, self._doctrine_remembered = {}, {}
+        self.doctrine_choices = {}
         for key, choice in remembered.items() if isinstance(remembered, dict) else ():
             pair = self.doctrine_pairs.get(key)
             action = choice.get("action") if isinstance(choice, dict) else None
             if pair is not None and action in dict(pair_choices(pair)):
-                self.doctrine_choices[key] = self._doctrine_remembered[key] = action
+                self.doctrine_choices[key] = action
 
     def _imported_before(self) -> str:
         bundle_id = getattr(self.bundle.meta, "id", "")
@@ -3464,10 +3470,12 @@ class _Controller:
         return self.doctrine_choices.get(key) or self._pair_default(key)
 
     def _import_options(self) -> Options:
-        """What is ticked, with the choices made per item - and per paired doctrine: a
-        choice is sent when it is not the pair's default, or when it is the one an earlier
-        import of this group honoured (so it is remembered again). A doctrine whose row is
-        not ticked is not imported: nothing is sent for it, its choice stays here."""
+        """What is ticked, with the choices made per item - and per paired doctrine: every
+        choice MADE for it is sent - clicked, or pre-set from what an earlier import of this
+        group honoured (so it is remembered again) - even one that equals its default. A
+        pair nobody chose for is not sent: it follows the item's radio, as before (D4). A
+        doctrine whose row is not ticked is not imported: nothing is sent for it, its
+        choice stays here."""
         view = self._views["import"]
         options = options_from_tree(view.tree, self.file_payloads)
         options.modes.update(self.item_modes)
@@ -3476,8 +3484,8 @@ class _Controller:
         for key, pair in self.doctrine_pairs.items():
             if view.tree is None or view.tree.state(DOCTRINES_ITEM + LEAF_SEP + key) != "on":
                 continue
-            action = self.doctrine_choice(key)
-            if action != self._pair_default(key) or action == self._doctrine_remembered.get(key):
+            action = self.doctrine_choices.get(key)
+            if action is not None:
                 chosen[key] = {"action": action, "local_id": pair.local_id}
         if chosen:
             options.resolutions[DOCTRINES_ITEM] = chosen
@@ -3695,7 +3703,7 @@ class _Controller:
             for child in frame.winfo_children():
                 child.destroy()
             self.option_buttons, self._option_vars, self._option_item = {}, {}, None
-            self._option_pair = None
+            self._option_pair, self._option_widths = None, {}
             item_id = self._item_of(view, view.sel) if self.bundle is not None else None
             item = _item(item_id) if item_id in self.file_payloads else None
             groups = []
@@ -3720,9 +3728,10 @@ class _Controller:
                 parent, row = frame, 3 * index
                 if kind == "doctrine":
                     # Its own frame, so its three choices do not share - and widen - the
-                    # columns of the item's two above it.
+                    # columns of the item's two above it; it spans the spare column 2 too
+                    # (weight 1, _build_import), which takes whatever it is wider by.
                     parent, row = tk.Frame(frame, bg=BG_DARK), 0
-                    parent.grid(row=3 * index, column=0, columnspan=2, sticky=tk.W)
+                    parent.grid(row=3 * index, column=0, columnspan=3, sticky=tk.W)
                 self._option_rows[kind] = row
                 self._label(parent, caption, font=_HINT_FONT, fg=FG_DIM, anchor=tk.W).grid(
                     row=row, column=0, columnspan=len(choices), sticky=tk.W)
@@ -3734,11 +3743,13 @@ class _Controller:
                     else:
                         command = (lambda k=kind, v=value, i=item_id:
                                    self.set_item_option(i, **{k: v}))
-                    self.option_buttons[(kind, value)] = tk.Radiobutton(
+                    button = tk.Radiobutton(
                         parent, text=text, value=value, variable=var, font=_HINT_FONT,
                         fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
                         activeforeground=FG_ACCENT, highlightthickness=0, bd=0, anchor=tk.W,
-                        command=command)
+                        justify=tk.LEFT, command=command)
+                    self.option_buttons[(kind, value)] = button
+                    self._option_widths[(kind, value)] = button.winfo_reqwidth()  # one line
             self._place_options(frame.winfo_width())
             frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 6), before=self._import_detail_frame)
         except tk.TclError:
@@ -3746,26 +3757,36 @@ class _Controller:
 
     def _place_options(self, width) -> None:
         """Lay the choices of each group side by side where ``width`` (the pane's) has
-        room for them, else one under the other. Every ``grid`` call passes its full set
-        of options: the ones left out would be kept from the layout before."""
+        room for them, else one under the other - each then wrapped to the pane, so a long
+        one (at 150% scaling) is never cut at its edge. Every ``grid`` call passes its full
+        set of options: the ones left out would be kept from the layout before. The widths
+        are the radios' on ONE line (``_option_widths``, taken when they were made): a
+        wrapped radio asks for less, and must not be thought to fit beside the others."""
         rows = self._option_rows
         try:
             for kind in ("mode", "conflict", "doctrine"):
                 if kind not in self._option_vars or kind not in rows:
                     continue
-                buttons = [button for (group, _value), button in self.option_buttons.items()
-                           if group == kind]
-                wanted = sum(button.winfo_reqwidth() for button in buttons) \
-                    + 10 + 14 * max(1, len(buttons) - 1)
+                group = [(key, button) for key, button in self.option_buttons.items()
+                         if key[0] == kind]
+                widths = [self._option_widths.get(key) or button.winfo_reqwidth()
+                          for key, button in group]
+                wanted = sum(widths) + 10 + 14 * max(1, len(group) - 1)
                 beside = width <= 1 or wanted <= width
-                for position, button in enumerate(buttons):
+                for position, ((_key, button), one_line) in enumerate(zip(group, widths)):
+                    wrap = 0
+                    if not beside:              # the text's room: the pane less the indicator
+                        text = button.cget("text")
+                        wrap = max(1, width - 10 - (one_line - self._hint_font.measure(text)))
+                    if int(str(button.cget("wraplength")) or 0) != wrap:
+                        button.configure(wraplength=wrap)
                     if beside:
                         button.grid(row=rows[kind] + 1, column=position, columnspan=1,
                                     sticky=tk.W, padx=(10 if position == 0 else 14, 0), pady=0)
                     else:
                         button.grid(row=rows[kind] + 1 + position, column=0,
-                                    columnspan=len(buttons), sticky=tk.W, padx=(10, 0), pady=0)
-        except tk.TclError:
+                                    columnspan=len(group), sticky=tk.W, padx=(10, 0), pady=0)
+        except (tk.TclError, ValueError):
             pass
 
     def set_item_option(self, item_id, mode=None, conflict=None) -> bool:
@@ -3807,23 +3828,24 @@ class _Controller:
     def set_doctrine_choice(self, record_key, action) -> bool:
         """Choose what happens to one paired doctrine of the file (``record_key``, its row's
         record key): one of the actions its pair offers (``pair_choices``). It overrides the
-        item's "An entry of the same name" radio for that doctrine. Anything else is refused
-        (False). True when what happens to the doctrine changed: the plan then runs again,
-        behind the debounce. The choice is kept while the row is unticked; it is only not
-        sent (``_import_options``)."""
+        item's "An entry of the same name" radio for that doctrine, and it is SENT
+        (``_import_options``) even when it equals the pair's default. Anything else is
+        refused (False), and so is the choice already made for it (False: nothing changed).
+        Otherwise True: what is sent changed, so the plan runs again, behind the debounce.
+        The choice is kept while the row is unticked; it is only not sent."""
         pair = self.doctrine_pairs.get(record_key) if isinstance(record_key, str) else None
         if self._closed or self.bundle is None or pair is None \
-                or not isinstance(action, str) or action not in dict(pair_choices(pair)):
+                or not isinstance(action, str) or action not in dict(pair_choices(pair)) \
+                or self.doctrine_choices.get(record_key) == action:
             return False
         before = self.doctrine_choice(record_key)
         self.doctrine_choices[record_key] = action
-        if action == before:
-            return False
-        if self._option_pair == record_key and "doctrine" in self._option_vars:
-            self._option_vars["doctrine"].set(action)   # the choice may not have come from it
-        self._views["import"].repaint()
-        if self._pair_key(self._views["import"].sel) == record_key:
-            self._render_import()               # "This doctrine: ..." at once
+        if action != before:                    # what is shown for it changed too
+            if self._option_pair == record_key and "doctrine" in self._option_vars:
+                self._option_vars["doctrine"].set(action)   # it may not have come from it
+            self._views["import"].repaint()
+            if self._pair_key(self._views["import"].sel) == record_key:
+                self._render_import()           # "This doctrine: ..." at once
         self._replan()
         return True
 
