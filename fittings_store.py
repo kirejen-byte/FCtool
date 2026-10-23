@@ -2216,9 +2216,17 @@ class FittingsStore:
                     dropped: list[str] = []
                     members = self._merge_slots(incoming, id_map, names, dropped)
                     if merging:
-                        # Keep mine, add what the group has that I don't.
+                        # Keep mine, add what the group has that I don't. A
+                        # line names a fit as the GROUP's doctrine does.
+                        shown_as: dict[str, str] = {}
+                        for member in incoming.members:
+                            for old_id in (member.refits or [member.fit_id]):
+                                if old_id in id_map:
+                                    shown_as.setdefault(id_map[old_id],
+                                                        names.get(old_id, ""))
                         members, counts = self._merge_into(
-                            local, members, name=incoming.name, dropped=dropped)
+                            local, members, name=incoming.name, dropped=dropped,
+                            shown_as=shown_as)
                         mine = local.description
                         fill = (not (isinstance(mine, str) and mine.strip())
                                 and bool(incoming.description.strip()))
@@ -2407,94 +2415,119 @@ class FittingsStore:
     def _merge_into(
         self, local: Doctrine, members: list[DoctrineMember], *,
         name: str = "", dropped: list[str] | None = None,
+        shown_as: dict[str, str] | None = None,
     ) -> tuple[list[DoctrineMember], MergeCounts]:
         """`local`'s slots with what `members` (an incoming doctrine's slots,
         already remapped by `_merge_slots`) has that they lack, and how much
         that is. Reads only: `local` is not modified.
 
-        "Keep mine, add what the group has that I don't" (spec section 6):
-        slots are paired BY HULL, in order (my first Ferox slot with their
-        first Ferox slot). A paired slot keeps my active fit, my default
-        (``refits[0]``) and every value of mine; the group's fits it lacks
-        are appended as refits (a plain slot of mine becomes ``refits = [my
-        fit, ...]``) and the group's tags it lacks are appended to its tags.
-        A slot only the group has is appended after mine, with its own values
-        and an `order` after my highest. A slot only I have is kept. A fit
-        another slot of my doctrine already flies is never added a second
-        time: one paired slot already has is silently there, any other is
-        dropped and said in `dropped` (``"<name> / <fit>: same fit as another
-        slot"``); a group-only slot left with no fit is dropped. Refits share
-        the slot's hull: a paired slot's are on its hull by the pairing, a
-        group-only slot's by `_merge_slots`."""
+        "Keep mine, add what the group has that I don't" (spec section 6).
+        Fits are compared BY CONTENT (`fit_content_hash`): one fit stored
+        under two ids is one fit. Each group slot, in the group's order:
+
+        * pairs with my FIRST still-unpaired slot of its hull that already
+          flies one of its fits (any refit); failing that, when it brings a
+          fit my doctrine does not fly yet, with my first still-unpaired slot
+          of its hull. The pair keeps my active fit, my default
+          (``refits[0]``) and every value of mine; the group's fits it lacks
+          are appended as refits (a plain slot of mine becomes ``refits = [my
+          fit, ...]``) and the group's tags it lacks are appended to its tags.
+          So tags only ever land on a slot that shares or gains a fit.
+        * a slot of the group with a new fit and no slot of mine left to pair
+          with is appended after mine, with its own values and an `order`
+          after my highest (kept in ``0 .. MAX_SHARE_COUNT``, the range
+          `validate_share` takes); it counts as paired.
+        * a fit another slot of my doctrine already flies is never added a
+          second time - one its partner has is silently there, any other is
+          dropped and said in `dropped` (``"<name> / <the group's fit name>:
+          same fit as another slot"``). A group slot ALL of whose fits other
+          slots of mine fly adds nothing - no tag, no slot - and pairs with
+          nothing.
+
+        A slot only I have is kept. A written slot of mine whose active fit is
+        not among its refits (hand-edited) gets it first, as
+        `_normalise_slot` does. Refits share the slot's hull: a paired slot's
+        by the pairing, an appended slot's by `_merge_slots`. A second merge
+        of the same slots pairs every group slot as the first did and adds
+        nothing. `shown_as` maps a local fit id to the group's name for it."""
         fits = self._fits
+        contents: dict[str, object] = {}
+
+        def content(fit_id):
+            if fit_id not in contents:
+                fit = fits.get(fit_id)
+                contents[fit_id] = (fit_content_hash(fit.parsed) if fit is not None
+                                    else ("no such fit", fit_id))
+            return contents[fit_id]
 
         def hull_of(fit_id):
             fit = fits.get(fit_id)
             return fit.hull_type_id if fit is not None else None
 
+        def said(fit_id):
+            if dropped is not None:
+                label = (shown_as or {}).get(fit_id)
+                if label is None:
+                    label = fits[fit_id].name
+                dropped.append(f"{name} / {label}: same fit as another slot")
+
         out = list(local.members)
-        flown: set[str] = set()                  # every fit my doctrine flies
-        mine_by_hull: dict = {}                  # hull -> my slot indexes, in order
+        held: list[set] = []                     # per slot of mine: its contents
+        flown: set = set()                       # every content my doctrine flies
+        unpaired: dict = {}                      # hull -> my unpaired slots, in order
         for index, member in enumerate(out):
-            flown.add(member.fit_id)
-            flown.update(member.refits)
-            mine_by_hull.setdefault(hull_of(member.fit_id), []).append(index)
-        paired: dict = {}                        # hull -> my slots of it paired so far
+            held.append({content(fit_id) for fit_id in [member.fit_id, *member.refits]})
+            flown |= held[index]
+            unpaired.setdefault(hull_of(member.fit_id), []).append(index)
         order = max((member.order for member in out if type(member.order) is int),
                     default=-1) + 1
         added_slots: list[DoctrineMember] = []
         refits = tags = 0
 
-        def said(fit_id):
-            if dropped is not None:
-                dropped.append(f"{name} / {fits[fit_id].name}: same fit as another slot")
-
         for member in members:
-            hull = hull_of(member.fit_id)
-            mine = mine_by_hull.get(hull, ())
-            taken = paired.get(hull, 0)
-            if taken < len(mine):
-                paired[hull] = taken + 1
-                index = mine[taken]
-                current = out[index]
-                in_slot = set(current.refits) | {current.fit_id}
-                new_fits = []
-                for fit_id in slot_fit_ids(member):
-                    if fit_id in in_slot:
-                        continue
-                    if fit_id in flown:
+            ids = slot_fit_ids(member)
+            wanted = {content(fit_id) for fit_id in ids}
+            free = unpaired.get(hull_of(member.fit_id), [])
+            partner = next((index for index in free if held[index] & wanted), None)
+            new_fits: list[str] = []
+            for fit_id in ids:
+                key = content(fit_id)
+                if partner is not None and key in held[partner]:
+                    continue                     # its partner flies it already
+                if key in flown:
+                    if not any(content(new) == key for new in new_fits):
                         said(fit_id)
-                        continue
-                    flown.add(fit_id)
-                    new_fits.append(fit_id)
-                new_tags = [tag for tag in member.tags if tag not in current.tags]
-                if new_fits or new_tags:
-                    base = list(current.refits) if current.refits else [current.fit_id]
-                    out[index] = replace(
-                        current,
-                        tags=list(current.tags) + new_tags,
-                        refits=base + new_fits if new_fits else list(current.refits),
-                    )
-                    refits += len(new_fits)
-                    tags += len(new_tags)
-                continue
-            survivors = []
-            for fit_id in slot_fit_ids(member):
-                if fit_id in flown:
-                    said(fit_id)
                     continue
-                survivors.append(fit_id)
-            if not survivors:
+                flown.add(key)
+                new_fits.append(fit_id)
+            if partner is None:
+                if not new_fits:
+                    continue                     # other slots of mine fly it all
+                if not free:
+                    added_slots.append(replace(
+                        member,
+                        fit_id=new_fits[0],
+                        tags=list(member.tags),
+                        refits=new_fits if len(new_fits) > 1 else [],
+                        order=min(max(order, 0), MAX_SHARE_COUNT),
+                    ))
+                    order += 1
+                    continue
+                partner = free[0]
+            free.remove(partner)
+            current = out[partner]
+            new_tags = [tag for tag in member.tags if tag not in current.tags]
+            if not (new_fits or new_tags):
                 continue
-            flown.update(survivors)
-            added_slots.append(replace(
-                member,
-                fit_id=survivors[0],
-                tags=list(member.tags),
-                refits=survivors if len(survivors) > 1 else [],
-                order=order,
-            ))
-            order += 1
+            base = list(current.refits)
+            if base and current.fit_id not in base:
+                base.insert(0, current.fit_id)   # as _normalise_slot does
+            if new_fits and not base:
+                base = [current.fit_id]
+            out[partner] = replace(current, tags=list(current.tags) + new_tags,
+                                   refits=base + new_fits)
+            refits += len(new_fits)
+            tags += len(new_tags)
         return out + added_slots, MergeCounts(refits, len(added_slots), tags)
 
     @staticmethod
