@@ -1324,7 +1324,7 @@ from tkinter import filedialog, messagebox, ttk                   # noqa: E402
 import group_apply                                                # noqa: E402
 import group_bundle                                               # noqa: E402
 import group_state                                                # noqa: E402
-from ui_helpers import attach_tooltip, make_modal                 # noqa: E402
+from ui_helpers import attach_tooltip, make_modal, parent_work_area  # noqa: E402
 from ui_theme import (                                            # noqa: E402
     BG_DARK, BG_ENTRY, BG_PANEL, BG_SELECT, BORDER_COLOR, FG_ACCENT, FG_DIM, FG_GREEN,
     FG_ORANGE, FG_RED, FG_TEXT, FG_WHITE,
@@ -1337,6 +1337,7 @@ GEOMETRY = "980x640"
 MIN_SIZE = (820, 520)                   # at 100% display scaling; see min_size
 BASE_SCALING = 96 / 72                  # tk scaling at 100% (96 dpi): 1.333...
 MIN_GROWTH = 1.35                       # the smallest height grows this much faster
+SCREEN_ROOM = 80                        # title bar + frame + margins, off the screen
 TREE_STYLE = "Group.Treeview"
 # The window's buttons: the app's "Dark" and "Green" styles (see _configure_styles).
 BUTTON_STYLES = {"dark": "Group.Dark.TButton", "green": "Group.Green.TButton"}
@@ -4353,6 +4354,32 @@ def min_size(scaling):
     return width, max(height, grown)
 
 
+def fit_to_screen(height, screen_height):
+    """``height`` no taller than a screen (or work area) ``screen_height`` tall can show:
+    at most ``screen_height - SCREEN_ROOM`` (the title bar, the frame and the placement
+    margins), never under ``MIN_SIZE``'s height - what the window always allowed. A
+    ``screen_height`` that is not a positive number caps nothing."""
+    try:
+        screen_height = int(screen_height)
+    except (TypeError, ValueError, OverflowError):
+        return height
+    if screen_height <= 0:
+        return height
+    return max(MIN_SIZE[1], min(height, screen_height - SCREEN_ROOM))
+
+
+def _screen_height(win, parent):
+    """The height of the work area (no taskbar) of the monitor the window opens on, else
+    the primary screen's height, else None. Never raises."""
+    area = parent_work_area(win, parent)
+    if area:
+        return area[3] - area[1]
+    try:
+        return int(win.winfo_screenheight())
+    except (tk.TclError, ValueError):
+        return None
+
+
 def open_window(parent, host, *, view="create", report=None, pick=False):
     """Open the Group configuration window over ``parent``; returns its Toplevel, which
     carries the controller as ``win._gc`` (see ``_Controller``).
@@ -4381,10 +4408,14 @@ def open_window(parent, host, *, view="create", report=None, pick=False):
         ctl = _Controller(win, host, report=report)
         make_modal(win, parent, on_cancel=ctl.close, grab=False)
         win.protocol("WM_DELETE_WINDOW", ctl.close)
-        smallest = min_size(win.tk.call("tk", "scaling"))
-        width, height = (int(n) for n in GEOMETRY.split("x"))
-        win.geometry("%dx%d" % (width, max(height, smallest[1])))  # never under it
-        win.minsize(*smallest)
+        # The smallest size grows with the scaling, never past what the screen shows;
+        # the window opens no smaller than it (and no taller than the screen either).
+        width, low = min_size(win.tk.call("tk", "scaling"))
+        screen = _screen_height(win, parent)
+        opening_width, opening = (int(n) for n in GEOMETRY.split("x"))
+        win.geometry("%dx%d" % (opening_width,
+                                fit_to_screen(max(opening, low), screen)))
+        win.minsize(width, fit_to_screen(low, screen))
         ctl.build()
         if view == "history" and ctl.report is not None:
             ctl.show_report(ctl.report)     # the one road to a report, new window or old
