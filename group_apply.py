@@ -14,11 +14,13 @@ everything that boots afterwards reads files that already hold the import (spec 
 5. ``restore`` -> the backup's files are put back (``restored``).
 6. Read the group file and the five state files. ``config.json`` unreadable -> ``failed``.
 7. Validate, then apply every selected item to a copy of the state.
-8. Nothing differs -> ``unchanged``: no backup, no write.
+8. Nothing differs -> ``unchanged``: no backup, no state file written. The side file may be
+   (best effort): for new attention flags or honoured doctrine choices, and to mark the run
+   ``done`` when its applying file cannot be removed.
 9. Back up the files that differ; record the backup's name in the applying file.
 10. Write the changed files. A failure puts the backup back -> ``failed``.
-11. History, attention, tasks, tag and report go to the side file; old backups are pruned; the
-    applying file is deleted.
+11. History, attention, tasks, tag, the honoured doctrine choices (``doctrine_choices``) and
+    report go to the side file; old backups are pruned; the applying file is deleted.
 
 It NEVER raises - it runs before a window exists - and it never leaves a mix of old and new
 files on purpose: once a file may have been written, every failure puts the backup back. When
@@ -650,10 +652,13 @@ def _merge_tasks(stored, incoming) -> list:
 #
 # The side file's ``doctrine_choices``: ``{bundle id: {incoming doctrine name: {"action",
 # "local_id"}}}`` - per group file (its ``bundle.id``) the per-doctrine choices that an
-# import HONOURED, oldest group first and, within one, oldest choice first. Written only
-# inside an import's own side-file change (``_import``: step 8 for an unchanged run, step
-# 11 with the history - same lock, same all-or-nothing); a restore leaves it alone.
-# ``plan_matches`` hands them back for the pairs they still fit.
+# import HONOURED, oldest group first and, within one, oldest choice first. What was
+# honoured is RECORDED by the doctrines item (``State.honoured``), never inferred from its
+# warning lines; only an honoured choice replaces a remembered one (``_put_choices``).
+# Written only inside an import's own side-file write (``_import``: step 8 for an unchanged
+# run, step 11 with the history - same lock), best effort: remembering never fails or
+# rolls back an import. A restore leaves it alone. ``plan_matches`` hands them back for the
+# pairs they still fit.
 
 def _clean_choice(value):
     """``{"action", "local_id"}`` out of a stored or staged choice, or ``None``."""
@@ -707,28 +712,28 @@ def _bounded_choices(groups) -> dict:
     return groups
 
 
-def _put_choices(side, bundle_id, made) -> bool:
-    """Remember ``made`` - ``(honoured, decided)`` of ``_choices_made``, or ``None`` - for
-    the group ``bundle_id`` in ``side``. That group's older choices for the doctrines this
-    import merged (``decided``) go; the ``honoured`` ones are added as its newest, and the
-    group becomes the newest one. A key that held anything else is repaired on the way.
-    -> True when ``side`` changed (and must be written)."""
-    if made is None or not (isinstance(bundle_id, str) and _HEX32.fullmatch(bundle_id)):
+def _put_choices(side, bundle_id, honoured) -> bool:
+    """Remember ``honoured`` - ``_choices_made``: ``{incoming name: {"action",
+    "local_id"}}``, or ``None`` - for the group ``bundle_id`` in ``side``.
+
+    ONLY AN HONOURED CHOICE REPLACES A REMEMBERED ONE: each honoured choice takes the place
+    of that group's older choice for the same doctrine and becomes its newest, and the
+    group becomes the newest one. A doctrine whose choice fell back, or that was merged on
+    the default rule (no choice sent for it), or that was not ticked, keeps what an earlier
+    import remembered - a choice that did not land says nothing new about what the importer
+    wants. With nothing honoured ``side`` is left exactly as it is; otherwise a key that
+    held anything else is repaired on the way. -> True when ``side`` changed (and must be
+    written)."""
+    if not honoured or not isinstance(honoured, dict) \
+            or not (isinstance(bundle_id, str) and _HEX32.fullmatch(bundle_id)):
         return False
-    honoured, decided = made
     groups = _side_choices(side)
     choices = {name: choice for name, choice in groups.pop(bundle_id, {}).items()
-               if name not in decided}
+               if name not in honoured}
     choices.update(honoured)
-    if choices:
-        groups[bundle_id] = choices
+    groups[bundle_id] = choices
     groups = _bounded_choices(groups)
     stored = side.get(CHOICES_KEY, None)
-    if not groups:
-        if CHOICES_KEY not in side:
-            return False
-        del side[CHOICES_KEY]
-        return True
     # In order: a group that becomes the newest one is a change worth writing.
     try:
         if json.dumps(stored) == json.dumps(groups):
@@ -739,75 +744,39 @@ def _put_choices(side, bundle_id, made) -> bool:
     return True
 
 
-def _visible_ascii(text) -> str:
-    return "".join(ch for ch in text if " " < ch <= "~")
+def _choices_made(results, payloads, honoured):
+    """The doctrine choices this import HONOURED, as ``_put_choices`` takes them:
+    ``{incoming name: {"action", "local_id"}}`` - or ``None`` when the doctrines item did
+    not run (unticked, absent, ``failed`` or ``skipped``). Never raises (``None`` then).
 
-
-def _may_name(name, line) -> bool:
-    """Whether ``line`` - a fallback line of ``merge_share``, ``"<name as quoted>: <why> -
-    <default> instead"`` - may be the one of the doctrine ``name``. Never False for the
-    line of ``name`` (the quoted name drops characters - control and format ones, the
-    blanks at its ends, everything after its 60th - but never one that is visible ASCII,
-    and keeps the rest in order); now and then True for another doctrine's line, which
-    leaves that choice unremembered: the safe side. No ``unicodedata`` here (purity)."""
-    shown, said = _visible_ascii(name), _visible_ascii(line)
-    common = 0
-    while common < len(shown) and common < len(said) and shown[common] == said[common]:
-        common += 1
-    return ":" in said[:common + 1]
-
-
-def _choices_made(results, payloads, options, aliases):
-    """The doctrine choices this import HONOURED: ``(honoured, decided)`` - ``honoured``
-    ``{incoming name: {"action", "local_id"}}``, ``decided`` the incoming names the
-    doctrines item merged this time - or ``None`` when that item did not run (unticked,
-    absent, ``failed`` or ``skipped``). Never raises (``None`` then).
-
-    A staged choice is keyed by its record key; only a key that IS its doctrine's name (the
-    first doctrine of a name) is ever handed to the store. It was honoured when it is not
-    one of the store's fallbacks (``MergeResult.resolution_fallbacks``, in the item's
-    ``warnings`` - ``_may_name``) AND it landed as that choice lands: "keep mine" leaves a
-    keep-mine alias (``state.aliases``), "use the group's" an update (or nothing to update)
-    without one, "keep both" a new doctrine without an alias. "merge" is not taken by this
-    build (spec Phase 2) and is never remembered yet."""
+    ``honoured`` is the new state's ``State.honoured``: the RECORD the doctrines item left
+    in its last step of exactly the choices it applied as chosen (a fallback is never in
+    it; the engine clears it when the item ends ``failed`` or ``skipped``). Nothing here is
+    inferred from the text of the item's notes or warnings - those are bounded and quote
+    names lossily. Of the record only a well-formed choice (``_clean_choice``) of a name
+    that is not too long (``_choice_name``), that IS its record key (the first doctrine of
+    a name) and that the item merged this time (``decided``: its record lists, which
+    ``ItemResult.bound`` never cuts) is kept. "merge" is not taken by this build (spec
+    Phase 2) and is never remembered yet."""
     try:
         result = next((result for result in results
                        if getattr(result, "item_id", None) == DOCTRINES_ITEM), None)
         if result is None or result.status in ("failed", "skipped"):
             return None
-        landed = {name: kind for kind in ("added", "updated", "unchanged", "skipped")
-                  for name in getattr(result, kind) if isinstance(name, str)}
-        decided = set(landed)
-        staged = options.resolutions.get(DOCTRINES_ITEM) \
-            if isinstance(options.resolutions, dict) else None
-        honoured = {}
-        if not isinstance(staged, dict) or not staged:
-            return honoured, decided
+        decided = {name for kind in ("added", "updated", "unchanged", "skipped")
+                   for name in getattr(result, kind) if isinstance(name, str)}
+        made = {}
+        if not isinstance(honoured, dict) or not honoured:
+            return made
         item = group_items.get_item(DOCTRINES_ITEM)
         names = {record.key for record in item.records(payloads.get(DOCTRINES_ITEM))
                  if record.key == record.label}
-        fallen = [line for line in result.warnings
-                  if isinstance(line, str) and line.endswith(" instead")]
-        aliases = aliases if isinstance(aliases, dict) else {}
-        for name, raw in staged.items():
+        for name, raw in honoured.items():
             choice = _clean_choice(raw)
-            if choice is None or name not in names or name not in decided \
-                    or not _choice_name(name) \
-                    or any(_may_name(name, line) for line in fallen):
-                continue
-            keep_mine = getattr(aliases.get(name), "keep_mine", None)
-            action = choice["action"]
-            if action == "mine":
-                taken = keep_mine is True
-            elif action == "theirs":
-                taken = keep_mine is not True and landed[name] in ("updated", "unchanged")
-            elif action == "both":
-                taken = name not in aliases and landed[name] == "added"
-            else:
-                taken = False
-            if taken:
-                honoured[name] = choice
-        return honoured, decided
+            if choice is not None and choice["action"] != "merge" and name in names \
+                    and name in decided and _choice_name(name):
+                made[name] = choice
+        return made
     except Exception:
         return None
 
@@ -1807,7 +1776,7 @@ def _import(app_dir, claimed, ctx, txn, side, old=None) -> dict:
     new_tasks = [task for item in items for task in item["tasks"]]
     new_attention = [entry for item in items for entry in item["attention"]]
     changed = group_state.changed_files(old, new)
-    made = _choices_made(results, payloads, options, getattr(new, "aliases", None))
+    made = _choices_made(results, payloads, getattr(new, "honoured", None))
 
     if not changed and new_tag is None and not new_tasks:               # step 8
         dirty = False
@@ -1817,8 +1786,9 @@ def _import(app_dir, claimed, ctx, txn, side, old=None) -> dict:
                 side["attention"] = flags
                 dirty = True
         # ... and so is a doctrine choice: "keep mine" everywhere changes no file, and
-        # the next file of this group must offer it again (spec D7)
-        if _put_choices(side, meta["id"], made):
+        # the next file of this group must offer it again (spec D7). Best effort, as the
+        # flags: remembering can never turn the run into a failure.
+        if _quiet(_put_choices, side, meta["id"], made, default=False):
             dirty = True
         if dirty:
             _quiet(group_state.write_sidecar, app_dir, side)
@@ -1827,9 +1797,10 @@ def _import(app_dir, claimed, ctx, txn, side, old=None) -> dict:
                          _MSG_NOTHING_APPLIED if stuck else _MSG_UNCHANGED,
                          meta=meta, items=items, problems=problems)
         if _quiet(group_state.finish_applying, app_dir) is not True:
-            # The run is over and its applying file is still there: mark it `done` (the one
-            # time an unchanged run touches the side file), or the next start would call it
-            # "interrupted". The report was handed over just now: stored as seen.
+            # The run is over and its applying file is still there: mark it `done` (with
+            # the flags and choices above, if any - the side file is written again whole),
+            # or the next start would call it "interrupted". The report was handed over
+            # just now: stored as seen.
             side["last_report"] = dict(_kept(report), seen=True)
             side["done"] = token
             _quiet(group_state.write_sidecar, app_dir, side)
@@ -1898,7 +1869,8 @@ def _import(app_dir, claimed, ctx, txn, side, old=None) -> dict:
         if new_tag is not None:
             _store_tag(side, new_tag)
         _log_tag(side, events, _live(side, held), new_tag, backup)
-        _put_choices(side, meta["id"], made)        # with the history: all or nothing
+        # In the same write as the history; never a reason to take the import back.
+        _quiet(_put_choices, side, meta["id"], made, default=False)
 
     if _remember(app_dir, report, token=token, side=side, change=change):
         txn["recorded"] = True          # new files AND their record: nothing takes it back
