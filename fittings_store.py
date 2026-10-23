@@ -255,7 +255,17 @@ class MergeResult:
     `members_dropped` lines read ``"<doctrine> / <fit>: <why>"`` and are
     recorded only for a doctrine that was written. `orphaned_fits` are local
     fits a replaced doctrine used before and nothing uses now (kept, never
-    deleted). `tags_added` are member tags appended to the vocabulary."""
+    deleted). `tags_added` are member tags appended to the vocabulary.
+
+    With per-doctrine ``resolutions`` (a group import): `aliases` maps an
+    incoming doctrine name to ``(local name, keep_mine)`` for every choice
+    that was honoured and does not land under the incoming name - "use the
+    group's" onto a doctrine of another name (``False``), and every "keep
+    mine" (``True``, the same name included); `resolution_fallbacks` holds
+    one line per choice that no longer held and followed the default rule.
+    Those two are plain attributes set in ``__post_init__``, deliberately NOT
+    dataclass fields: the field list is pinned (`test_fittings_merge_share`),
+    and a result without choices compares and converts exactly as before."""
 
     fits_added: list[str] = field(default_factory=list)
     fits_reused: list[str] = field(default_factory=list)
@@ -266,6 +276,15 @@ class MergeResult:
     members_dropped: list[str] = field(default_factory=list)
     orphaned_fits: list[str] = field(default_factory=list)
     tags_added: list[str] = field(default_factory=list)
+
+    def __post_init__(self):
+        self.aliases: dict[str, tuple[str, bool]] = {}
+        self.resolution_fallbacks: list[str] = []
+
+
+# What a per-doctrine choice of `merge_share` may be in this build ("merge"
+# is not yet: such a choice falls back like a stale one).
+_RESOLUTION_ACTIONS = ("theirs", "mine", "both")
 
 
 _FIT_TEXT_FIELDS = ("name", "hull_name", "source", "raw_text", "dna", "notes",
@@ -2015,7 +2034,7 @@ class FittingsStore:
 
     def merge_share(
         self, payload: dict, *, on_conflict: str = "theirs",
-        validated: bool = False,
+        validated: bool = False, resolutions: dict | None = None,
     ) -> MergeResult:
         """Merge a share payload into the library BY NAME, all or nothing.
 
@@ -2055,6 +2074,19 @@ class FittingsStore:
         * **Tags** — a member tag the vocabulary lacks is appended to it
           (otherwise the next tag edit would strip it silently).
 
+        * **Per-doctrine choices** (``resolutions``, a group import; ``None``
+          or ``{}`` is everything above, exactly) — keyed by the INCOMING
+          doctrine name, ``(action, local doctrine id)``: "theirs" writes the
+          incoming doctrine into that local one in place, keeping its `id`,
+          `created` AND name; "mine" skips it and declines the fits only
+          skipped doctrines name; "both" adds it as a new doctrine. A choice
+          that no longer holds - its local doctrine is gone, two choices or a
+          same-named incoming doctrine claim one local doctrine, "both" onto a
+          name the library has exactly, any other action ("merge" included)
+          - follows the rules above and leaves one line in
+          `MergeResult.resolution_fallbacks`; it never refuses the merge.
+          `MergeResult.aliases` says where honoured choices landed.
+
         Slot drops, new tags and orphans are reported for doctrines this call
         WROTE; a skipped or unchanged doctrine reports nothing. See
         `MergeResult`."""
@@ -2078,15 +2110,24 @@ class FittingsStore:
                 for local in self._doctrines.values():
                     first_by_name.setdefault(local.name, local)
 
+                # The importer's per-doctrine choices that still hold:
+                # incoming name -> (action, local doctrine).
+                chosen = self._honoured_choices(
+                    clean["doctrines"], resolutions, first_by_name, keep_mine,
+                    result)
+
                 # "Keep mine" declines a doctrine whole: the fits only such
                 # doctrines name (as a slot's fit or a refit) stay out too,
                 # or they would land in the library as orphans.
                 declined: set[str] = set()         # payload fit ids
-                if keep_mine:
+                if keep_mine or chosen:
                     wanted: set[str] = set()
                     for raw_doctrine in clean["doctrines"]:
-                        named = (declined if raw_doctrine["name"] in first_by_name
-                                 else wanted)
+                        choice = chosen.get(raw_doctrine["name"])
+                        skip = (choice[0] == "mine" if choice is not None
+                                else keep_mine
+                                and raw_doctrine["name"] in first_by_name)
+                        named = declined if skip else wanted
                         for raw_member in raw_doctrine["members"]:
                             named.add(raw_member["fit_id"])
                             named.update(raw_member.get("refits") or ())
@@ -2128,8 +2169,14 @@ class FittingsStore:
                 vocabulary = set(self._tags)       # one build, not a scan per tag
                 for raw_doctrine in clean["doctrines"]:
                     incoming = doctrine_from_dict(raw_doctrine)
-                    local = first_by_name.get(incoming.name)
-                    if local is not None and keep_mine:
+                    choice = chosen.get(incoming.name)
+                    if choice is None:
+                        local = first_by_name.get(incoming.name)
+                        skip = local is not None and keep_mine
+                    else:
+                        local = None if choice[0] == "both" else choice[1]
+                        skip = choice[0] == "mine"
+                    if skip:
                         result.doctrines_skipped.append(incoming.name)
                         continue
                     dropped: list[str] = []
@@ -2149,7 +2196,8 @@ class FittingsStore:
                         continue
                     else:
                         released.extend(doctrine_fit_ids(local, True))
-                        local.name = incoming.name
+                        if choice is None:         # a choice keeps MY name
+                            local.name = incoming.name
                         local.description = incoming.description
                         local.members = members
                         local.exemptions = incoming.exemptions
@@ -2176,6 +2224,81 @@ class FittingsStore:
                 self._fits, self._doctrines, self._tags = snapshot
                 raise
         return result
+
+    def _honoured_choices(
+        self, doctrines: list, resolutions, first_by_name: dict,
+        keep_mine: bool, result: MergeResult,
+    ) -> dict:
+        """`merge_share`'s per-doctrine choices that still hold, as
+        ``{incoming name: (action, local Doctrine)}``; `result` gets the
+        aliases of those and one fallback line per choice that does not.
+
+        Only a name of the payload's doctrines is looked at (a choice for a
+        doctrine that is not being merged is no choice). A choice falls back
+        when its action is not one this build takes, its local doctrine is
+        gone, another choice names the same local doctrine, "both" would make
+        a name twin, or - for "theirs" / "mine" - an incoming doctrine of
+        that local doctrine's exact name follows the default rule onto it
+        (repeated until nothing changes: a fallback can claim in its turn)."""
+        if not resolutions or not isinstance(resolutions, dict):
+            return {}
+        names = [raw["name"] for raw in doctrines]
+        reasons: dict[str, str] = {}
+        chosen: dict[str, tuple] = {}
+        for name in names:
+            if name not in resolutions:
+                continue
+            entry = resolutions[name]
+            action, local_id = (entry if isinstance(entry, tuple) and len(entry) == 2
+                                else (None, None))
+            local = (self._doctrines.get(local_id)
+                     if isinstance(local_id, str) else None)
+            if action == "merge":
+                reasons[name] = "merging is not supported by this version"
+            elif action not in _RESOLUTION_ACTIONS:
+                reasons[name] = "the choice for it could not be read"
+            elif local is None:
+                reasons[name] = ("the doctrine of yours chosen for it is no "
+                                 "longer in your library")
+            elif action == "both" and name in first_by_name:
+                reasons[name] = "you have a doctrine of that name now"
+            else:
+                chosen[name] = (action, local)
+        uses: dict[int, int] = {}
+        for _action, local in chosen.values():
+            uses[id(local)] = uses.get(id(local), 0) + 1
+        for name, (_action, local) in list(chosen.items()):
+            if uses[id(local)] > 1:
+                del chosen[name]
+                reasons[name] = (f"your {_share_shown(local.name)} was chosen "
+                                 f"for two doctrines")
+        while True:
+            claimed = {id(first_by_name[name]) for name in names
+                       if name not in chosen and name in first_by_name}
+            taken = [name for name, (action, local) in chosen.items()
+                     if action != "both" and id(local) in claimed]
+            if not taken:
+                break
+            for name in taken:
+                local = chosen.pop(name)[1]
+                reasons[name] = (f"your {_share_shown(local.name)} is taken by "
+                                 f"the group's doctrine of that name")
+        for name in names:
+            if name in reasons:
+                if name not in first_by_name:
+                    default = "added as a new doctrine"
+                elif keep_mine:
+                    default = "kept yours"
+                else:
+                    default = "the group's version"
+                result.resolution_fallbacks.append(
+                    f"{_share_shown(name)}: {reasons[name]} - {default} instead")
+        for name, (action, local) in chosen.items():
+            if action == "mine":
+                result.aliases[name] = (local.name, True)
+            elif action == "theirs" and local.name != name:
+                result.aliases[name] = (local.name, False)
+        return chosen
 
     def _merge_slots(
         self, incoming: Doctrine, id_map: dict[str, str],

@@ -63,8 +63,14 @@ through its own store (``ping_store.PingStore``). The block names no character -
 the staging system and the time of a ping are never stored - and a doctrine id never
 travels: a doctrine's template is carried, and landed, by the doctrine's NAME.
 
-Pure: stdlib, ``fittings_store``, ``motd_doc``, ``ping_doc``, ``ping_store``,
-``group_bundle`` and ``group_items`` only. No Tk, no ``ui_theme``, no ``fc_gui`` - this
+A group doctrine the importer chose to keep theirs for, or to write into a doctrine of
+another name, leaves an alias (``State.aliases``, in memory only): the MOTD and ping
+templates of that doctrine are re-pointed to the importer's doctrine name, and under "keep
+mine" they land by the item's "mine" rule whatever its radio says.
+
+Pure: stdlib, ``fittings_store``, ``fit_models``, ``doctrine_match``, ``motd_doc``,
+``ping_doc``, ``ping_store``, ``group_bundle`` and ``group_items`` only. No Tk, no
+``ui_theme``, no ``fc_gui`` - this
 module runs in the boot hook.
 """
 
@@ -72,15 +78,16 @@ import copy
 import json
 import re
 
+import doctrine_match
 import fittings_store
 import motd_doc
 import ping_doc
 import ping_store
-from fit_models import fit_to_dict
+from fit_models import doctrine_from_dict, fit_from_dict, fit_to_dict
 from fittings_store import FittingsStore
 from group_bundle import MAX_NAME, clean_text, has_visible
-from group_items import (ABSENT, ConfigFieldsItem, Field, Item, ItemResult, Record, get_path,
-                         set_path, value_text)
+from group_items import (ABSENT, Alias, ConfigFieldsItem, Field, Item, ItemResult, Record,
+                         get_path, set_path, value_text)
 from ping_store import PingStore
 
 
@@ -398,6 +405,14 @@ class DoctrinesItem(_LibraryItem):
     unchanged; a name used twice in one file keeps its first doctrine. A doctrine added or
     updated sets the boot flag ``motd_disarm``, as a new MOTD template does: the tag lines
     of the importer's MOTD are built from the library.
+
+    Per-doctrine choices (``resolves``): ``matches`` pairs the file's doctrines with the
+    importer's (``doctrine_match``); ``apply`` hands the importer's choice for a pair to
+    ``merge_share`` - "theirs" writes the group's doctrine into theirs under THEIR name,
+    "mine" keeps theirs, "both" adds the group's - and, as its last step, leaves
+    ``state.aliases`` (incoming name -> ``Alias``) so the same file's MOTD and ping
+    templates land on the importer's doctrine. A choice that no longer holds follows the
+    default rule with one warning line. Without choices: exactly as before.
     """
 
     id = "fittings.doctrines"
@@ -406,6 +421,7 @@ class DoctrinesItem(_LibraryItem):
     paths = (("fittings", ("fits",)), ("fittings", ("doctrines",)), ("fittings", ("tags",)),
              _STAMP)
     conflicts = True
+    resolves = True
     never_saved = (_NEVER_IN_GAME,)
 
     def _exported(self, state):
@@ -487,7 +503,70 @@ class DoctrinesItem(_LibraryItem):
             return ABSENT
         return _share_of(payload.get("schema_version"), kept, _dicts(payload.get("fits")))
 
-    def apply(self, state, payload, mode, conflict, ctx) -> ItemResult:
+    def matches(self, state, payload) -> dict:
+        """``{record key: doctrine_match.Pair}``: the doctrines of a validated payload that
+        look like ones the importer has (``doctrine_match.pair_doctrines``). Only the first
+        doctrine of a name is keyed (its key is its name), and a pair onto a doctrine with
+        no usable id is never offered (a resolution needs one). ``{}`` for a fresh, newer
+        or unreadable library, a payload of a newer format, and on any failure. Reads only."""
+        try:
+            if not isinstance(payload, dict):
+                return {}
+            version = payload.get("schema_version")
+            if type(version) is int and version > fittings_store.SCHEMA_VERSION:
+                return {}
+            store, _reason = _open_library(state)
+            if store is None:
+                return {}
+            # The detector reads a slot's hull through its fits: a MAPPING id -> Fit.
+            mine_fits = {fit.id: fit for fit in store.list_fits()}
+            local = [(doctrine.id if isinstance(doctrine.id, str) else "",
+                      doctrine_match.sig_of_doctrine(doctrine, mine_fits))
+                     for doctrine in store.list_doctrines()]
+            if not local:
+                return {}
+            their_fits = {}
+            for raw in _dicts(payload.get("fits")):
+                try:
+                    fit = fit_from_dict(raw)
+                except Exception:
+                    continue
+                their_fits.setdefault(fit.id, fit)
+            rows = self._rows(payload)
+            incoming = []
+            for _key, raw in rows:
+                try:
+                    incoming.append(doctrine_match.sig_of_doctrine(doctrine_from_dict(raw),
+                                                                   their_fits))
+                except Exception:
+                    incoming.append(None)       # keeps the positions: never paired
+            found = {}
+            for pair in doctrine_match.pair_doctrines(local, incoming):
+                key, raw = rows[pair.incoming_index]
+                if pair.local_id and key == _name_of(raw):
+                    found[key] = pair
+            return found
+        except Exception:
+            return {}
+
+    def _choices(self, payload, resolutions) -> dict:
+        """``Options.resolutions`` for this item (record key -> ``{"action", "local_id"}``)
+        as ``merge_share`` takes them: incoming name -> ``(action, local_id)``. Only a key
+        that IS its doctrine's name - the first doctrine of a name - is read; a ``#2`` key
+        and anything that is not a choice are ignored."""
+        if not isinstance(resolutions, dict) or not resolutions:
+            return {}
+        choices = {}
+        for key, raw in self._rows(payload):
+            choice = resolutions.get(key)
+            if key != _name_of(raw) or not isinstance(choice, dict):
+                continue
+            action, local_id = choice.get("action"), choice.get("local_id")
+            if isinstance(action, str) and isinstance(local_id, str):
+                choices[key] = (action, local_id)
+        return choices
+
+    def apply(self, state, payload, mode, conflict, ctx, resolutions=None) -> ItemResult:
         result = ItemResult(self.id)
         doctrines = _dicts(payload.get("doctrines")) if isinstance(payload, dict) else []
         if not doctrines:
@@ -500,11 +579,14 @@ class DoctrinesItem(_LibraryItem):
         clean, problems = fittings_store.validate_share(payload)
         if clean is None:
             return _skipped(result, problems[0] if problems else _NOT_A_PAYLOAD)
+        choices = self._choices(payload, resolutions)
         try:
             # Every conflict rule is the store's: under "mine" it leaves a doctrine the
             # importer has exactly as it is and declines the fits only such doctrines name.
             # `clean` is what validate_share just returned: not validated a second time.
-            merged = store.merge_share(clean, on_conflict=conflict, validated=True)
+            # The importer's per-doctrine choices are the store's to honour too.
+            merged = store.merge_share(clean, on_conflict=conflict, validated=True,
+                                       resolutions=choices or None)
             changed = bool(merged.doctrines_added or merged.doctrines_updated
                            or merged.fits_added or merged.tags_added)
             if changed:
@@ -528,8 +610,23 @@ class DoctrinesItem(_LibraryItem):
             # lines are built from the library): as for a template, the next start begins
             # with Auto-update MOTD off for the session.
             result.flags["motd_disarm"] = True
+        for name, (local, keep_mine) in merged.aliases.items():
+            shown, mine = fittings_store._share_shown(name), fittings_store._share_shown(local)
+            if keep_mine:
+                result.notes.append(f"{shown}: kept your {mine}")
+            elif name in merged.doctrines_updated:
+                result.notes.append(f"{shown} went into your {mine}")
+            else:
+                result.notes.append(f"{shown} is already your {mine}")
+        result.warnings.extend(merged.resolution_fallbacks)
         if changed:
             result.status = "applied"
+        # LAST: the same file's MOTD and ping templates follow the importer's doctrine.
+        # A status of "skipped" or "failed" never gets here with an alias (the engine
+        # clears them for such a result), and "keep mine" everywhere is "unchanged".
+        aliases = getattr(state, "aliases", None)
+        if isinstance(aliases, dict):
+            aliases.update({name: Alias(*value) for name, value in merged.aliases.items()})
         return result
 
 
@@ -1042,6 +1139,18 @@ def _keep_my_fc(mine, theirs):
     return document, any(_is_pinned_fc(run) for run in own[taken:])
 
 
+def _aliases(state) -> dict:
+    """``{incoming doctrine name: (my doctrine name, keep_mine)}`` from ``state.aliases``
+    (what ``fittings.doctrines`` left for this apply); anything malformed is no alias."""
+    aliases = getattr(state, "aliases", None)
+    found = {}
+    for name, alias in aliases.items() if isinstance(aliases, dict) else ():
+        if isinstance(alias, tuple) and len(alias) == 2 and isinstance(name, str) \
+                and isinstance(alias[0], str) and alias[0] and isinstance(alias[1], bool):
+            found[name] = (alias[0], alias[1])
+    return found
+
+
 def _is_row_key(hint, base) -> bool:
     """Whether ``hint`` is a record key ``_named_rows`` gives a template whose own key is
     ``base``: ``base`` itself, or ``base#<n>`` with ``<n>`` in ASCII digits (a
@@ -1065,6 +1174,11 @@ class MotdsItem(Item):
     ``fittings.saved_motds`` is written. Any template added or updated sets the boot flag
     ``motd_disarm``: the next start begins with Auto-update MOTD off for the session, so a
     template nobody has read yet is not pushed on a cold launch.
+
+    A template of a doctrine that landed in one of the importer's (``state.aliases``) is
+    re-pointed to that doctrine's name - under "keep mine" it lands by the "mine" rule
+    whatever the radio says - and a second one landing on one ``(doctrine, name)`` is
+    left out with the twin line; its record key stays the one the file gave it.
 
     The record key is ``"<doctrine> / <name>"``; two templates that spell the same key
     (``"A / B"`` + ``"C"`` and ``"A"`` + ``"B / C"``) get ``#2``, ``#3`` as doctrines do.
@@ -1214,8 +1328,20 @@ class MotdsItem(Item):
                 if isinstance(doctrine, str) and isinstance(name, str):
                     mine.setdefault((doctrine, name), index)
 
-        landed = []
+        aliases = _aliases(state)
+        landed, keys, twins = [], set(), 0
         for key, entry in self._result_rows(payload, incoming):    # the keys `records` shows
+            # A template of a doctrine that landed in one of the importer's follows it; one
+            # of a doctrine they said to keep lands by the "mine" rule, whatever the radio.
+            target, forced_mine = aliases.get(entry["doctrine"], (entry["doctrine"], False))
+            if target != entry["doctrine"]:
+                entry = dict(entry, doctrine=target)
+            if (entry["doctrine"], entry["name"]) in keys:
+                # Re-pointed onto a template of this file: the first stays.
+                twins += 1
+                result.skipped.append(key)
+                continue
+            keys.add((entry["doctrine"], entry["name"]))
             index = mine.get((entry["doctrine"], entry["name"]))
             if index is None:
                 # Key order as the composer writes a template.
@@ -1223,7 +1349,7 @@ class MotdsItem(Item):
                               "name": entry["name"], "doctrine": entry["doctrine"]})
                 mine[(entry["doctrine"], entry["name"])] = len(saved) - 1
                 result.added.append(key)
-            elif keep_mine:
+            elif keep_mine or forced_mine:
                 result.skipped.append(key)
                 continue
             else:
@@ -1249,6 +1375,10 @@ class MotdsItem(Item):
                     result.warnings.append(f"{shown}: your pinned FC was cleared")
             landed.append(entry)
 
+        if twins:
+            odd = _count(twins, "template with a name used twice",
+                         "templates with a name used twice")
+            result.warnings.append(f"{self.label}: {odd} left out")
         if not landed:
             return result
         if state.config is None:
@@ -2022,7 +2152,10 @@ class PingTemplatesItem(Item):
     one the importer does not have is skipped with a warning, never guessed (a doctrine
     renamed since the export is such a one). A doctrine with an entry already - a template
     of its own, or any stored pick - gets the file's ("theirs") or is left whole ("mine").
-    A file entry without a template never takes the importer's own template away.
+    A file entry without a template never takes the importer's own template away. An entry
+    whose doctrine landed in one of the importer's (``state.aliases``) lands on that one;
+    under "keep mine" by the "mine" rule whatever the radio says; a second entry landing on
+    one doctrine is left out with a warning.
 
     The library is read and never written: ``files`` names the config alone, so the engine
     copies no library for this item, and an unreadable one is answered here."""
@@ -2181,9 +2314,20 @@ class PingTemplatesItem(Item):
         keep_mine = isinstance(conflict, str) and conflict.strip().lower() == "mine"
         ping = _PingConfig(state)
         left_out = False                                # a row skipped WITH a warning
+        aliases, targets = _aliases(state), set()
         for name, entry in incoming.items():
             shown = _ping_shown(name)
-            doctrine_id = ids.get(name)                 # the exact name, the first of it
+            # A doctrine that landed in one of the importer's: its entry follows it; one
+            # they said to keep: the "mine" rule below, whatever the radio says.
+            target, forced_mine = aliases.get(name, (name, False))
+            if target in targets:
+                left_out = True
+                result.skipped.append(name)
+                result.warnings.append(f"{shown}: your {_ping_shown(target)} already has an "
+                                       f"entry of this file - ping template left out")
+                continue
+            targets.add(target)
+            doctrine_id = ids.get(target)               # the exact name, the first of it
             if doctrine_id is None:
                 left_out = True
                 result.skipped.append(name)
@@ -2193,7 +2337,7 @@ class PingTemplatesItem(Item):
             mine = ping.entry(doctrine_id)
             had = isinstance(mine.get("doc"), list) or any(
                 field in ping.stored_picks(doctrine_id) for field in ping_store.PICK_FIELDS)
-            if had and keep_mine:
+            if had and (keep_mine or forced_mine):
                 result.skipped.append(name)             # the importer's whole entry stays
                 continue
             before = ping.saves
