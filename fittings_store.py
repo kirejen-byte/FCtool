@@ -262,10 +262,15 @@ class MergeResult:
     that was honoured and does not land under the incoming name - "use the
     group's" onto a doctrine of another name (``False``), and every "keep
     mine" (``True``, the same name included); `resolution_fallbacks` holds
-    one line per choice that no longer held and followed the default rule.
-    Those two are plain attributes set in ``__post_init__``, deliberately NOT
-    dataclass fields: the field list is pinned (`test_fittings_merge_share`),
-    and a result without choices compares and converts exactly as before."""
+    one line per choice that no longer held and followed the default rule;
+    `honoured` maps an incoming doctrine name to ``(action, local id)`` for
+    EVERY choice that was applied as chosen (the final set, after every
+    fallback round) - the local id is the library key of the doctrine the
+    choice wrote, kept or (for "both") was paired with. A fallback is never
+    in it. Those three are plain attributes set in ``__post_init__``,
+    deliberately NOT dataclass fields: the field list is pinned
+    (`test_fittings_merge_share`), and a result without choices compares and
+    converts exactly as before."""
 
     fits_added: list[str] = field(default_factory=list)
     fits_reused: list[str] = field(default_factory=list)
@@ -280,6 +285,7 @@ class MergeResult:
     def __post_init__(self):
         self.aliases: dict[str, tuple[str, bool]] = {}
         self.resolution_fallbacks: list[str] = []
+        self.honoured: dict[str, tuple[str, str]] = {}
 
 
 # What a per-doctrine choice of `merge_share` may be in this build ("merge"
@@ -2075,7 +2081,7 @@ class FittingsStore:
           (otherwise the next tag edit would strip it silently).
 
         * **Per-doctrine choices** (``resolutions``, a group import; ``None``
-          or ``{}`` is everything above, exactly) — keyed by the INCOMING
+          or ``{}`` is everything above, exactly) - keyed by the INCOMING
           doctrine name, ``(action, local doctrine id)``: "theirs" writes the
           incoming doctrine into that local one in place, keeping its `id`,
           `created` AND name; "mine" skips it and declines the fits only
@@ -2085,7 +2091,8 @@ class FittingsStore:
           name the library has exactly, any other action ("merge" included)
           - follows the rules above and leaves one line in
           `MergeResult.resolution_fallbacks`; it never refuses the merge.
-          `MergeResult.aliases` says where honoured choices landed.
+          `MergeResult.aliases` says where honoured choices landed and
+          `MergeResult.honoured` which choices were honoured.
 
         Slot drops, new tags and orphans are reported for doctrines this call
         WROTE; a skipped or unchanged doctrine reports nothing. See
@@ -2231,20 +2238,24 @@ class FittingsStore:
     ) -> dict:
         """`merge_share`'s per-doctrine choices that still hold, as
         ``{incoming name: (action, local Doctrine)}``; `result` gets the
-        aliases of those and one fallback line per choice that does not.
+        aliases and the `honoured` record of those, and one fallback line per
+        choice that does not.
 
         Only a name of the payload's doctrines is looked at (a choice for a
         doctrine that is not being merged is no choice). A choice falls back
         when its action is not one this build takes, its local doctrine is
-        gone, another choice names the same local doctrine, "both" would make
-        a name twin, or - for "theirs" / "mine" - an incoming doctrine of
-        that local doctrine's exact name follows the default rule onto it
-        (repeated until nothing changes: a fallback can claim in its turn)."""
+        gone, another "theirs" / "mine" choice names the same local doctrine
+        (a "both" never touches it, so it counts for nothing there), "both"
+        would make a name twin, or - for "theirs" / "mine" - an incoming
+        doctrine of that local doctrine's exact name follows the default rule
+        onto it (repeated until nothing changes: a fallback can claim in its
+        turn)."""
         if not resolutions or not isinstance(resolutions, dict):
             return {}
         names = [raw["name"] for raw in doctrines]
         reasons: dict[str, str] = {}
         chosen: dict[str, tuple] = {}
+        keys: dict[str, str] = {}               # incoming name -> the local key
         for name in names:
             if name not in resolutions:
                 continue
@@ -2264,11 +2275,14 @@ class FittingsStore:
                 reasons[name] = "you have a doctrine of that name now"
             else:
                 chosen[name] = (action, local)
+                keys[name] = local_id
+        # Only a choice that writes or keeps the local doctrine claims it.
         uses: dict[int, int] = {}
-        for _action, local in chosen.values():
-            uses[id(local)] = uses.get(id(local), 0) + 1
-        for name, (_action, local) in list(chosen.items()):
-            if uses[id(local)] > 1:
+        for action, local in chosen.values():
+            if action != "both":
+                uses[id(local)] = uses.get(id(local), 0) + 1
+        for name, (action, local) in list(chosen.items()):
+            if action != "both" and uses[id(local)] > 1:
                 del chosen[name]
                 reasons[name] = (f"your {_share_shown(local.name)} was chosen "
                                  f"for two doctrines")
@@ -2294,6 +2308,7 @@ class FittingsStore:
                 result.resolution_fallbacks.append(
                     f"{_share_shown(name)}: {reasons[name]} - {default} instead")
         for name, (action, local) in chosen.items():
+            result.honoured[name] = (action, keys[name])
             if action == "mine":
                 result.aliases[name] = (local.name, True)
             elif action == "theirs" and local.name != name:

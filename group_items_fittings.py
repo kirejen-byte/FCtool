@@ -65,8 +65,10 @@ travels: a doctrine's template is carried, and landed, by the doctrine's NAME.
 
 A group doctrine the importer chose to keep theirs for, or to write into a doctrine of
 another name, leaves an alias (``State.aliases``, in memory only): the MOTD and ping
-templates of that doctrine are re-pointed to the importer's doctrine name, and under "keep
-mine" they land by the item's "mine" rule whatever its radio says.
+templates of that doctrine are re-pointed to the importer's doctrine name, and every
+template of a doctrine the importer said to keep - re-pointed or the file's own - lands by
+the item's "mine" rule whatever its radio says. The choices that were applied as chosen
+are recorded in ``State.honoured`` (in memory only) for the caller.
 
 Pure: stdlib, ``fittings_store``, ``fit_models``, ``doctrine_match``, ``motd_doc``,
 ``ping_doc``, ``ping_store``, ``group_bundle`` and ``group_items`` only. No Tk, no
@@ -411,8 +413,10 @@ class DoctrinesItem(_LibraryItem):
     ``merge_share`` - "theirs" writes the group's doctrine into theirs under THEIR name,
     "mine" keeps theirs, "both" adds the group's - and, as its last step, leaves
     ``state.aliases`` (incoming name -> ``Alias``) so the same file's MOTD and ping
-    templates land on the importer's doctrine. A choice that no longer holds follows the
-    default rule with one warning line. Without choices: exactly as before.
+    templates land on the importer's doctrine, and ``state.honoured`` (incoming name ->
+    ``{"action", "local_id"}``, each choice applied as chosen) for the caller. A choice
+    that no longer holds follows the default rule with one warning line - FIRST among the
+    warnings, so the engine's line bound never cuts it. Without choices: exactly as before.
     """
 
     id = "fittings.doctrines"
@@ -508,7 +512,11 @@ class DoctrinesItem(_LibraryItem):
         look like ones the importer has (``doctrine_match.pair_doctrines``). Only the first
         doctrine of a name is keyed (its key is its name), and a pair onto a doctrine with
         no usable id is never offered (a resolution needs one). ``{}`` for a fresh, newer
-        or unreadable library, a payload of a newer format, and on any failure. Reads only."""
+        or unreadable library, a payload of a newer format, and on any failure. Reads only.
+
+        A doctrine is offered only under the key the library files it by (``get_doctrine(id)
+        is`` that doctrine): a hand-edited library whose record names another key would send
+        the choice to a different doctrine than the one shown."""
         try:
             if not isinstance(payload, dict):
                 return {}
@@ -520,7 +528,8 @@ class DoctrinesItem(_LibraryItem):
                 return {}
             # The detector reads a slot's hull through its fits: a MAPPING id -> Fit.
             mine_fits = {fit.id: fit for fit in store.list_fits()}
-            local = [(doctrine.id if isinstance(doctrine.id, str) else "",
+            local = [(doctrine.id if isinstance(doctrine.id, str)
+                      and store.get_doctrine(doctrine.id) is doctrine else "",
                       doctrine_match.sig_of_doctrine(doctrine, mine_fits))
                      for doctrine in store.list_doctrines()]
             if not local:
@@ -601,6 +610,8 @@ class DoctrinesItem(_LibraryItem):
         result.notes.extend(_fits_note(merged))
         if merged.tags_added:
             result.notes.append("added to your tag list: " + ", ".join(merged.tags_added))
+        # A choice that fell back FIRST: the engine keeps only the first lines of a result.
+        result.warnings.extend(merged.resolution_fallbacks)
         result.warnings.extend(merged.members_dropped)
         if merged.orphaned_fits:
             result.warnings.append("no longer used, kept in your library: "
@@ -618,15 +629,19 @@ class DoctrinesItem(_LibraryItem):
                 result.notes.append(f"{shown} went into your {mine}")
             else:
                 result.notes.append(f"{shown} is already your {mine}")
-        result.warnings.extend(merged.resolution_fallbacks)
         if changed:
             result.status = "applied"
-        # LAST: the same file's MOTD and ping templates follow the importer's doctrine.
-        # A status of "skipped" or "failed" never gets here with an alias (the engine
-        # clears them for such a result), and "keep mine" everywhere is "unchanged".
+        # LAST: the same file's MOTD and ping templates follow the importer's doctrine,
+        # and the caller learns which choices were honoured. A status of "skipped" or
+        # "failed" never gets here with them (the engine clears both for such a result),
+        # and "keep mine" everywhere is "unchanged".
         aliases = getattr(state, "aliases", None)
         if isinstance(aliases, dict):
             aliases.update({name: Alias(*value) for name, value in merged.aliases.items()})
+        honoured = getattr(state, "honoured", None)
+        if isinstance(honoured, dict):
+            honoured.update({name: {"action": action, "local_id": local_id}
+                             for name, (action, local_id) in merged.honoured.items()})
         return result
 
 
@@ -1151,6 +1166,12 @@ def _aliases(state) -> dict:
     return found
 
 
+def _kept_doctrines(aliases) -> set:
+    """The importer's doctrine names a "keep mine" choice landed on (``_aliases`` shape):
+    nothing of theirs on such a doctrine is overwritten, whichever entry names it."""
+    return {name for name, keep_mine in aliases.values() if keep_mine}
+
+
 def _is_row_key(hint, base) -> bool:
     """Whether ``hint`` is a record key ``_named_rows`` gives a template whose own key is
     ``base``: ``base`` itself, or ``base#<n>`` with ``<n>`` in ASCII digits (a
@@ -1176,9 +1197,10 @@ class MotdsItem(Item):
     template nobody has read yet is not pushed on a cold launch.
 
     A template of a doctrine that landed in one of the importer's (``state.aliases``) is
-    re-pointed to that doctrine's name - under "keep mine" it lands by the "mine" rule
-    whatever the radio says - and a second one landing on one ``(doctrine, name)`` is
-    left out with the twin line; its record key stays the one the file gave it.
+    re-pointed to that doctrine's name; every template that lands on a doctrine the
+    importer said to keep - re-pointed or the file's own, in any order - lands by the
+    "mine" rule whatever the radio says; and a second one landing on one ``(doctrine,
+    name)`` is left out with the twin line; its record key stays the one the file gave it.
 
     The record key is ``"<doctrine> / <name>"``; two templates that spell the same key
     (``"A / B"`` + ``"C"`` and ``"A"`` + ``"B / C"``) get ``#2``, ``#3`` as doctrines do.
@@ -1329,13 +1351,16 @@ class MotdsItem(Item):
                     mine.setdefault((doctrine, name), index)
 
         aliases = _aliases(state)
+        kept = _kept_doctrines(aliases)
         landed, keys, twins = [], set(), 0
         for key, entry in self._result_rows(payload, incoming):    # the keys `records` shows
-            # A template of a doctrine that landed in one of the importer's follows it; one
-            # of a doctrine they said to keep lands by the "mine" rule, whatever the radio.
-            target, forced_mine = aliases.get(entry["doctrine"], (entry["doctrine"], False))
+            # A template of a doctrine that landed in one of the importer's follows it; any
+            # landing on a doctrine they said to keep - re-pointed or the file's own - lands
+            # by the "mine" rule, whatever the radio.
+            target = aliases.get(entry["doctrine"], (entry["doctrine"], False))[0]
             if target != entry["doctrine"]:
                 entry = dict(entry, doctrine=target)
+            forced_mine = target in kept
             if (entry["doctrine"], entry["name"]) in keys:
                 # Re-pointed onto a template of this file: the first stays.
                 twins += 1
@@ -2154,8 +2179,9 @@ class PingTemplatesItem(Item):
     of its own, or any stored pick - gets the file's ("theirs") or is left whole ("mine").
     A file entry without a template never takes the importer's own template away. An entry
     whose doctrine landed in one of the importer's (``state.aliases``) lands on that one;
-    under "keep mine" by the "mine" rule whatever the radio says; a second entry landing on
-    one doctrine is left out with a warning.
+    every entry landing on a doctrine the importer said to keep - re-pointed or the file's
+    own, in any order - by the "mine" rule whatever the radio says; a second entry landing
+    on one doctrine is left out with a warning.
 
     The library is read and never written: ``files`` names the config alone, so the engine
     copies no library for this item, and an unreadable one is answered here."""
@@ -2315,11 +2341,14 @@ class PingTemplatesItem(Item):
         ping = _PingConfig(state)
         left_out = False                                # a row skipped WITH a warning
         aliases, targets = _aliases(state), set()
+        kept = _kept_doctrines(aliases)
         for name, entry in incoming.items():
             shown = _ping_shown(name)
-            # A doctrine that landed in one of the importer's: its entry follows it; one
-            # they said to keep: the "mine" rule below, whatever the radio says.
-            target, forced_mine = aliases.get(name, (name, False))
+            # A doctrine that landed in one of the importer's: its entry follows it; any
+            # entry landing on one they said to keep - re-pointed or the file's own - the
+            # "mine" rule below, whatever the radio says.
+            target = aliases.get(name, (name, False))[0]
+            forced_mine = target in kept
             if target in targets:
                 left_out = True
                 result.skipped.append(name)

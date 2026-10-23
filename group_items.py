@@ -52,9 +52,10 @@ Contracts the item modules rely on
 * The lines an item says are bounded by the engine (``MAX_PROBLEMS``, ``MAX_RESULT_LINES``):
   an item need not count them.
 * An item with ``resolves = True`` (a ``bool``; ``register`` refuses anything else) is
-  handed ``resolutions=`` and may leave ``state.aliases`` for the items after it. Its
-  ``failed`` or ``skipped`` result CLEARS ``state.aliases`` - so an apply that leaves aliases
-  must answer ``applied`` or ``unchanged``, never ``skipped``.
+  handed ``resolutions=`` and may leave ``state.aliases`` for the items after it, and
+  ``state.honoured`` - the choices it applied as chosen - for the caller. Its ``failed``
+  or ``skipped`` result CLEARS both - so an apply that leaves them must answer ``applied``
+  or ``unchanged``, never ``skipped``. ``apply_bundle`` empties both before the first item.
 
 Pure: stdlib, ``group_bundle`` and ``system_coords`` only. No Tk, no ``ui_theme``, no
 ``fc_gui`` - this module runs in the boot hook, before the palette is installed. The one
@@ -142,12 +143,16 @@ class State:
 
     ``aliases`` is NOT a file: an in-memory map ``{incoming doctrine name: Alias}`` that the
     doctrines item leaves for the items after it within ONE apply (MOTD and ping templates
-    follow the importer's doctrine). It is a plain instance attribute set in
-    ``__post_init__``, deliberately NOT a dataclass field - the fields are exactly the
-    ``FILE_NAMES`` keys - so it is not part of equality, ``repr`` or a constructor call, is
-    never loaded or written (everything that touches disk walks ``FILE_NAMES``), and
-    ``copy`` gives the twin its own. The engine clears it when a ``resolves`` item fails
-    or is skipped."""
+    follow the importer's doctrine). ``honoured`` is its twin for the CALLER:
+    ``{incoming doctrine name: {"action": str, "local_id": str}}``, every per-doctrine
+    choice the doctrines item applied as chosen (a choice that fell back is never in it),
+    written by that item in its last step together with the aliases. Both are plain
+    instance attributes set in ``__post_init__``, deliberately NOT dataclass fields - the
+    fields are exactly the ``FILE_NAMES`` keys - so they are not part of equality, ``repr``
+    or a constructor call, are never loaded or written (everything that touches disk walks
+    ``FILE_NAMES``), and ``copy`` gives the twin its own deep copies. The engine empties
+    both when an apply begins, and clears both when a ``resolves`` item fails or is
+    skipped."""
 
     config: object
     fittings: object = None
@@ -157,10 +162,12 @@ class State:
 
     def __post_init__(self):
         self.aliases = {}
+        self.honoured = {}
 
     def copy(self):
         twin = State(**{key: deepcopy(getattr(self, key)) for key in FILE_NAMES})
         twin.aliases = deepcopy(self.aliases)
+        twin.honoured = deepcopy(self.honoured)
         return twin
 
     def readable(self, key) -> bool:
@@ -730,9 +737,10 @@ class Item:
                     refuses ``1`` or ``"yes"``): the engine then calls
                     ``apply(..., resolutions=options.resolutions.get(id, {}))`` - every
                     other item is called exactly as before - and clears ``state.aliases``
-                    when the item ends ``failed`` or ``skipped``. So an ``apply`` that
-                    leaves aliases for later items must answer ``applied`` or
-                    ``unchanged`` - never ``skipped``, or the aliases are dropped
+                    and ``state.honoured`` when the item ends ``failed`` or ``skipped``.
+                    So an ``apply`` that leaves aliases for later items (and its honoured
+                    choices for the caller) must answer ``applied`` or ``unchanged`` -
+                    never ``skipped``, or both are dropped
     """
 
     id = ""
@@ -1636,8 +1644,10 @@ def apply_bundle(state, payloads, options, ctx=None):
     An item with ``resolves = True`` is called with the extra keyword ``resolutions=`` (its
     entry of ``options.resolutions``, ``{}`` when none); every other item exactly as above,
     even when ``options.resolutions`` holds an entry under its id. When such an item ends
-    ``failed`` or ``skipped`` - whatever the reason - ``state.aliases`` is CLEARED, so a
-    resolving item whose apply leaves aliases must not answer ``skipped``.
+    ``failed`` or ``skipped`` - whatever the reason - ``state.aliases`` and
+    ``state.honoured`` are CLEARED, so a resolving item whose apply leaves them must not
+    answer ``skipped``. Both are emptied before the first item runs: a reused state never
+    carries an earlier apply's entries.
     """
     return _apply(state, payloads, options, ctx)
 
@@ -1670,12 +1680,15 @@ def _apply(state, payloads, options, ctx, broken=None):
     """``apply_bundle``. With ``broken`` (an exception type name: the state could not even
     be copied) nothing runs and every item that would have run is ``failed`` with it.
 
-    A ``resolves`` item that ends ``failed`` or ``skipped`` clears ``state.aliases``: no
-    later item may follow an alias onto a doctrine the group's never reached. (Not with
-    ``broken``: nothing ran, and that state is the caller's own.)"""
+    ``state.aliases`` and ``state.honoured`` are emptied first, and a ``resolves`` item
+    that ends ``failed`` or ``skipped`` clears both: no later item may follow an alias onto
+    a doctrine the group's never reached, and no caller may record a choice that did not
+    land. (Not with ``broken``: nothing ran, and that state is the caller's own.)"""
     options = _options(options)
     ctx = default_ctx() if ctx is None else ctx
     results = []
+    if broken is None:
+        _clear_maps(state)
     if not isinstance(payloads, dict):
         return state, results
     for item in registry():
@@ -1687,10 +1700,16 @@ def _apply(state, payloads, options, ctx, broken=None):
         results.append(result)
         if broken is None and getattr(item, "resolves", False) is True \
                 and result.status in ("failed", "skipped"):
-            aliases = getattr(state, "aliases", None)
-            if isinstance(aliases, dict):
-                aliases.clear()
+            _clear_maps(state)
     return state, results
+
+
+def _clear_maps(state):
+    """Empty the two transient maps of a ``State`` (``aliases``, ``honoured``)."""
+    for name in ("aliases", "honoured"):
+        found = getattr(state, name, None)
+        if isinstance(found, dict):
+            found.clear()
 
 
 def _apply_item(state, item, raw_payload, options, ctx, broken):
