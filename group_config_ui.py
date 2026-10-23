@@ -1336,7 +1336,7 @@ TITLE = "Group configuration"
 GEOMETRY = "980x640"
 MIN_SIZE = (820, 520)                   # at 100% display scaling; see min_size
 BASE_SCALING = 96 / 72                  # tk scaling at 100% (96 dpi): 1.333...
-MIN_GROWTH = 1.35                       # the smallest height grows this much faster
+MIN_GROWTH = 1.45                      # the smallest height grows this much faster
 SCREEN_ROOM = 80                        # title bar + frame + margins, off the screen
 TREE_STYLE = "Group.Treeview"
 # The window's buttons: the app's "Dark" and "Green" styles (see _configure_styles).
@@ -4345,10 +4345,13 @@ def min_size(scaling):
     ``MIN_SIZE`` exactly; a scaling that is not a positive number counts as 100%."""
     try:
         scaling = float(scaling)
+    except OverflowError:                        # an int too big for a float: the cap
+        scaling = 10.0
     except (TypeError, ValueError):
         scaling = BASE_SCALING
     if not scaling > 0 or math.isinf(scaling):
         scaling = BASE_SCALING
+    scaling = min(max(scaling, 0.5), 10.0)       # total: a huge number never overflows
     width, height = MIN_SIZE
     grown = math.ceil(round(height * (1 + MIN_GROWTH * (scaling / BASE_SCALING - 1)), 6))
     return width, max(height, grown)
