@@ -2427,14 +2427,18 @@ class FittingsStore:
         the importer's values always win - tags included). Fits are compared
         BY CONTENT (`fit_content_hash`): one fit stored under two ids is one
         fit. A merge NEVER changes the tags of a slot I already have, so it
-        never changes that slot's role. Each group slot, in the group's order:
+        never changes that slot's role. In two passes over the group's slots,
+        each in the group's order:
 
-        * pairs with my FIRST still-unpaired slot of its hull that already
-          flies one of its fits (any refit); failing that - and only when it
-          brings a fit my doctrine does not fly yet - with my first
-          still-unpaired slot of its hull whose tag set (after the store's
-          tag migration) is exactly the group slot's. A slot of mine pairs at
-          most once. The pair keeps my active fit, my default
+        * first, every group slot pairs with my FIRST still-unpaired slot of
+          its hull that already flies one of its fits (any refit); then each
+          group slot still unpaired - only when it brings a fit my doctrine
+          does not fly yet - with my first still-unpaired slot of its hull
+          whose tag set (after the store's tag migration) is exactly the
+          group slot's. A shared fit therefore wins over a same-tags slot
+          whatever the group's order. A slot of mine pairs at most once. My
+          slots stay in my order, appended ones follow in the group's order.
+          The pair keeps my active fit, my default
           (``refits[0]``), my tags and every value of mine; the group's fits
           it lacks are appended as refits (a plain slot of mine becomes
           ``refits = [my fit, ...]``).
@@ -2492,11 +2496,23 @@ class FittingsStore:
         added_slots: list[DoctrineMember] = []
         refits = 0
 
-        for member in members:
-            ids = slot_fit_ids(member)
-            wanted = {content(fit_id) for fit_id in ids}
+        # Pass 1, in the group's order: every group slot that shares a fit
+        # with a free slot of mine takes the first such slot - before any
+        # same-tags pairing, so a shared fit wins whatever the file order.
+        shared: dict[int, int] = {}              # group slot index -> my slot
+        for position, member in enumerate(members):
+            wanted = {content(fit_id) for fit_id in slot_fit_ids(member)}
             free = unpaired.get(hull_of(member.fit_id), [])
             partner = next((index for index in free if held[index] & wanted), None)
+            if partner is not None:
+                shared[position] = partner
+                free.remove(partner)
+
+        # Pass 2, in the group's order: what each slot brings, and where.
+        for position, member in enumerate(members):
+            ids = slot_fit_ids(member)
+            free = unpaired.get(hull_of(member.fit_id), [])
+            partner = shared.get(position)
             new_fits: list[str] = []
             for fit_id in ids:
                 key = content(fit_id)
@@ -2524,7 +2540,7 @@ class FittingsStore:
                     ))
                     order += 1
                     continue
-            free.remove(partner)
+                free.remove(partner)
             if not new_fits:
                 continue
             current = out[partner]
