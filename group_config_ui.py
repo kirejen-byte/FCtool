@@ -1170,6 +1170,85 @@ def result_summary(report) -> list:
     return lines
 
 
+# -- doctrine pairs (spec "doctrine merge" 5, 9) --------------------------------------------
+#
+# A doctrine of the file that looks like one the importer has (``group_apply.plan_matches``
+# -> ``doctrine_match.Pair``) is offered a choice of its own. The defaults are today's
+# (D4): a pair of the same name follows the item's "An entry of the same name" radio, a
+# pair of different names keeps both.
+
+DOCTRINES_ITEM = "fittings.doctrines"   # the one item whose records are paired
+PAIR_CHOICES_EXACT = (("theirs", "Use the group's version"), ("mine", "Keep mine"))
+PAIR_CHOICES_OTHER = (("both", "Keep both"),
+                      ("theirs", "Use the group's version (keeps your name)"),
+                      ("mine", "Keep mine"))
+MAX_HULLS_SHOWN = 8                     # pair_detail_lines: hull names per list
+
+
+def _exact(pair) -> bool:
+    return getattr(pair, "exact", None) is True
+
+
+def pair_choices(pair) -> tuple:
+    """``((action, label), ...)``: what a pair offers - "keep both" only to a pair of
+    different names (one of the same name would make a name twin)."""
+    return PAIR_CHOICES_EXACT if _exact(pair) else PAIR_CHOICES_OTHER
+
+
+def pair_default(pair, conflict="theirs") -> str:
+    """The choice a pair gets when none is made for it: a pair of the same name follows
+    the item's ``conflict`` (``theirs`` | ``mine``; anything else reads as ``theirs``), a
+    pair of different names keeps both."""
+    if not _exact(pair):
+        return "both"
+    return conflict if conflict in dict(PAIR_CHOICES_EXACT) else "theirs"
+
+
+def doctrine_header_line(count) -> str:
+    """The Import header's line for ``count`` paired doctrines; ``""`` for none."""
+    if type(count) is not int or count < 1:
+        return ""
+    if count == 1:
+        return ("1 doctrine in this file looks like one you already have - choose what "
+                "happens to it.")
+    return (f"{count} doctrines in this file look like ones you already have - choose "
+            "what happens to each.")
+
+
+def _hull_list(names) -> str:
+    names = names if isinstance(names, (list, tuple)) else ()
+    shown = [name for name in map(_show, names) if name]
+    text = ", ".join(shown[:MAX_HULLS_SHOWN])
+    if len(shown) > MAX_HULLS_SHOWN:
+        text += f" and {len(shown) - MAX_HULLS_SHOWN} more"
+    return text
+
+
+def pair_detail_lines(pair, action) -> list:
+    """The lines a paired record row shows first: ``"Looks like your <local> - <why>"``,
+    the hulls only one side flies (at most ``MAX_HULLS_SHOWN`` names each, then
+    ``"and <n> more"``; a list with nothing in it is left out) and ``"This doctrine:
+    <label of action>"`` (left out for an action the pair does not offer). Total: no pair
+    -> ``[]``."""
+    local = getattr(pair, "local_name", None)
+    try:
+        why = _show(pair.reason())
+    except Exception:
+        return []
+    if not isinstance(local, str):
+        return []
+    lines = [f"Looks like your {_show(local) or '(no name)'} - {why}"]
+    for lead, names in (("Only in yours: ", getattr(pair, "mine_only", ())),
+                        ("Only in the group's: ", getattr(pair, "theirs_only", ()))):
+        text = _hull_list(names)
+        if text:
+            lines.append(lead + text)
+    label = dict(pair_choices(pair)).get(action) if isinstance(action, str) else None
+    if label:
+        lines.append(f"This doctrine: {label}")
+    return lines
+
+
 # -- the host ------------------------------------------------------------------------------
 
 @dataclass
@@ -1484,6 +1563,7 @@ class _TreeView:
         widget.tag_configure("dim", foreground=FG_DIM)
         widget.tag_configure("warn", foreground=FG_ORANGE)
         widget.tag_configure("head", foreground=FG_WHITE)
+        widget.tag_configure("similar", foreground=FG_ACCENT)     # a paired doctrine
         widget.bind("<Button-1>", self._on_press, add="+")
         widget.bind("<Double-Button-1>", self._on_double, add="+")
         widget.bind("<space>", self._on_space, add="+")
@@ -1664,12 +1744,16 @@ class _Controller:
       ``bundle`` / ``read_notes`` / ``file_payloads`` / ``problems`` / ``results`` /
       ``header`` / ``warnings`` / ``notes`` / ``item_modes`` / ``item_conflicts``
                        the Import page: the file, and the plan of it
+      ``doctrine_pairs``   ``{record key: doctrine_match.Pair}`` - the file's doctrines that
+                       look like the importer's (``group_apply.plan_matches``, ONCE per file)
+      ``doctrine_choices`` ``{record key: action}`` - the choices MADE for them (remembered
+                       ones pre-set); a pair without one has its default (``pair_default``)
       ``imports`` / ``attention_flags`` / ``pending``    the History page
 
     Methods: ``show_page(name)``, ``set_mode(mode)``, ``toggle(row)``, ``select(row)``,
     ``refresh()``, ``save_file()``, ``set_field(item_id, key, value)``, ``edit_palette()``,
     ``choose_file(path=None)``, ``set_item_option(item_id, mode=None, conflict=None)``,
-    ``apply_import(when)``, ``show_details(index)``, ``show_report(report)``,
+    ``set_doctrine_choice(record_key, action)``, ``apply_import(when)``, ``show_details(index)``, ``show_report(report)``,
     ``ask_restore(index=None)``, ``restore(backup_name, when)``, ``restart_now()``,
     ``cancel_pending()``, ``open_attention(index=None)``, ``dismiss(section)``,
     ``first_control()``, ``focus_first()``, ``flush()``, ``close()``;
@@ -1740,7 +1824,11 @@ class _Controller:
         self.file_payloads = {}
         self.header, self.warnings, self.notes = [], [], []
         self.item_modes, self.item_conflicts = {}, {}
+        self.doctrine_pairs, self.doctrine_choices = {}, {}
+        self._doctrine_remembered = {}  # record key -> the action an earlier import honoured
         self.option_buttons, self._option_vars, self._option_item = {}, {}, None
+        self._option_pair = None        # the record key of the pair the radios are for
+        self._option_rows = {}          # group kind -> the grid row of its caption
         self._preview, self._extra_rows, self._import_unusable = {}, [], {}
         self._refusal = ""              # why the chosen file was refused (the reader's words)
         self._warn_count = 0            # the lines the warnings box holds
@@ -2110,6 +2198,7 @@ class _Controller:
         frame, self.header_text = self._text_box(row, height=_HEADER_LINES[1])
         frame.pack(side=tk.LEFT, fill=tk.X, expand=True)
         self.header_text.tag_configure("title", spacing3=0)     # whole lines (_size_header)
+        self.header_text.tag_configure("accent", foreground=FG_ACCENT)  # the paired doctrines
         self.header_text.bind("<Configure>", self._size_header, add="+")
 
         paned = self._paned(page)
@@ -3219,6 +3308,7 @@ class _Controller:
         self.read_notes, self.problems, self.file_payloads = [], [], {}
         self.header, self.warnings, self.notes = [], [], []
         self.item_modes, self.item_conflicts = {}, {}
+        self.doctrine_pairs, self.doctrine_choices, self._doctrine_remembered = {}, {}, {}
         self._preview, self._extra_rows, self._import_unusable = {}, [], {}
         self._refusal = ""
         view = self._views["import"]
@@ -3245,6 +3335,7 @@ class _Controller:
         self.bundle, self.read_notes = bundle, list(notes)
         self.file_payloads, self.problems = payloads, list(problems)
         self._ask_host("flush_config")  # the plan reads the files, as the apply will
+        self._find_pairs(payloads)
         self.header = self._header_lines()
         self._set_preview(None)
         view.fill(SelectionTree(build_nodes(payloads, depth="leaves",
@@ -3276,7 +3367,37 @@ class _Controller:
         before = self._imported_before()
         if before:
             lines.append(before)
+        paired = doctrine_header_line(len(self.doctrine_pairs))
+        if paired:
+            lines.append(paired)
         return lines
+
+    def _find_pairs(self, payloads) -> None:
+        """The file's doctrines that look like the importer's, and the choices an earlier
+        import of this group honoured for them - asked ONCE per file read (it costs a few
+        tenths of a second on a large library), never per plan. Only a pair of a record row
+        the tree shows is kept, with a remembered action that pair offers."""
+        try:
+            found = group_apply.plan_matches(self.app_dir, self.bundle, ctx=self.ctx)
+            pairs, remembered = found.get("pairs"), found.get("remembered")
+        except Exception as exc:        # plan_matches is total; this is the backstop
+            log.warning("group window: the doctrines could not be paired (%s)",
+                        type(exc).__name__)
+            pairs, remembered = {}, {}
+        item = _item(DOCTRINES_ITEM)
+        keys = {key for key, _label, _detail in _records(item, _payload(payloads,
+                                                                        DOCTRINES_ITEM))} \
+            if item is not None else set()
+        self.doctrine_pairs = {key: pair for key, pair in pairs.items()
+                               if key in keys and isinstance(getattr(pair, "local_id", None),
+                                                             str)} \
+            if isinstance(pairs, dict) else {}
+        self.doctrine_choices, self._doctrine_remembered = {}, {}
+        for key, choice in remembered.items() if isinstance(remembered, dict) else ():
+            pair = self.doctrine_pairs.get(key)
+            action = choice.get("action") if isinstance(choice, dict) else None
+            if pair is not None and action in dict(pair_choices(pair)):
+                self.doctrine_choices[key] = self._doctrine_remembered[key] = action
 
     def _imported_before(self) -> str:
         bundle_id = getattr(self.bundle.meta, "id", "")
@@ -3319,13 +3440,47 @@ class _Controller:
         return (node.summary if node is not None and node.kind != "root" else "", "")
 
     def _import_tags(self, row):
-        return self._row_tags(self._views["import"].tree, row, self._import_unusable)
+        tags = self._row_tags(self._views["import"].tree, row, self._import_unusable)
+        # A paired doctrine that is ticked is marked; unticked it is dim like any other row.
+        return ("similar",) if not tags and self._pair_key(row) is not None else tags
+
+    def _pair_key(self, row):
+        """The record key of a paired doctrine's row, or ``None`` for any other row."""
+        prefix = DOCTRINES_ITEM + LEAF_SEP
+        if not isinstance(row, str) or not row.startswith(prefix):
+            return None
+        key = row[len(prefix):]
+        return key if key in self.doctrine_pairs else None
+
+    def _pair_default(self, key) -> str:
+        return pair_default(self.doctrine_pairs.get(key),
+                            self.item_conflicts.get(DOCTRINES_ITEM, CONFLICT_CHOICES[0][0]))
+
+    def doctrine_choice(self, key):
+        """What happens to a paired doctrine: the choice made for it, else its default;
+        ``None`` for a record key that is no pair."""
+        if key not in self.doctrine_pairs:
+            return None
+        return self.doctrine_choices.get(key) or self._pair_default(key)
 
     def _import_options(self) -> Options:
-        """What is ticked, with the choices made per item."""
-        options = options_from_tree(self._views["import"].tree, self.file_payloads)
+        """What is ticked, with the choices made per item - and per paired doctrine: a
+        choice is sent when it is not the pair's default, or when it is the one an earlier
+        import of this group honoured (so it is remembered again). A doctrine whose row is
+        not ticked is not imported: nothing is sent for it, its choice stays here."""
+        view = self._views["import"]
+        options = options_from_tree(view.tree, self.file_payloads)
         options.modes.update(self.item_modes)
         options.conflicts.update(self.item_conflicts)
+        chosen = {}
+        for key, pair in self.doctrine_pairs.items():
+            if view.tree is None or view.tree.state(DOCTRINES_ITEM + LEAF_SEP + key) != "on":
+                continue
+            action = self.doctrine_choice(key)
+            if action != self._pair_default(key) or action == self._doctrine_remembered.get(key):
+                chosen[key] = {"action": action, "local_id": pair.local_id}
+        if chosen:
+            options.resolutions[DOCTRINES_ITEM] = chosen
         return options
 
     def _replan(self) -> None:
@@ -3365,8 +3520,10 @@ class _Controller:
     def _paint_import(self) -> None:
         """The header, the warnings box and the right pane of the Import page."""
         lines = self.header
+        paired = doctrine_header_line(len(self.doctrine_pairs))
         parts = [(line + ("\n" if index < len(lines) - 1 else ""),
-                  "title" if index == 0 else "dim" if line.startswith("You imported") else "")
+                  "title" if index == 0 else "dim" if line.startswith("You imported")
+                  else "accent" if paired and line == paired else "")
                  for index, line in enumerate(lines)]
         if self.bundle is None:                     # no file yet, or one that was refused
             name = self.file_var.get()
@@ -3513,7 +3670,13 @@ class _Controller:
             happens = self._import_cells(item_id)[1]
             result = next((entry for entry in self.results or ()
                            if entry.item_id == item_id), None)
-            parts = [(title + "\n", "title")] + self._detail_parts(text, rows, HEAD_IN_FILE)
+            parts = [(title + "\n", "title")]
+            key = self._pair_key(node.id)
+            if key is not None:                     # a paired doctrine: what it looks like
+                lines = pair_detail_lines(self.doctrine_pairs[key], self.doctrine_choice(key))
+                parts += [(line + "\n", "sub" if index == 0 else ("hang",))
+                          for index, line in enumerate(lines)]
+            parts += self._detail_parts(text, rows, HEAD_IN_FILE)
             parts.append((HEAD_HAPPENS + "\n", "head"))
             parts.append((f"  {happens or (MSG_CHECKING if self.results is None else NOT_TICKED)}"
                           "\n", ""))
@@ -3532,6 +3695,7 @@ class _Controller:
             for child in frame.winfo_children():
                 child.destroy()
             self.option_buttons, self._option_vars, self._option_item = {}, {}, None
+            self._option_pair = None
             item_id = self._item_of(view, view.sel) if self.bundle is not None else None
             item = _item(item_id) if item_id in self.file_payloads else None
             groups = []
@@ -3541,45 +3705,66 @@ class _Controller:
             if item is not None and item.conflicts:
                 groups.append(("conflict", "An entry of the same name:", CONFLICT_CHOICES,
                                self.item_conflicts.get(item_id, CONFLICT_CHOICES[0][0])))
+            # A paired doctrine's own choice, under the item's (spec "doctrine merge" 9).
+            pair_key = self._pair_key(view.sel) if item is not None else None
+            if pair_key is not None:
+                groups.append(("doctrine", "This doctrine:",
+                               pair_choices(self.doctrine_pairs[pair_key]),
+                               self.doctrine_choice(pair_key)))
             if not groups:
                 frame.pack_forget()
                 return
-            self._option_item = item_id
+            self._option_item, self._option_pair = item_id, pair_key
+            self._option_rows = {}
             for index, (kind, caption, choices, current) in enumerate(groups):
-                self._label(frame, caption, font=_HINT_FONT, fg=FG_DIM, anchor=tk.W).grid(
-                    row=3 * index, column=0, columnspan=2, sticky=tk.W)
+                parent, row = frame, 3 * index
+                if kind == "doctrine":
+                    # Its own frame, so its three choices do not share - and widen - the
+                    # columns of the item's two above it.
+                    parent, row = tk.Frame(frame, bg=BG_DARK), 0
+                    parent.grid(row=3 * index, column=0, columnspan=2, sticky=tk.W)
+                self._option_rows[kind] = row
+                self._label(parent, caption, font=_HINT_FONT, fg=FG_DIM, anchor=tk.W).grid(
+                    row=row, column=0, columnspan=len(choices), sticky=tk.W)
                 var = tk.StringVar(self.win, value=current)
                 self._option_vars[kind] = var
                 for value, text in choices:
+                    if kind == "doctrine":
+                        command = (lambda k=pair_key, v=value: self.set_doctrine_choice(k, v))
+                    else:
+                        command = (lambda k=kind, v=value, i=item_id:
+                                   self.set_item_option(i, **{k: v}))
                     self.option_buttons[(kind, value)] = tk.Radiobutton(
-                        frame, text=text, value=value, variable=var, font=_HINT_FONT,
+                        parent, text=text, value=value, variable=var, font=_HINT_FONT,
                         fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
                         activeforeground=FG_ACCENT, highlightthickness=0, bd=0, anchor=tk.W,
-                        command=lambda k=kind, v=value, i=item_id:
-                        self.set_item_option(i, **{k: v}))
+                        command=command)
             self._place_options(frame.winfo_width())
             frame.pack(side=tk.TOP, fill=tk.X, pady=(0, 6), before=self._import_detail_frame)
         except tk.TclError:
             pass
 
     def _place_options(self, width) -> None:
-        """Lay the two choices of each group side by side where ``width`` (the pane's)
-        has room for them, else one under the other. Every ``grid`` call passes its full
-        set of options: the ones left out would be kept from the layout before."""
-        kinds = [kind for kind in ("mode", "conflict") if kind in self._option_vars]
+        """Lay the choices of each group side by side where ``width`` (the pane's) has
+        room for them, else one under the other. Every ``grid`` call passes its full set
+        of options: the ones left out would be kept from the layout before."""
+        rows = self._option_rows
         try:
-            for index, kind in enumerate(kinds):
+            for kind in ("mode", "conflict", "doctrine"):
+                if kind not in self._option_vars or kind not in rows:
+                    continue
                 buttons = [button for (group, _value), button in self.option_buttons.items()
                            if group == kind]
-                wanted = sum(button.winfo_reqwidth() for button in buttons) + 10 + 14
+                wanted = sum(button.winfo_reqwidth() for button in buttons) \
+                    + 10 + 14 * max(1, len(buttons) - 1)
                 beside = width <= 1 or wanted <= width
                 for position, button in enumerate(buttons):
                     if beside:
-                        button.grid(row=3 * index + 1, column=position, columnspan=1,
+                        button.grid(row=rows[kind] + 1, column=position, columnspan=1,
                                     sticky=tk.W, padx=(10 if position == 0 else 14, 0), pady=0)
                     else:
-                        button.grid(row=3 * index + 1 + position, column=0, columnspan=2,
-                                    sticky=tk.W, padx=(10, 0), pady=0)
+                        button.grid(row=rows[kind] + 1 + position, column=0,
+                                    columnspan=len(buttons), sticky=tk.W, padx=(10, 0), pady=0)
         except tk.TclError:
             pass
 
@@ -3611,11 +3796,36 @@ class _Controller:
         if changed:
             if self._option_item == item_id:        # the choice may not have come from them
                 for kind, value in (("mode", self.item_modes.get(item_id, item.modes[0])),
-                                    ("conflict", self.item_conflicts.get(item_id, default))):
-                    if kind in self._option_vars:
+                                    ("conflict", self.item_conflicts.get(item_id, default)),
+                                    # a pair of the same name follows the item's radio
+                                    ("doctrine", self.doctrine_choice(self._option_pair))):
+                    if kind in self._option_vars and value is not None:
                         self._option_vars[kind].set(value)
             self._replan()
         return changed
+
+    def set_doctrine_choice(self, record_key, action) -> bool:
+        """Choose what happens to one paired doctrine of the file (``record_key``, its row's
+        record key): one of the actions its pair offers (``pair_choices``). It overrides the
+        item's "An entry of the same name" radio for that doctrine. Anything else is refused
+        (False). True when what happens to the doctrine changed: the plan then runs again,
+        behind the debounce. The choice is kept while the row is unticked; it is only not
+        sent (``_import_options``)."""
+        pair = self.doctrine_pairs.get(record_key) if isinstance(record_key, str) else None
+        if self._closed or self.bundle is None or pair is None \
+                or not isinstance(action, str) or action not in dict(pair_choices(pair)):
+            return False
+        before = self.doctrine_choice(record_key)
+        self.doctrine_choices[record_key] = action
+        if action == before:
+            return False
+        if self._option_pair == record_key and "doctrine" in self._option_vars:
+            self._option_vars["doctrine"].set(action)   # the choice may not have come from it
+        self._views["import"].repaint()
+        if self._pair_key(self._views["import"].sel) == record_key:
+            self._render_import()               # "This doctrine: ..." at once
+        self._replan()
+        return True
 
     def _apply_state(self):
         """``(can it be applied, why not, how to say it)``."""
