@@ -159,6 +159,9 @@ APPLIER_WAIT = APPLYING_WAIT            # the older name of that ONE limit (it w
 EDIT_WAIT = 0.5                         # seconds a side-file helper waits for the apply lock
 MAX_EXPORTS = 50                        # export names remembered (the newest)
 MAX_TASKS = 20                          # queued tasks kept (the newest)
+MAX_CHOICE_GROUPS = 20                  # groups whose doctrine choices are remembered (newest)
+MAX_CHOICES = 500                       # ...and choices of one group (the newest)
+CHOICES_KEY = "doctrine_choices"        # the side file's key for them (_put_choices)
 VERIFY_TASK = "verify_structure"
 TOKEN_FILES = "esi_tokens*.json"        # looked for by NAME only
 
@@ -190,6 +193,11 @@ _UNLISTED = ("attention", "tasks")      # _kept: lists of an item that hold no t
 _STATE_NAMES = tuple(FILE_NAMES.values())       # the files a record can be about (_held)
 _BACKUP_CLIP = 64                       # ...and how long a backup's name in it may be
 _TAG_LOG = 40                           # entries of the tag's history kept (_log_tag)
+_CHOICE_CLIP = 200                      # a remembered name / local id longer is not kept
+_CHOICES_BYTES = 4 * 1024 * 1024        # JSON of all remembered choices: the oldest groups
+                                        # go until it fits (one full group always does)
+_OFFERED = {True: ("theirs", "mine"),   # the choices a pair offers: an exact-name pair...
+            False: ("both", "theirs", "mine")}      # ...and one of different names
 _DEFAULT_WAIT = group_state.wait_for_exit       # apply_pending's own `wait` (_writer_gone)
 _CONTINUE = object()                    # _resume: the leftover is gone, go on with step 2
 _AGAIN = object()                       # _apply_locked: give the lock up and look again
@@ -638,6 +646,190 @@ def _merge_tasks(stored, incoming) -> list:
     return merged
 
 
+# -- remembered doctrine choices (spec D7) -----------------------------------
+#
+# The side file's ``doctrine_choices``: ``{bundle id: {incoming doctrine name: {"action",
+# "local_id"}}}`` - per group file (its ``bundle.id``) the per-doctrine choices that an
+# import HONOURED, oldest group first and, within one, oldest choice first. Written only
+# inside an import's own side-file change (``_import``: step 8 for an unchanged run, step
+# 11 with the history - same lock, same all-or-nothing); a restore leaves it alone.
+# ``plan_matches`` hands them back for the pairs they still fit.
+
+def _clean_choice(value):
+    """``{"action", "local_id"}`` out of a stored or staged choice, or ``None``."""
+    if not isinstance(value, dict):
+        return None
+    action, local_id = value.get("action"), value.get("local_id")
+    if not (isinstance(action, str) and action in group_items.RESOLUTION_ACTIONS
+            and isinstance(local_id, str) and 0 < len(local_id) <= _CHOICE_CLIP):
+        return None
+    return {"action": action, "local_id": local_id}
+
+
+def _choice_name(name) -> bool:
+    return isinstance(name, str) and 0 < len(name) <= _CHOICE_CLIP
+
+
+def _side_choices(side) -> dict:
+    """The side file's ``doctrine_choices`` as clean copies, in their order; whatever is
+    not a group id with at least one well-formed choice is no entry. Total."""
+    stored = side.get(CHOICES_KEY) if isinstance(side, dict) else None
+    groups = {}
+    for bundle_id, choices in stored.items() if isinstance(stored, dict) else ():
+        if not (isinstance(bundle_id, str) and _HEX32.fullmatch(bundle_id)
+                and isinstance(choices, dict)):
+            continue
+        kept = {}
+        for name, value in choices.items():
+            choice = _clean_choice(value)
+            if choice is not None and _choice_name(name):
+                kept[name] = choice
+        if kept:
+            groups[bundle_id] = kept
+    return groups
+
+
+def _bounded_choices(groups) -> dict:
+    """``groups`` cut to the newest ``MAX_CHOICE_GROUPS`` groups of at most ``MAX_CHOICES``
+    choices each (the newest), then - oldest group first - to ``_CHOICES_BYTES`` of JSON:
+    the side file always reads back (``group_state.write_sidecar``). One full group of the
+    longest names and ids is ~2.4 MB as JSON, so the newest group always stays."""
+    groups = {bundle_id: dict(list(choices.items())[-MAX_CHOICES:])
+              for bundle_id, choices in list(groups.items())[-MAX_CHOICE_GROUPS:]}
+    sizes = {bundle_id: len(json.dumps({bundle_id: choices}, ensure_ascii=True))
+             for bundle_id, choices in groups.items()}
+    total = sum(sizes.values())
+    for bundle_id in list(groups):
+        if total <= _CHOICES_BYTES:
+            break
+        del groups[bundle_id]
+        total -= sizes[bundle_id]
+    return groups
+
+
+def _put_choices(side, bundle_id, made) -> bool:
+    """Remember ``made`` - ``(honoured, decided)`` of ``_choices_made``, or ``None`` - for
+    the group ``bundle_id`` in ``side``. That group's older choices for the doctrines this
+    import merged (``decided``) go; the ``honoured`` ones are added as its newest, and the
+    group becomes the newest one. A key that held anything else is repaired on the way.
+    -> True when ``side`` changed (and must be written)."""
+    if made is None or not (isinstance(bundle_id, str) and _HEX32.fullmatch(bundle_id)):
+        return False
+    honoured, decided = made
+    groups = _side_choices(side)
+    choices = {name: choice for name, choice in groups.pop(bundle_id, {}).items()
+               if name not in decided}
+    choices.update(honoured)
+    if choices:
+        groups[bundle_id] = choices
+    groups = _bounded_choices(groups)
+    stored = side.get(CHOICES_KEY, None)
+    if not groups:
+        if CHOICES_KEY not in side:
+            return False
+        del side[CHOICES_KEY]
+        return True
+    # In order: a group that becomes the newest one is a change worth writing.
+    try:
+        if json.dumps(stored) == json.dumps(groups):
+            return False
+    except Exception:                   # what was stored is no JSON: replaced
+        pass
+    side[CHOICES_KEY] = groups
+    return True
+
+
+def _visible_ascii(text) -> str:
+    return "".join(ch for ch in text if " " < ch <= "~")
+
+
+def _may_name(name, line) -> bool:
+    """Whether ``line`` - a fallback line of ``merge_share``, ``"<name as quoted>: <why> -
+    <default> instead"`` - may be the one of the doctrine ``name``. Never False for the
+    line of ``name`` (the quoted name drops characters - control and format ones, the
+    blanks at its ends, everything after its 60th - but never one that is visible ASCII,
+    and keeps the rest in order); now and then True for another doctrine's line, which
+    leaves that choice unremembered: the safe side. No ``unicodedata`` here (purity)."""
+    shown, said = _visible_ascii(name), _visible_ascii(line)
+    common = 0
+    while common < len(shown) and common < len(said) and shown[common] == said[common]:
+        common += 1
+    return ":" in said[:common + 1]
+
+
+def _choices_made(results, payloads, options, aliases):
+    """The doctrine choices this import HONOURED: ``(honoured, decided)`` - ``honoured``
+    ``{incoming name: {"action", "local_id"}}``, ``decided`` the incoming names the
+    doctrines item merged this time - or ``None`` when that item did not run (unticked,
+    absent, ``failed`` or ``skipped``). Never raises (``None`` then).
+
+    A staged choice is keyed by its record key; only a key that IS its doctrine's name (the
+    first doctrine of a name) is ever handed to the store. It was honoured when it is not
+    one of the store's fallbacks (``MergeResult.resolution_fallbacks``, in the item's
+    ``warnings`` - ``_may_name``) AND it landed as that choice lands: "keep mine" leaves a
+    keep-mine alias (``state.aliases``), "use the group's" an update (or nothing to update)
+    without one, "keep both" a new doctrine without an alias. "merge" is not taken by this
+    build (spec Phase 2) and is never remembered yet."""
+    try:
+        result = next((result for result in results
+                       if getattr(result, "item_id", None) == DOCTRINES_ITEM), None)
+        if result is None or result.status in ("failed", "skipped"):
+            return None
+        landed = {name: kind for kind in ("added", "updated", "unchanged", "skipped")
+                  for name in getattr(result, kind) if isinstance(name, str)}
+        decided = set(landed)
+        staged = options.resolutions.get(DOCTRINES_ITEM) \
+            if isinstance(options.resolutions, dict) else None
+        honoured = {}
+        if not isinstance(staged, dict) or not staged:
+            return honoured, decided
+        item = group_items.get_item(DOCTRINES_ITEM)
+        names = {record.key for record in item.records(payloads.get(DOCTRINES_ITEM))
+                 if record.key == record.label}
+        fallen = [line for line in result.warnings
+                  if isinstance(line, str) and line.endswith(" instead")]
+        aliases = aliases if isinstance(aliases, dict) else {}
+        for name, raw in staged.items():
+            choice = _clean_choice(raw)
+            if choice is None or name not in names or name not in decided \
+                    or not _choice_name(name) \
+                    or any(_may_name(name, line) for line in fallen):
+                continue
+            keep_mine = getattr(aliases.get(name), "keep_mine", None)
+            action = choice["action"]
+            if action == "mine":
+                taken = keep_mine is True
+            elif action == "theirs":
+                taken = keep_mine is not True and landed[name] in ("updated", "unchanged")
+            elif action == "both":
+                taken = name not in aliases and landed[name] == "added"
+            else:
+                taken = False
+            if taken:
+                honoured[name] = choice
+        return honoured, decided
+    except Exception:
+        return None
+
+
+def _remembered(app_dir, bundle, pairs) -> dict:
+    """``plan_matches``' ``remembered``: the stored choices of this group file for the
+    ``pairs`` they still fit - the same local doctrine, and an action that pair offers
+    (``_OFFERED``; "keep both" only for a pair of different names, "merge" not yet). A
+    side file that cannot be read now remembers nothing. Reads only."""
+    bundle_id = _meta_dict(getattr(bundle, "meta", None))["id"]
+    if not bundle_id or not pairs:
+        return {}
+    stored = _side_choices(_quiet(group_state.read_sidecar, app_dir)).get(bundle_id, {})
+    found = {}
+    for key, pair in pairs.items():
+        choice = stored.get(key)
+        if choice is not None and choice["local_id"] == getattr(pair, "local_id", None) \
+                and choice["action"] in _OFFERED[getattr(pair, "exact", None) is True]:
+            found[key] = dict(choice)
+    return found
+
+
 # -- the group tag -----------------------------------------------------------
 
 def _tag_result(file_tag, options, current):
@@ -750,8 +942,9 @@ def _no_matches() -> dict:
 def plan_matches(app_dir, bundle, *, ctx=None) -> dict:
     """The group file's doctrines that look like ones the importer already has, for the
     window to ask about next to ``plan_import``. -> ``{"pairs": {record_key: Pair},
-    "remembered": {record_key: {"action", "local_id"}}}`` (``remembered``: the choices made
-    for this group's last file - always ``{}`` for now).
+    "remembered": {record_key: {"action", "local_id"}}}`` (``remembered``: the choices an
+    earlier import of this group - same ``bundle.id`` - honoured, for the pairs they still
+    fit: same local doctrine, an action the pair offers; ``_remembered``).
 
     Writes nothing and never raises: a build that is missing item modules, a
     ``config.json`` or library that cannot be read or is in use right now, no library at
@@ -772,6 +965,8 @@ def plan_matches(app_dir, bundle, *, ctx=None) -> dict:
         found = _no_matches()
         if isinstance(pairs, dict):
             found["pairs"] = {key: pair for key, pair in pairs.items() if isinstance(key, str)}
+            found["remembered"] = _quiet(_remembered, app_dir, bundle, found["pairs"],
+                                         default={})
         return found
     except Exception:
         return _no_matches()
@@ -1612,13 +1807,21 @@ def _import(app_dir, claimed, ctx, txn, side, old=None) -> dict:
     new_tasks = [task for item in items for task in item["tasks"]]
     new_attention = [entry for item in items for entry in item["attention"]]
     changed = group_state.changed_files(old, new)
+    made = _choices_made(results, payloads, options, getattr(new, "aliases", None))
 
     if not changed and new_tag is None and not new_tasks:               # step 8
+        dirty = False
         if new_attention:               # a flag is worth keeping without any change
             flags = _merge_attention(side["attention"], new_attention)
             if flags != side["attention"]:
                 side["attention"] = flags
-                _quiet(group_state.write_sidecar, app_dir, side)
+                dirty = True
+        # ... and so is a doctrine choice: "keep mine" everywhere changes no file, and
+        # the next file of this group must offer it again (spec D7)
+        if _put_choices(side, meta["id"], made):
+            dirty = True
+        if dirty:
+            _quiet(group_state.write_sidecar, app_dir, side)
         stuck = any(item["status"] in ("failed", "skipped") for item in items)
         report = _report("unchanged", "import",
                          _MSG_NOTHING_APPLIED if stuck else _MSG_UNCHANGED,
@@ -1695,6 +1898,7 @@ def _import(app_dir, claimed, ctx, txn, side, old=None) -> dict:
         if new_tag is not None:
             _store_tag(side, new_tag)
         _log_tag(side, events, _live(side, held), new_tag, backup)
+        _put_choices(side, meta["id"], made)        # with the history: all or nothing
 
     if _remember(app_dir, report, token=token, side=side, change=change):
         txn["recorded"] = True          # new files AND their record: nothing takes it back
