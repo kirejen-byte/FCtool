@@ -112,7 +112,7 @@ FILE_NAMES = {
 KINDS = ("value", "collection")
 FIELD_KINDS = ("bool", "int", "str", "enum", "system", "names")
 STATUSES = ("applied", "unchanged", "skipped", "failed")
-CONFLICTS = ("theirs", "mine")
+CONFLICTS = ("theirs", "mine")         # an item's conflict_choices unless it says other
 # What the importer may choose for ONE record the detector paired with one of theirs
 # (``Options.resolutions``). Only an item with ``resolves = True`` is ever handed them.
 RESOLUTION_ACTIONS = ("theirs", "mine", "both", "merge")
@@ -464,8 +464,9 @@ class Options:
 
     ``selected[item_id]`` is ``True`` (the whole item) or a list of field / record keys;
     an item that is not in ``selected`` is left alone. ``modes[item_id]`` is one of the
-    item's ``modes``, ``conflicts[item_id]`` is ``theirs`` or ``mine``; both fall back to the
-    item's default. ``apply_tag`` says whether an import may set the group tag - the engine
+    item's ``modes``, ``conflicts[item_id]`` one of its ``conflict_choices`` (``theirs`` or
+    ``mine``; the doctrines item also takes ``merge``); both fall back to the item's
+    default. ``apply_tag`` says whether an import may set the group tag - the engine
     ignores it, ``group_apply`` reads it.
 
     ``resolutions[item_id][record_key] = {"action": a, "local_id": id}`` (``a`` one of
@@ -730,6 +731,9 @@ class Item:
     ``sections``    Settings TOC titles the item may raise attention on
     ``modes``       ``("merge",)`` or ``("merge", "replace")``; the first is the default
     ``conflicts``   True when a same-named record offers theirs / mine
+    ``conflict_choices`` what the importer may answer such a record - a tuple of words,
+                    the first the default (``CONFLICTS``; the doctrines item adds "merge").
+                    Any other answer is the first.
     ``never_saved`` human lines: what this item leaves out of a file on purpose
     ``partial_ok``  True when the item copes with an unreadable SIDE file itself; an
                     unreadable ``config.json`` skips every item that names it regardless
@@ -752,6 +756,7 @@ class Item:
     sections = ()
     modes = ("merge",)
     conflicts = False
+    conflict_choices = CONFLICTS
     never_saved = ()
     partial_ok = False
     resolves = False
@@ -1242,7 +1247,8 @@ def _load_item_modules() -> None:
         # ==== ITEM MODULES - END ============================================
 
 
-_TUPLE_ATTRIBUTES = ("files", "paths", "modes", "sections", "never_saved")
+_TUPLE_ATTRIBUTES = ("files", "paths", "modes", "sections", "never_saved",
+                     "conflict_choices")
 
 
 def _check_item(item) -> None:
@@ -1277,6 +1283,9 @@ def _check_item(item) -> None:
             raise ValueError(f"{item.id}: an item may not declare all of config.json")
     if not item.modes or not all(isinstance(mode, str) and mode for mode in item.modes):
         raise ValueError(f"{item.id}: modes must name at least one mode")
+    if not item.conflict_choices or not all(isinstance(word, str) and word
+                                            for word in item.conflict_choices):
+        raise ValueError(f"{item.id}: conflict_choices must name at least one choice")
     if not all(isinstance(line, str) for line in item.sections + item.never_saved):
         raise ValueError(f"{item.id}: sections and never_saved hold text")
     # The engine asks ``resolves is True``: a truthy ``1`` would register and then be
@@ -1733,8 +1742,8 @@ def _apply_item(state, item, raw_payload, options, ctx, broken):
     if not isinstance(mode, str) or mode not in item.modes:
         mode = item.modes[0]
     conflict = options.conflicts.get(item.id)
-    if not isinstance(conflict, str) or conflict not in CONFLICTS:
-        conflict = CONFLICTS[0]
+    if not isinstance(conflict, str) or conflict not in item.conflict_choices:
+        conflict = item.conflict_choices[0]
 
     try:                                    # nothing has run yet: nothing to roll back
         before = {key: deepcopy(getattr(state, key)) for key in item.files}

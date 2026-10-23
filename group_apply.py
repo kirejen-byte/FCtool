@@ -198,8 +198,8 @@ _TAG_LOG = 40                           # entries of the tag's history kept (_lo
 _CHOICE_CLIP = 200                      # a remembered name / local id longer is not kept
 _CHOICES_BYTES = 4 * 1024 * 1024        # JSON of all remembered choices: the oldest groups
                                         # go until it fits (one full group always does)
-_OFFERED = {True: ("theirs", "mine"),   # the choices a pair offers: an exact-name pair...
-            False: ("both", "theirs", "mine")}      # ...and one of different names
+_OFFERED = {True: ("theirs", "mine", "merge"),  # the choices a pair offers: an exact-name
+            False: ("both", "theirs", "mine", "merge")}     # pair... and one of other names
 _DEFAULT_WAIT = group_state.wait_for_exit       # apply_pending's own `wait` (_writer_gone)
 _CONTINUE = object()                    # _resume: the leftover is gone, go on with step 2
 _AGAIN = object()                       # _apply_locked: give the lock up and look again
@@ -756,8 +756,7 @@ def _choices_made(results, payloads, honoured):
     names lossily. Of the record only a well-formed choice (``_clean_choice``) of a name
     that is not too long (``_choice_name``), that IS its record key (the first doctrine of
     a name) and that the item merged this time (``decided``: its record lists, which
-    ``ItemResult.bound`` never cuts) is kept. "merge" is not taken by this build (spec
-    Phase 2) and is never remembered yet."""
+    ``ItemResult.bound`` never cuts) is kept - "merge" as any other."""
     try:
         result = next((result for result in results
                        if getattr(result, "item_id", None) == DOCTRINES_ITEM), None)
@@ -773,8 +772,8 @@ def _choices_made(results, payloads, honoured):
                  if record.key == record.label}
         for name, raw in honoured.items():
             choice = _clean_choice(raw)
-            if choice is not None and choice["action"] != "merge" and name in names \
-                    and name in decided and _choice_name(name):
+            if choice is not None and name in names and name in decided \
+                    and _choice_name(name):
                 made[name] = choice
         return made
     except Exception:
@@ -784,7 +783,7 @@ def _choices_made(results, payloads, honoured):
 def _remembered(app_dir, bundle, pairs) -> dict:
     """``plan_matches``' ``remembered``: the stored choices of this group file for the
     ``pairs`` they still fit - the same local doctrine, and an action that pair offers
-    (``_OFFERED``; "keep both" only for a pair of different names, "merge" not yet). A
+    (``_OFFERED``; "keep both" only for a pair of different names, "merge" for both). A
     side file that cannot be read now remembers nothing. Reads only."""
     bundle_id = _meta_dict(getattr(bundle, "meta", None))["id"]
     if not bundle_id or not pairs:

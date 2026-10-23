@@ -267,7 +267,10 @@ class MergeResult:
     EVERY choice that was applied as chosen (the final set, after every
     fallback round) - the local id is the library key of the doctrine the
     choice wrote, kept or (for "both") was paired with. A fallback is never
-    in it. Those three are plain attributes set in ``__post_init__``,
+    in it. `merged` lists ``(incoming name, local name, MergeCounts)`` for
+    every merge that added something - a merge is otherwise reported like a
+    write: `doctrines_updated`, or `doctrines_unchanged` when it added
+    nothing. Those four are plain attributes set in ``__post_init__``,
     deliberately NOT dataclass fields: the field list is pinned
     (`test_fittings_merge_share`), and a result without choices compares and
     converts exactly as before."""
@@ -286,11 +289,23 @@ class MergeResult:
         self.aliases: dict[str, tuple[str, bool]] = {}
         self.resolution_fallbacks: list[str] = []
         self.honoured: dict[str, tuple[str, str]] = {}
+        # (incoming name, local name, MergeCounts) for every MERGE that added
+        # something (a merge that adds nothing is `doctrines_unchanged`).
+        self.merged: list[tuple[str, str, MergeCounts]] = []
 
 
-# What a per-doctrine choice of `merge_share` may be in this build ("merge"
-# is not yet: such a choice falls back like a stale one).
-_RESOLUTION_ACTIONS = ("theirs", "mine", "both")
+class MergeCounts(NamedTuple):
+    """What a merge (`FittingsStore._merge_into`) added to the importer's
+    doctrine: fits added as refits of its own slots, slots only the group had,
+    tags added to its own slots."""
+
+    refits: int
+    slots: int
+    tags: int
+
+
+# What a per-doctrine choice of `merge_share` may be.
+_RESOLUTION_ACTIONS = ("theirs", "mine", "both", "merge")
 
 
 _FIT_TEXT_FIELDS = ("name", "hull_name", "source", "raw_text", "dna", "notes",
@@ -2085,14 +2100,23 @@ class FittingsStore:
           doctrine name, ``(action, local doctrine id)``: "theirs" writes the
           incoming doctrine into that local one in place, keeping its `id`,
           `created` AND name; "mine" skips it and declines the fits only
-          skipped doctrines name; "both" adds it as a new doctrine. A choice
+          skipped doctrines name; "both" adds it as a new doctrine; "merge"
+          merges it into that local one (`_merge_into`). A choice
           that no longer holds - its local doctrine is gone, two choices or a
           same-named incoming doctrine claim one local doctrine, "both" onto a
-          name the library has exactly, any other action ("merge" included)
-          - follows the rules above and leaves one line in
+          name the library has exactly, any other action - follows the rules
+          above and leaves one line in
           `MergeResult.resolution_fallbacks`; it never refuses the merge.
           `MergeResult.aliases` says where honoured choices landed and
           `MergeResult.honoured` which choices were honoured.
+        * **Merge** (a "merge" choice, or ``on_conflict`` "merge" for every
+          exact-name match without a choice) - "keep mine, add what the group
+          has that I don't", in MY doctrine: my id, created, name,
+          exemptions, seed target and every slot value stay; the group's
+          fits, slots and slot tags I lack are added (`_merge_into`); the
+          description is filled only when mine is blank. Nothing is ever
+          removed, and merging the same payload again adds nothing (the
+          doctrine is then `doctrines_unchanged`).
 
         Slot drops, new tags and orphans are reported for doctrines this call
         WROTE; a skipped or unchanged doctrine reports nothing. See
@@ -2105,6 +2129,7 @@ class FittingsStore:
                 raise ValueError(
                     problems[0] if problems else "not a fittings payload")
         keep_mine = str(on_conflict).strip().lower() == "mine"
+        merge_all = str(on_conflict).strip().lower() == "merge"
         result = MergeResult()
         with self._lock:
             snapshot = (copy.deepcopy(self._fits), copy.deepcopy(self._doctrines),
@@ -2121,7 +2146,7 @@ class FittingsStore:
                 # incoming name -> (action, local doctrine).
                 chosen = self._honoured_choices(
                     clean["doctrines"], resolutions, first_by_name, keep_mine,
-                    result)
+                    result, merge_all=merge_all)
 
                 # "Keep mine" declines a doctrine whole: the fits only such
                 # doctrines name (as a slot's fit or a refit) stay out too,
@@ -2180,15 +2205,33 @@ class FittingsStore:
                     if choice is None:
                         local = first_by_name.get(incoming.name)
                         skip = local is not None and keep_mine
+                        merging = local is not None and merge_all
                     else:
                         local = None if choice[0] == "both" else choice[1]
                         skip = choice[0] == "mine"
+                        merging = choice[0] == "merge"
                     if skip:
                         result.doctrines_skipped.append(incoming.name)
                         continue
                     dropped: list[str] = []
                     members = self._merge_slots(incoming, id_map, names, dropped)
-                    if local is None:
+                    if merging:
+                        # Keep mine, add what the group has that I don't.
+                        members, counts = self._merge_into(
+                            local, members, name=incoming.name, dropped=dropped)
+                        mine = local.description
+                        fill = (not (isinstance(mine, str) and mine.strip())
+                                and bool(incoming.description.strip()))
+                        if not (any(counts) or fill):
+                            result.doctrines_unchanged.append(incoming.name)
+                            continue
+                        if fill:
+                            local.description = incoming.description
+                        local.members = members
+                        local.modified = stamp
+                        result.doctrines_updated.append(incoming.name)
+                        result.merged.append((incoming.name, local.name, counts))
+                    elif local is None:
                         incoming.id = uuid4().hex
                         incoming.members = members
                         incoming.created = incoming.modified = stamp
@@ -2234,7 +2277,7 @@ class FittingsStore:
 
     def _honoured_choices(
         self, doctrines: list, resolutions, first_by_name: dict,
-        keep_mine: bool, result: MergeResult,
+        keep_mine: bool, result: MergeResult, *, merge_all: bool = False,
     ) -> dict:
         """`merge_share`'s per-doctrine choices that still hold, as
         ``{incoming name: (action, local Doctrine)}``; `result` gets the
@@ -2244,12 +2287,15 @@ class FittingsStore:
         Only a name of the payload's doctrines is looked at (a choice for a
         doctrine that is not being merged is no choice). A choice falls back
         when its action is not one this build takes, its local doctrine is
-        gone, another "theirs" / "mine" choice names the same local doctrine
-        (a "both" never touches it, so it counts for nothing there), "both"
-        would make a name twin, or - for "theirs" / "mine" - an incoming
-        doctrine of that local doctrine's exact name follows the default rule
-        onto it (repeated until nothing changes: a fallback can claim in its
-        turn)."""
+        gone, another "theirs" / "mine" / "merge" choice names the same local
+        doctrine (a "both" never touches it, so it counts for nothing there),
+        "both" would make a name twin, or - for "theirs" / "mine" / "merge" -
+        an incoming doctrine of that local doctrine's exact name follows the
+        default rule onto it (repeated until nothing changes: a fallback can
+        claim in its turn). A "merge" onto a doctrine of another name leaves
+        an alias like "theirs" does (``keep_mine`` False); one onto the same
+        name leaves none. ``merge_all`` is ``on_conflict`` "merge": only the
+        wording of a fallback line onto a same-named doctrine."""
         if not resolutions or not isinstance(resolutions, dict):
             return {}
         names = [raw["name"] for raw in doctrines]
@@ -2264,9 +2310,7 @@ class FittingsStore:
                                 else (None, None))
             local = (self._doctrines.get(local_id)
                      if isinstance(local_id, str) else None)
-            if action == "merge":
-                reasons[name] = "merging is not supported by this version"
-            elif action not in _RESOLUTION_ACTIONS:
+            if action not in _RESOLUTION_ACTIONS:
                 reasons[name] = "the choice for it could not be read"
             elif local is None:
                 reasons[name] = ("the doctrine of yours chosen for it is no "
@@ -2303,6 +2347,8 @@ class FittingsStore:
                     default = "added as a new doctrine"
                 elif keep_mine:
                     default = "kept yours"
+                elif merge_all:
+                    default = "merged into yours"
                 else:
                     default = "the group's version"
                 result.resolution_fallbacks.append(
@@ -2311,7 +2357,7 @@ class FittingsStore:
             result.honoured[name] = (action, keys[name])
             if action == "mine":
                 result.aliases[name] = (local.name, True)
-            elif action == "theirs" and local.name != name:
+            elif action in ("theirs", "merge") and local.name != name:
                 result.aliases[name] = (local.name, False)
         return chosen
 
@@ -2357,6 +2403,99 @@ class FittingsStore:
                 refits=survivors if len(survivors) > 1 else [],
             ))
         return slots
+
+    def _merge_into(
+        self, local: Doctrine, members: list[DoctrineMember], *,
+        name: str = "", dropped: list[str] | None = None,
+    ) -> tuple[list[DoctrineMember], MergeCounts]:
+        """`local`'s slots with what `members` (an incoming doctrine's slots,
+        already remapped by `_merge_slots`) has that they lack, and how much
+        that is. Reads only: `local` is not modified.
+
+        "Keep mine, add what the group has that I don't" (spec section 6):
+        slots are paired BY HULL, in order (my first Ferox slot with their
+        first Ferox slot). A paired slot keeps my active fit, my default
+        (``refits[0]``) and every value of mine; the group's fits it lacks
+        are appended as refits (a plain slot of mine becomes ``refits = [my
+        fit, ...]``) and the group's tags it lacks are appended to its tags.
+        A slot only the group has is appended after mine, with its own values
+        and an `order` after my highest. A slot only I have is kept. A fit
+        another slot of my doctrine already flies is never added a second
+        time: one paired slot already has is silently there, any other is
+        dropped and said in `dropped` (``"<name> / <fit>: same fit as another
+        slot"``); a group-only slot left with no fit is dropped. Refits share
+        the slot's hull: a paired slot's are on its hull by the pairing, a
+        group-only slot's by `_merge_slots`."""
+        fits = self._fits
+
+        def hull_of(fit_id):
+            fit = fits.get(fit_id)
+            return fit.hull_type_id if fit is not None else None
+
+        out = list(local.members)
+        flown: set[str] = set()                  # every fit my doctrine flies
+        mine_by_hull: dict = {}                  # hull -> my slot indexes, in order
+        for index, member in enumerate(out):
+            flown.add(member.fit_id)
+            flown.update(member.refits)
+            mine_by_hull.setdefault(hull_of(member.fit_id), []).append(index)
+        paired: dict = {}                        # hull -> my slots of it paired so far
+        order = max((member.order for member in out if type(member.order) is int),
+                    default=-1) + 1
+        added_slots: list[DoctrineMember] = []
+        refits = tags = 0
+
+        def said(fit_id):
+            if dropped is not None:
+                dropped.append(f"{name} / {fits[fit_id].name}: same fit as another slot")
+
+        for member in members:
+            hull = hull_of(member.fit_id)
+            mine = mine_by_hull.get(hull, ())
+            taken = paired.get(hull, 0)
+            if taken < len(mine):
+                paired[hull] = taken + 1
+                index = mine[taken]
+                current = out[index]
+                in_slot = set(current.refits) | {current.fit_id}
+                new_fits = []
+                for fit_id in slot_fit_ids(member):
+                    if fit_id in in_slot:
+                        continue
+                    if fit_id in flown:
+                        said(fit_id)
+                        continue
+                    flown.add(fit_id)
+                    new_fits.append(fit_id)
+                new_tags = [tag for tag in member.tags if tag not in current.tags]
+                if new_fits or new_tags:
+                    base = list(current.refits) if current.refits else [current.fit_id]
+                    out[index] = replace(
+                        current,
+                        tags=list(current.tags) + new_tags,
+                        refits=base + new_fits if new_fits else list(current.refits),
+                    )
+                    refits += len(new_fits)
+                    tags += len(new_tags)
+                continue
+            survivors = []
+            for fit_id in slot_fit_ids(member):
+                if fit_id in flown:
+                    said(fit_id)
+                    continue
+                survivors.append(fit_id)
+            if not survivors:
+                continue
+            flown.update(survivors)
+            added_slots.append(replace(
+                member,
+                fit_id=survivors[0],
+                tags=list(member.tags),
+                refits=survivors if len(survivors) > 1 else [],
+                order=order,
+            ))
+            order += 1
+        return out + added_slots, MergeCounts(refits, len(added_slots), tags)
 
     @staticmethod
     def _same_slots(mine: list[DoctrineMember], theirs: list[DoctrineMember]) -> bool:

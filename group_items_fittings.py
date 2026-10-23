@@ -263,6 +263,18 @@ def _doctrine_detail(doctrine) -> str:
     return f"{_count(len(members), 'fit', 'fits')}, {_count(refits, 'refit', 'refits')}"
 
 
+def _merge_note(incoming, local, counts) -> str:
+    """``"<incoming> merged into your <local>: +2 refits, +1 slot, +3 tags"`` - a part that
+    is zero left out (``counts``: ``fittings_store.MergeCounts``); names as a line quotes
+    them."""
+    parts = [f"+{_count(n, one, many)}" for n, one, many in (
+        (counts.refits, "refit", "refits"), (counts.slots, "slot", "slots"),
+        (counts.tags, "tag", "tags")) if n]
+    text = (f"{fittings_store._share_shown(incoming)} merged into your "
+            f"{fittings_store._share_shown(local)}")
+    return f"{text}: {', '.join(parts)}" if parts else text
+
+
 def _fits_note(merged) -> list:
     added, reused = len(merged.fits_added), len(merged.fits_reused)
     if not (added or reused):
@@ -417,6 +429,14 @@ class DoctrinesItem(_LibraryItem):
     ``{"action", "local_id"}``, each choice applied as chosen) for the caller. A choice
     that no longer holds follows the default rule with one warning line - FIRST among the
     warnings, so the engine's line bound never cuts it. Without choices: exactly as before.
+
+    Merge (``conflict_choices`` adds "merge" - for every same-named doctrine - and a choice
+    "merge" for one pair): the group's doctrine merged into the importer's, which keeps
+    its id, name and every value (``FittingsStore._merge_into``); a merge that added
+    something is ``updated`` with a note ``"<incoming> merged into your <local>: +N
+    refits, +N slots, +N tags"``, one that added nothing ``unchanged``. A merge onto a
+    doctrine of another name leaves an alias like "theirs" (the templates follow the
+    item's own radio).
     """
 
     id = "fittings.doctrines"
@@ -425,6 +445,7 @@ class DoctrinesItem(_LibraryItem):
     paths = (("fittings", ("fits",)), ("fittings", ("doctrines",)), ("fittings", ("tags",)),
              _STAMP)
     conflicts = True
+    conflict_choices = ("theirs", "mine", "merge")
     resolves = True
     never_saved = (_NEVER_IN_GAME,)
 
@@ -621,8 +642,13 @@ class DoctrinesItem(_LibraryItem):
             # lines are built from the library): as for a template, the next start begins
             # with Auto-update MOTD off for the session.
             result.flags["motd_disarm"] = True
+        for name, local, counts in merged.merged:
+            result.notes.append(_merge_note(name, local, counts))
+        merged_names = {name for name, _local, _counts in merged.merged}
         for name, (local, keep_mine) in merged.aliases.items():
             shown, mine = fittings_store._share_shown(name), fittings_store._share_shown(local)
+            if name in merged_names:
+                continue                    # its merge note says where it went
             if keep_mine:
                 result.notes.append(f"{shown}: kept your {mine}")
             elif name in merged.doctrines_updated:
