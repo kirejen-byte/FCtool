@@ -1315,6 +1315,7 @@ class GroupHost:
 #   staging that is refused each end as a sentence in ``status_var``.
 import dataclasses                                                # noqa: E402
 import logging                                                    # noqa: E402
+import math                                                       # noqa: E402
 import os                                                         # noqa: E402
 import tkinter as tk                                              # noqa: E402
 import tkinter.font as tkfont                                     # noqa: E402
@@ -1333,7 +1334,9 @@ log = logging.getLogger(__name__)
 
 TITLE = "Group configuration"
 GEOMETRY = "980x640"
-MIN_SIZE = (820, 520)
+MIN_SIZE = (820, 520)                   # at 100% display scaling; see min_size
+BASE_SCALING = 96 / 72                  # tk scaling at 100% (96 dpi): 1.333...
+MIN_GROWTH = 1.35                       # the smallest height grows this much faster
 TREE_STYLE = "Group.Treeview"
 # The window's buttons: the app's "Dark" and "Green" styles (see _configure_styles).
 BUTTON_STYLES = {"dark": "Group.Dark.TButton", "green": "Group.Green.TButton"}
@@ -4329,6 +4332,27 @@ class _Controller:
         return done
 
 
+def min_size(scaling):
+    """The window's smallest (width, height) at ``tk scaling`` ``scaling``.
+
+    The text is sized in points, so it grows with the scaling, and above 100%
+    (``BASE_SCALING``) the height grows ``MIN_GROWTH`` times as fast: the Import page's
+    four stacked doctrine choices and the two lines of text under them grow faster than
+    the scaling (the long choice wraps to more lines). Measured on the hidden desktop,
+    narrowest pane: 611 px needed at 1.51, 633 at 1.6, 696 at 1.75, 792 at 2.0. The
+    width stays ``MIN_SIZE``'s (the long choice wraps instead). Up to 100% it is
+    ``MIN_SIZE`` exactly; a scaling that is not a positive number counts as 100%."""
+    try:
+        scaling = float(scaling)
+    except (TypeError, ValueError):
+        scaling = BASE_SCALING
+    if not scaling > 0 or math.isinf(scaling):
+        scaling = BASE_SCALING
+    width, height = MIN_SIZE
+    grown = math.ceil(round(height * (1 + MIN_GROWTH * (scaling / BASE_SCALING - 1)), 6))
+    return width, max(height, grown)
+
+
 def open_window(parent, host, *, view="create", report=None, pick=False):
     """Open the Group configuration window over ``parent``; returns its Toplevel, which
     carries the controller as ``win._gc`` (see ``_Controller``).
@@ -4357,8 +4381,10 @@ def open_window(parent, host, *, view="create", report=None, pick=False):
         ctl = _Controller(win, host, report=report)
         make_modal(win, parent, on_cancel=ctl.close, grab=False)
         win.protocol("WM_DELETE_WINDOW", ctl.close)
-        win.geometry(GEOMETRY)
-        win.minsize(*MIN_SIZE)
+        smallest = min_size(win.tk.call("tk", "scaling"))
+        width, height = (int(n) for n in GEOMETRY.split("x"))
+        win.geometry("%dx%d" % (width, max(height, smallest[1])))  # never under it
+        win.minsize(*smallest)
         ctl.build()
         if view == "history" and ctl.report is not None:
             ctl.show_report(ctl.report)     # the one road to a report, new window or old
