@@ -13,7 +13,8 @@ it (``apply``). This module holds
   ``config.json`` fields) and :class:`NameListItem` (a list of names at one config path);
 * the engine: ``register`` / ``registry`` / ``get_item``, ``export_all``,
   ``collect_export_notes``, ``build_bundle``, ``validate_bundle``, ``apply_bundle``,
-  ``preview``, ``matches``. ``registry()`` loads the item modules (``group_items_*``) on its first call.
+  ``preview``, ``matches``. ``registry()`` loads the item modules (``group_items_*``) on its
+  first call.
 
 Two rules hold everywhere (spec section 4): **absent means untouched** - a field, record or
 item that is not in the payload is not read, compared or written - and **an import never
@@ -50,6 +51,10 @@ Contracts the item modules rely on
   leaves out is said by ``export_notes``.
 * The lines an item says are bounded by the engine (``MAX_PROBLEMS``, ``MAX_RESULT_LINES``):
   an item need not count them.
+* An item with ``resolves = True`` (a ``bool``; ``register`` refuses anything else) is
+  handed ``resolutions=`` and may leave ``state.aliases`` for the items after it. Its
+  ``failed`` or ``skipped`` result CLEARS ``state.aliases`` - so an apply that leaves aliases
+  must answer ``applied`` or ``unchanged``, never ``skipped``.
 
 Pure: stdlib, ``group_bundle`` and ``system_coords`` only. No Tk, no ``ui_theme``, no
 ``fc_gui`` - this module runs in the boot hook, before the palette is installed. The one
@@ -110,7 +115,7 @@ CONFLICTS = ("theirs", "mine")
 # What the importer may choose for ONE record the detector paired with one of theirs
 # (``Options.resolutions``). Only an item with ``resolves = True`` is ever handed them.
 RESOLUTION_ACTIONS = ("theirs", "mine", "both", "merge")
-MAX_LIST = 500                         # spec section 5: 500 systems / channels per list
+MAX_LIST = 500                          # spec section 5: 500 systems / channels per list
 MAX_PROBLEMS = 50                       # problem lines of one validate_bundle, then "and <n> more"
 MAX_RESULT_LINES = 50                   # warnings / notes of one ItemResult, and the export
 #                                         notes of one item; then "and <n> more"
@@ -721,10 +726,13 @@ class Item:
     ``never_saved`` human lines: what this item leaves out of a file on purpose
     ``partial_ok``  True when the item copes with an unreadable SIDE file itself; an
                     unreadable ``config.json`` skips every item that names it regardless
-    ``resolves``    True when the item takes per-record choices: the engine then calls
+    ``resolves``    True when the item takes per-record choices (a ``bool``: ``register``
+                    refuses ``1`` or ``"yes"``): the engine then calls
                     ``apply(..., resolutions=options.resolutions.get(id, {}))`` - every
                     other item is called exactly as before - and clears ``state.aliases``
-                    when the item fails or is skipped
+                    when the item ends ``failed`` or ``skipped``. So an ``apply`` that
+                    leaves aliases for later items must answer ``applied`` or
+                    ``unchanged`` - never ``skipped``, or the aliases are dropped
     """
 
     id = ""
@@ -1263,6 +1271,10 @@ def _check_item(item) -> None:
         raise ValueError(f"{item.id}: modes must name at least one mode")
     if not all(isinstance(line, str) for line in item.sections + item.never_saved):
         raise ValueError(f"{item.id}: sections and never_saved hold text")
+    # The engine asks ``resolves is True``: a truthy ``1`` would register and then be
+    # silently treated as a plain item (no ``resolutions=``, aliases never cleared).
+    if not isinstance(item.resolves, bool):
+        raise ValueError(f"{item.id}: resolves must be True or False: {item.resolves!r}")
     # The paths of the generic items, checked HERE and not only when they are built: a
     # subclass may set its path after the base constructor has run (the staging lists do).
     if isinstance(item, ConfigFieldsItem):
@@ -1620,6 +1632,12 @@ def apply_bundle(state, payloads, options, ctx=None):
 
     The ``notes`` and ``warnings`` of every result are bounded (``ItemResult.bound``),
     whether or not the item settled it.
+
+    An item with ``resolves = True`` is called with the extra keyword ``resolutions=`` (its
+    entry of ``options.resolutions``, ``{}`` when none); every other item exactly as above,
+    even when ``options.resolutions`` holds an entry under its id. When such an item ends
+    ``failed`` or ``skipped`` - whatever the reason - ``state.aliases`` is CLEARED, so a
+    resolving item whose apply leaves aliases must not answer ``skipped``.
     """
     return _apply(state, payloads, options, ctx)
 
@@ -1735,32 +1753,50 @@ def preview(state, payloads, options, ctx=None) -> list:
     return _apply(twin, payloads, options, ctx)[1]
 
 
-def matches(state, payloads, ctx=None) -> dict:
+_NO_STATE = object()                    # ``matches``: the state could not be copied
+
+
+def _pairs_nothing(item) -> bool:
+    """True when ``item.matches`` is the base ``Item.matches`` (always ``{}``): the engine
+    answers for it without a call - and without copying anything for it."""
+    return getattr(getattr(item, "matches", None), "__func__", None) is Item.matches
+
+
+def matches(state, payloads, ctx=None, *, copy=True) -> dict:
     """``{item_id: {record_key: Pair}}`` for every registered item that has a payload in
     ``payloads`` (the output of ``validate_bundle``), in registry order: what each item's
     ``matches`` pairs with this setup. Never raises: an item whose ``matches`` raises or
     answers anything but a dict gets ``{}``, and a record key that is not text is left
-    out. Reads only: each item is handed a copy of its payload, and all of them one copy
-    of the state (one that cannot be copied gives every item ``{}``). ``ctx`` is accepted
-    for symmetry with ``preview`` (``Item.matches`` takes none)."""
+    out. An item that keeps the base ``Item.matches`` gets ``{}`` without being asked.
+
+    Reads only (``copy=True``, the default): each asking item is handed a copy of its
+    payload, and all of them one copy of the state, made only when the first one asks (a
+    state that cannot be copied gives every item ``{}``). ``copy=False`` hands the state
+    and the payloads THEMSELVES - only for a caller that owns both and throws them away
+    (``group_apply.plan_matches``): a 5 MB library is not copied twice for nothing.
+    ``ctx`` is accepted for symmetry with ``preview`` (``Item.matches`` takes none)."""
     found = {}
     if not isinstance(payloads, dict):
         return found
-    try:
-        twin = state.copy()
-    except Exception:
-        twin = None
+    twin = None if copy else state
     for item in registry():
         payload = payloads.get(item.id, ABSENT)
         if payload is ABSENT or payload is None:
             continue
         pairs = {}
-        if twin is not None:
-            try:
-                answer = item.matches(twin, deepcopy(payload))
-                if isinstance(answer, dict):
-                    pairs = {key: pair for key, pair in answer.items() if isinstance(key, str)}
-            except Exception:
-                pairs = {}
+        try:
+            if not _pairs_nothing(item):
+                if twin is None:
+                    try:
+                        twin = state.copy()
+                    except Exception:
+                        twin = _NO_STATE
+                if twin is not _NO_STATE:
+                    answer = item.matches(twin, deepcopy(payload) if copy else payload)
+                    if isinstance(answer, dict):
+                        pairs = {key: pair for key, pair in answer.items()
+                                 if isinstance(key, str)}
+        except Exception:
+            pairs = {}
         found[item.id] = pairs
     return found

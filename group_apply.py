@@ -767,7 +767,8 @@ def plan_matches(app_dir, bundle, *, ctx=None) -> dict:
                 or not isinstance(state.fittings, dict):
             return _no_matches()
         payloads, _problems = group_items.validate_bundle(bundle, ctx)
-        pairs = group_items.matches(state, payloads, ctx).get(DOCTRINES_ITEM)
+        # both were built for this call and are dropped after it: nothing to copy
+        pairs = group_items.matches(state, payloads, ctx, copy=False).get(DOCTRINES_ITEM)
         found = _no_matches()
         if isinstance(pairs, dict):
             found["pairs"] = {key: pair for key, pair in pairs.items() if isinstance(key, str)}
