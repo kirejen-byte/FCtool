@@ -150,8 +150,8 @@ WM_HINTS_INPUT_HINT = 1
 
 #: window_wm_info's ``input`` when the window HAS no input hint (no WM_HINTS,
 #: or InputHint clear) -- distinct from None, which means "unreadable".
-#: x11_thumbs renders it ``input=unset``.
-INPUT_UNSET = "unset"
+#: Defined once in the shared codec (x11_thumbs renders it ``input=unset``).
+INPUT_UNSET = proto.INPUT_UNSET
 
 
 def _log(text):
@@ -861,14 +861,18 @@ class XSession(object):
 
         Every other atom stays, in its order.  ZERO-WRITE: nothing is written
         when the atom is not there (one GetProperty is the whole cost).
-        Returns True only when a write was issued.  Raises XCallError.
+        Returns True only when a write was issued.  Raises XCallError --
+        also when either atom could not be interned, so the tile's
+        "protocols" check stays cold and the next trigger retries it.
         """
         take_focus = self._atom("WM_TAKE_FOCUS")
         # Interned here (the first attach) so next_events() can classify a
         # PropertyNotify on it later without a round trip.
-        self._atom("WM_PROTOCOLS")
-        if not take_focus:
-            return False
+        protocols_atom = self._atom("WM_PROTOCOLS")
+        if not take_focus or not protocols_atom:
+            raise XCallError("%s was not interned"
+                             % ("WM_TAKE_FOCUS" if not take_focus
+                                else "WM_PROTOCOLS"), "internal", xid)
         win = self._window(int(xid))
         try:
             protocols = self._read_protocols(win)
@@ -928,12 +932,13 @@ class XSession(object):
         Used by the diagnostic reads AND by the attach path (drop_take_focus
         interns WM_TAKE_FOCUS / WM_PROTOCOLS at the first attach).  Only a
         SUCCESS is cached: a refusal is logged and retried at the next call
-        instead of pinning 0 for the session.  The call that got 0 still
-        degrades quietly -- drop_take_focus returns False, so that tile's
-        "protocols" check is marked clean with nothing stripped and is not
-        retried until a re-attach or a PropertyNotify.  That cannot happen on
-        a live server (intern_atom with only_if_exists False always gets an
-        atom); a dead connection is the event loop's to report.
+        instead of pinning 0 for the session.  The callers treat 0 as
+        "unknown", never as an answer: drop_take_focus raises XCallError, so
+        that tile's "protocols" check stays cold and the next 'activate' (or
+        a re-attach) retries it, and window_wm_info leaves ``take_focus``
+        None with an ``error``.  That cannot happen on a live server
+        (intern_atom with only_if_exists False always gets an atom), so it
+        costs nothing there; a dead connection is the event loop's to report.
         """
         atom = self._atoms.get(name)
         if atom is None:
@@ -956,7 +961,8 @@ class XSession(object):
         True while WM_TAKE_FOCUS is in WM_PROTOCOLS, ``input`` is the
         WM_HINTS input field, or the string ``"unset"`` when the InputHint
         flag is clear or there is no WM_HINTS (a WM then treats the window
-        as input True -- NOT "No Input"); both None when unreadable.
+        as input True -- NOT "No Input"); both None when unreadable (and
+        ``take_focus`` None when WM_TAKE_FOCUS could not be interned).
         """
         info = {"dst": int(xid), "override_redirect": None,
                 "state": [], "transient_for": 0,
@@ -981,11 +987,13 @@ class XSession(object):
         except Exception as exc:
             info.setdefault("error", _describe(exc))
         take_focus = self._atom("WM_TAKE_FOCUS")
-        try:
-            info["take_focus"] = bool(take_focus) and \
-                take_focus in self._read_protocols(win)
-        except Exception as exc:
-            info.setdefault("error", _describe(exc))
+        if not take_focus:
+            info.setdefault("error", "cannot intern WM_TAKE_FOCUS")
+        else:
+            try:
+                info["take_focus"] = take_focus in self._read_protocols(win)
+            except Exception as exc:
+                info.setdefault("error", _describe(exc))
         try:
             hints = self._read_wm_hints(win)
             if hints and len(hints) >= 2 and hints[0] & WM_HINTS_INPUT_HINT:

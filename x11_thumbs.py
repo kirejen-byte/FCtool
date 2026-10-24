@@ -2224,8 +2224,8 @@ def _nofocus_fields(row):
             return "yes"
         if value is False:
             return "no"
-        if value == "unset":
-            return "unset"
+        if value == proto.INPUT_UNSET:
+            return proto.INPUT_UNSET
         return "?"
 
     return " take_focus=%s input=%s" % (word(row.get("take_focus")),

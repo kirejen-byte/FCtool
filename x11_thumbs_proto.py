@@ -95,6 +95,11 @@ ERROR_CODES = (
     "internal",
 )
 
+# probe_result ``wm`` rows: the ``input`` value for a tile that HAS no input
+# hint (no WM_HINTS, or its InputHint flag clear).  Distinct from True/False
+# (the hint's value) and from None (the helper could not read it).
+INPUT_UNSET = "unset"
+
 
 class ProtoError(Exception):
     """A frame that cannot be encoded, or a stream that must be closed."""
