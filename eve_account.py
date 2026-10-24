@@ -210,12 +210,41 @@ class AccountMap:
         self._sidecar: dict[str, dict] = {}
         self._dirty = False
 
+        # Change counter for readers that cache something derived from the
+        # char<->account knowledge (the preview's account-slot heal). Bumped
+        # ONLY when the live account set, the live char<->account map, or the
+        # sidecar's char->account content actually changes -- an identical
+        # observe() leaves it alone, so a reader polling it every tick pays
+        # one int compare in steady state. Its value means nothing on its own;
+        # compare it for equality only.
+        self._revision = 0
+
+    @property
+    def revision(self) -> int:
+        """Opaque change counter (see ``__init__``): differs from an earlier
+        read iff what this map knows about chars and accounts has changed."""
+        return self._revision
+
     # -- persistence --------------------------------------------------------
     def load(self) -> None:
         """Load the sidecar into memory. Missing file -> empty (normal first
         run). Malformed / unknown-version -> memory left empty and
         :class:`CorruptSidecar` raised (the wiring preserves the file as
         ``.corrupt``)."""
+        before = self._sidecar_accounts()
+        try:
+            self._load()
+        finally:
+            # A corrupt file still clears memory, so compare on every exit.
+            if self._sidecar_accounts() != before:
+                self._revision += 1
+
+    def _sidecar_accounts(self) -> dict:
+        """``{char_key: account}`` view of the sidecar -- what ``revision``
+        tracks (the ``seen`` stamp is bookkeeping, not knowledge)."""
+        return {k: v.get("account") for k, v in self._sidecar.items()}
+
+    def _load(self) -> None:
         self._sidecar = {}
         self._dirty = False
         text = self._store.read()
@@ -270,6 +299,7 @@ class AccountMap:
         self._pid_cache = {p: v for p, v in self._pid_cache.items() if p in live_pids}
         self._pid_neg = {p: v for p, v in self._pid_neg.items() if p in live_pids}
 
+        prev_live = (self._live_accounts, self._live_char_to_acct)
         self._live_accounts = set()
         self._live_acct_to_char = {}
         self._live_char_to_acct = {}
@@ -289,6 +319,10 @@ class AccountMap:
                 # Never let one bad client poison the tick. PID is not secret.
                 log.debug("account probe failed for pid=%s", getattr(c, "pid", None))
                 continue
+        # The loop above contains every fault, so this always runs. An
+        # identical snapshot rebuilds equal containers -> no bump.
+        if (self._live_accounts, self._live_char_to_acct) != prev_live:
+            self._revision += 1
 
     def _resolve_pid(self, pid: int) -> int | None:
         """Per-PID cache -> Tier 0 -> Tier 1. A miss is retried in a fast initial
@@ -345,6 +379,7 @@ class AccountMap:
             return
         self._sidecar[char_key] = {"account": account_id, "seen": self._now_iso()}
         self._dirty = True
+        self._revision += 1
 
     def _now_iso(self) -> str:
         return datetime.fromtimestamp(self._clock(), timezone.utc).isoformat()
@@ -401,6 +436,26 @@ class AccountMap:
             key for key, entry in self._sidecar.items()
             if isinstance(entry, dict) and entry.get("account") == account_id)
         return members[0] if members else None
+
+    def live_chars(self) -> list[str]:
+        """The logged-in character keys of the last ``observe``, sorted."""
+        return sorted(self._live_char_to_acct)
+
+    def known_chars(self) -> list[str]:
+        """Every character key this map can place on an account from its own
+        caches -- live clients plus the sidecar -- sorted, no duplicates. (The
+        hint step of ``account_for_char`` answers per account, not per char, so
+        it cannot enumerate anyone and is not included.)"""
+        return sorted(set(self._live_char_to_acct) | set(self._sidecar))
+
+    def chars_for_account(self, account_id: int) -> list[str]:
+        """Every character key known on *account_id* (live + sidecar), sorted.
+        Pure and total: in-memory reads only, never raises."""
+        out = {k for k, a in self._live_char_to_acct.items() if a == account_id}
+        out.update(k for k, entry in self._sidecar.items()
+                   if isinstance(entry, dict)
+                   and entry.get("account") == account_id)
+        return sorted(out)
 
     def known_accounts(self) -> list[int]:
         """All account ids in play: union of live (login + logged-in), sidecar,
