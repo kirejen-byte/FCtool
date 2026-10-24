@@ -30228,6 +30228,16 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 FCToolGUI._PREVIEW_ACCOUNT_CAP:
             return False
         cfg = self._preview_cfg()
+        # With account slots on (raw read, the _preview_layout_key discipline)
+        # a label edit re-keys the character's geometry slot; note the slot
+        # it leaves so the new one can start where the tile is.
+        raw = self.config.get("preview")
+        slots = isinstance(raw, dict) and raw.get("account_slots", False)
+        try:
+            old_slot = self._preview_layout_key(key) if slots else None
+        except Exception:
+            slots = False               # no old slot known: no carry, the save stands
+            log.exception("[preview] slot key lookup failed")
         accounts = cfg.get("char_accounts")
         if not isinstance(accounts, dict):
             accounts = {}
@@ -30240,6 +30250,27 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             accounts.pop(stored, None)
         if want:
             accounts[key] = want
+        if slots:
+            # The user only regrouped the character: seed an ABSENT new slot
+            # from its live tile's rect, else the old slot (copy-only, sizes
+            # under uniform OFF), so the next spawn/rekey does not jump to the
+            # cascade or an older entry. Before the heal, which then skips it.
+            live = None
+            rects = getattr(self, "_preview_tile_rects", None) or {}
+            tiles = getattr(self, "_preview_tiles", None) or {}
+            try:
+                for hwnd, client in (getattr(self, "_preview_clients", None)
+                                     or {}).items():
+                    if getattr(client, "identity", None) == key and \
+                            hwnd in tiles and hwnd in rects:
+                        live = rects[hwnd]
+                        break
+                preview_layout.carry_slot_on_rekey(
+                    cfg, old_key=old_slot,
+                    new_key=self._preview_layout_key(key), live_rect=live,
+                    uniform_size=cfg.get("uniform_size", True))
+            except Exception:
+                log.exception("[preview] account slot carry failed")
         # A label edit moves characters between "acct:<label>" and
         # "account:<id>" slots (clearing an account's only manual label
         # lands them on an empty id slot) with no map revision bump, so fill

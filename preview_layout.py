@@ -471,6 +471,39 @@ def account_slot_source(block, *, width, account_id, own_char, members,
     return None
 
 
+def carry_slot_on_rekey(cfg, *, old_key, new_key, live_rect=None,
+                        uniform_size=True):
+    """Seed a character's NEW geometry slot when an edit (a manual account
+    label added, changed or cleared) moves it from `old_key` to `new_key`.
+
+    `cfg` is the preview block. Only an ABSENT `new_key` is seeded, so the
+    tile stays where it is instead of jumping to the spawn cascade or to an
+    older entry: `layouts` from `live_rect` (where the live tile IS) when it
+    is well-formed (>= 4), else from `layouts[old_key]` (>= 4); `sizes`,
+    only while `uniform_size` is falsy, from `sizes[old_key]` (>= 2).
+
+    Never overwrites, never deletes, copies (a later edit of the source can
+    never move the slot). Returns the list of `(block_name, source)` written,
+    source "live" or `old_key` -- empty when the key did not move. No IO."""
+    if not isinstance(cfg, dict) or not isinstance(new_key, str) \
+            or old_key == new_key:
+        return []
+    blocks = [("layouts", 4, live_rect)]
+    if not uniform_size:
+        blocks.append(("sizes", 2, None))
+    written = []
+    for name, width, live in blocks:
+        block = cfg.get(name)
+        if not isinstance(block, dict) or new_key in block:
+            continue                        # absent block, or already placed
+        for source, entry in (("live", live), (old_key, block.get(old_key))):
+            if isinstance(entry, (list, tuple)) and len(entry) >= width:
+                block[new_key] = list(entry)
+                written.append((name, source))
+                break
+    return written
+
+
 def fill_account_id_slots(cfg, *, uniform_size, live_chars, known_chars,
                           layout_key, label_for_account, chars_for_account,
                           manual_labels, id_prefix="account:",
