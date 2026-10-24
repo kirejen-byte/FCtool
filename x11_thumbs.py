@@ -2206,23 +2206,30 @@ def _nofocus_fields(row):
     """`` take_focus=yes|no|? input=yes|no|unset|?`` for one ``[wm]`` row.
 
     A tile is "No Input" -- the WM never offers it focus, so a click no
-    longer bounces focus through FCTool's main window -- when it reads
-    ``take_focus=no`` and ``input=no`` (or ``unset``).  ``?`` = the helper
-    could not read it.  An older helper sends neither key: nothing is
-    rendered then, so its rows read exactly as before.
+    longer bounces focus through FCTool's main window -- ONLY when it reads
+    ``take_focus=no`` and ``input=no``.  ``input=unset`` (no WM_HINTS, or
+    the InputHint flag clear) is NOT "No Input": KWin, Mutter and the ICCCM
+    default treat a missing input hint as input True, so such a tile can
+    still take focus (the helper never adds a hint, it only clears a True
+    one).  ``?`` = the helper could not read it (the helper sends None for
+    that, and the string ``"unset"`` for a missing hint).  An older helper
+    sends neither key: nothing is rendered then, so its rows read exactly
+    as before.
     """
     if "take_focus" not in row and "input" not in row:
         return ""
 
-    def word(value, unset):
+    def word(value):
         if value is True:
             return "yes"
         if value is False:
             return "no"
-        return unset
+        if value == "unset":
+            return "unset"
+        return "?"
 
-    return " take_focus=%s input=%s" % (word(row.get("take_focus"), "?"),
-                                        word(row.get("input"), "unset"))
+    return " take_focus=%s input=%s" % (word(row.get("take_focus")),
+                                        word(row.get("input")))
 
 
 def _merge_clients(clients, results):

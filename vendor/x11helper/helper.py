@@ -148,6 +148,11 @@ _BOOL_FLAGS = ("--no-transient", "--no-tile-nofocus")
 #: meaningful.  A plain constant so this module still never imports Xlib.
 WM_HINTS_INPUT_HINT = 1
 
+#: window_wm_info's ``input`` when the window HAS no input hint (no WM_HINTS,
+#: or InputHint clear) -- distinct from None, which means "unreadable".
+#: x11_thumbs renders it ``input=unset``.
+INPUT_UNSET = "unset"
+
 
 def _log(text):
     """Write one ASCII line to stderr.  Never raises: under Wine a GUI
@@ -918,14 +923,25 @@ class XSession(object):
         return None
 
     def _atom(self, name):
-        """Intern ``name`` once.  0 when the server refused (diagnostic only)."""
+        """Intern ``name`` once; 0 when the server refused.  Never raises.
+
+        Used by the diagnostic reads AND by the attach path (drop_take_focus
+        interns WM_TAKE_FOCUS / WM_PROTOCOLS at the first attach).  Only a
+        SUCCESS is cached: a refusal is logged and retried at the next call
+        instead of pinning 0 for the session.  The call that got 0 still
+        degrades quietly -- drop_take_focus returns False, so that tile's
+        "protocols" check is marked clean with nothing stripped and is not
+        retried until a re-attach or a PropertyNotify.  That cannot happen on
+        a live server (intern_atom with only_if_exists False always gets an
+        atom); a dead connection is the event loop's to report.
+        """
         atom = self._atoms.get(name)
         if atom is None:
             try:
                 atom = int(self.display.intern_atom(name))
             except Exception as exc:
                 _log("cannot intern %s: %s" % (name, exc))
-                atom = 0
+                return 0
             self._atoms[name] = atom
         return atom
 
@@ -938,8 +954,9 @@ class XSession(object):
         managed-vs-override-redirect premise on the tester's box instead of
         assuming it -- and whether the tile is "No Input": ``take_focus`` is
         True while WM_TAKE_FOCUS is in WM_PROTOCOLS, ``input`` is the
-        WM_HINTS input field (None when the InputHint flag is unset or there
-        is no WM_HINTS); both None when unreadable.
+        WM_HINTS input field, or the string ``"unset"`` when the InputHint
+        flag is clear or there is no WM_HINTS (a WM then treats the window
+        as input True -- NOT "No Input"); both None when unreadable.
         """
         info = {"dst": int(xid), "override_redirect": None,
                 "state": [], "transient_for": 0,
@@ -973,6 +990,8 @@ class XSession(object):
             hints = self._read_wm_hints(win)
             if hints and len(hints) >= 2 and hints[0] & WM_HINTS_INPUT_HINT:
                 info["input"] = bool(hints[1])
+            else:
+                info["input"] = INPUT_UNSET
         except Exception as exc:
             info.setdefault("error", _describe(exc))
         return info
@@ -1880,10 +1899,15 @@ class HelperCore(object):
         """WM_PROTOCOLS or WM_HINTS changed on a tile: re-check that one.
 
         Wine writes WM_PROTOCOLS only when it creates the X window, but it
-        rewrites WM_HINTS on every style change (input = !use_take_focus), so
-        this is what keeps a UseTakeFocus=N tile at input False.  Our OWN
-        write comes back here too, and is closed in one read: the re-check
-        finds the property clean and writes nothing.
+        rewrites WM_HINTS on every style change (input = !use_take_focus).
+        Default Wine (use_take_focus) is unaffected by that: input is False
+        anyway, and the stripped WM_PROTOCOLS survives a re-show.  Under
+        UseTakeFocus=N this re-strip is BEST EFFORT, not a guarantee: Wine
+        writes input True just before each map/show, and our write lands one
+        round trip later, so a WM that focuses newly shown windows can still
+        bounce focus on a tile RE-show (hide-active / hide-on-lost-focus).
+        Our OWN write comes back here too, and is closed in one read: the
+        re-check finds the property clean and writes nothing.
         """
         kinds = (kind,) if kind in ("protocols", "hints") \
             else ("protocols", "hints")
