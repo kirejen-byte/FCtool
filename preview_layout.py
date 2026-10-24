@@ -471,6 +471,78 @@ def account_slot_source(block, *, width, account_id, own_char, members,
     return None
 
 
+def fill_account_id_slots(cfg, *, uniform_size, live_chars, known_chars,
+                          layout_key, label_for_account, chars_for_account,
+                          manual_labels, id_prefix="account:",
+                          label_prefix="acct:"):
+    """Fill every ABSENT id-keyed account slot of `cfg` from saved geometry.
+
+    `cfg` is the preview block; only `cfg["layouts"]` (entries >= 4 long) and,
+    while `uniform_size` is falsy, `cfg["sizes"]` (>= 2) are read or written.
+
+    Characters are visited live first (`live_chars`), then `known_chars`, then
+    the character keys of the blocks (sorted, no ":" -- a namespaced key is no
+    character), each once. `layout_key(char)` names the character's slot; the
+    ones starting with `id_prefix` followed by an int group the characters per
+    account, in visiting order -- so the first one, the live character when
+    there is one, offers its own entry first (`own_char`). Per account and per
+    block, an absent slot is seeded by `account_slot_source` with the account's
+    `label_for_account(id)` as auto label, `chars_for_account(id)` plus the
+    grouped characters as members, and `manual_labels` (a manual group's
+    `label_prefix` slot is never a source).
+
+    An existing slot is never overwritten, no key is deleted, entries are
+    copied. A raising `layout_key` skips that character; a raising
+    `label_for_account` / `chars_for_account` skips that account.
+
+    Returns the list of `(block_name, slot, source_key)` written, in order --
+    empty when nothing changed. Mutates only the two blocks; no IO."""
+    if not isinstance(cfg, dict):
+        return []
+    blocks = [("layouts", 4)]
+    if not uniform_size:
+        blocks.append(("sizes", 2))
+    order = list(live_chars) + list(known_chars)
+    for name, _width in blocks:
+        block = cfg.get(name)
+        if isinstance(block, dict):
+            order += sorted(k for k in block
+                            if isinstance(k, str) and k and ":" not in k)
+    accounts: dict = {}                     # id -> (slot key, chars in order)
+    seen = set()
+    for char in order:
+        if char in seen:
+            continue
+        seen.add(char)
+        try:
+            slot = layout_key(char)
+            acct = int(slot[len(id_prefix):]) if (
+                isinstance(slot, str) and slot.startswith(id_prefix)) else None
+        except Exception:
+            continue
+        if acct is not None:
+            accounts.setdefault(acct, (slot, []))[1].append(char)
+    written = []
+    for acct, (slot, chars) in accounts.items():
+        try:
+            auto_label = label_for_account(acct)
+            members = sorted(set(chars_for_account(acct)) | set(chars))
+        except Exception:
+            continue
+        for name, width in blocks:
+            block = cfg.get(name)
+            if not isinstance(block, dict) or slot in block:
+                continue                    # absent block, or already placed
+            picked = account_slot_source(
+                block, width=width, account_id=acct, own_char=chars[0],
+                members=members, auto_label=auto_label,
+                manual_labels=manual_labels, label_prefix=label_prefix)
+            if picked is not None:
+                block[slot] = picked[1]
+                written.append((name, slot, picked[0]))
+    return written
+
+
 def snap_to_grid(x, y, grid_w, grid_h):
     return (round(x / grid_w) * grid_w, round(y / grid_h) * grid_h)
 

@@ -30491,30 +30491,24 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         """Fill every ABSENT "account:<id>" slot from geometry already saved.
 
         The id slot (see `_preview_layout_key`) starts empty, and an empty slot
-        means the tile cascades into the corner. This adopts what the user
-        already has, for every character the account map can place on an
-        account -- live and sidecar characters plus the character keys of
-        `layouts` / `sizes` -- whose slot key is an id slot. The source is
-        picked by the pure `preview_layout.account_slot_source`: the current
-        auto-label slot, then "acct:Account <id>", then "acct:<name>" of the
-        account's characters, then the per-character entries (the live
-        character's own first). A label slot belonging to a manual group is
-        never a source.
+        means the tile cascades into the corner. The pure
+        `preview_layout.fill_account_id_slots` adopts what the user already
+        has, for every live / sidecar / saved character whose slot key is an
+        id slot (sources in `account_slot_source` order; a manual group's label
+        slot is never one). It never overwrites a slot, deletes a key or
+        aliases an entry, and fills `sizes` only while `uniform_size` is OFF.
 
         Lazy and data-driven, so it also completes the v5.4.0 default-slots
-        migration for configs it missed: that one-time seed ran at boot before
-        a config upgraded from v5.2 had any account map, and the map only
-        learns the accounts on the first tick. Called at boot, from the tick
-        via `_preview_maybe_heal_account_slots` (only when the map's
-        `revision` moves), and at the end of `_preview_seed_account_slots`.
+        migration for configs it missed (a v5.2 config has no account map at
+        boot; the map learns the accounts on the first tick). Called at boot,
+        from the tick via `_preview_maybe_heal_account_slots` (only when the
+        map's `revision` moves), and at the end of
+        `_preview_seed_account_slots`.
 
-        Same rules as the seeder: an existing slot is NEVER overwritten, no key
-        is ever deleted (house rule), entries are copied (never aliased),
-        malformed ones skipped, and `sizes` is filled only while
-        `uniform_size` is OFF. Returns True iff anything was written; the
-        caller saves. Inert -- returns False and writes nothing -- without a
-        map, with `account_slots` or `account_slots_auto` off (raw flag reads,
-        the `_preview_layout_key` discipline), or when no `account:` key comes
+        Returns True iff anything was written; the caller saves. Inert --
+        returns False and writes nothing -- without a map, with
+        `account_slots` or `account_slots_auto` off (raw flag reads, the
+        `_preview_layout_key` discipline), or when no `account:` key comes
         back."""
         raw = self.config.get("preview")
         if not (isinstance(raw, dict) and raw.get("account_slots", False)
@@ -30524,67 +30518,32 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         layout_key = getattr(self, "_preview_layout_key", None)
         if amap is None or not callable(layout_key) or not isinstance(cfg, dict):
             return False
-        blocks = [("layouts", 4)]
-        if not cfg.get("uniform_size", True):
-            blocks.append(("sizes", 2))
         try:
             live = list(amap.live_chars())
             known = list(amap.known_chars())
         except Exception:
             return False
-        # The live characters first: when several characters answer for one
-        # account, the one whose window is on screen offers its own entry.
-        order = live + known
-        for name, _width in blocks:
-            block = cfg.get(name)
-            if isinstance(block, dict):
-                order += sorted(k for k in block
-                                if isinstance(k, str) and k and ":" not in k)
-        prefix = FCToolGUI._PREVIEW_ACCOUNT_ID_SLOT_PREFIX
-        accounts: dict = {}                 # id -> (slot key, chars in order)
-        seen = set()
-        for char in order:
-            if char in seen:
-                continue
-            seen.add(char)
-            try:
-                slot = layout_key(char)
-                acct = int(slot[len(prefix):]) if (
-                    isinstance(slot, str) and slot.startswith(prefix)) else None
-            except Exception:
-                continue
-            if acct is not None:
-                accounts.setdefault(acct, (slot, []))[1].append(char)
-        if not accounts:
-            return False
         try:
             manual = list(self._preview_char_accounts().values())
         except Exception:
             manual = []
-        changed = False
-        for acct, (slot, chars) in accounts.items():
-            try:
-                auto_label = amap.label_for_account(acct)
-                members = sorted(set(amap.chars_for_account(acct)) | set(chars))
-            except Exception:
-                continue
-            for name, width in blocks:
-                block = cfg.get(name)
-                if not isinstance(block, dict) or slot in block:
-                    continue                # absent block, or already placed
-                picked = preview_layout.account_slot_source(
-                    block, width=width, account_id=acct, own_char=chars[0],
-                    members=members, auto_label=auto_label,
-                    manual_labels=manual,
-                    label_prefix=FCToolGUI._PREVIEW_ACCOUNT_SLOT_PREFIX)
-                if picked is not None:
-                    block[slot] = picked[1]
-                    changed = True
-                    # %a: a source label may be a user alias with any glyph,
-                    # and the console handler is cp1252 (map/facts.md).
-                    log.info("[preview] %s slot %s seeded from %a",
-                             name, slot, picked[0])
-        return changed
+        # The grouping and the fill live in the pure preview_layout function
+        # (live characters first, never overwrite); this keeps the guards.
+        # Lambdas, so a map missing either method fails per account (skipped)
+        # rather than here.
+        written = preview_layout.fill_account_id_slots(
+            cfg, uniform_size=cfg.get("uniform_size", True),
+            live_chars=live, known_chars=known, layout_key=layout_key,
+            label_for_account=lambda a: amap.label_for_account(a),
+            chars_for_account=lambda a: amap.chars_for_account(a),
+            manual_labels=manual,
+            id_prefix=FCToolGUI._PREVIEW_ACCOUNT_ID_SLOT_PREFIX,
+            label_prefix=FCToolGUI._PREVIEW_ACCOUNT_SLOT_PREFIX)
+        for name, slot, source in written:
+            # %a: a source label may be a user alias with any glyph, and the
+            # console handler is cp1252 (map/facts.md).
+            log.info("[preview] %s slot %s seeded from %a", name, slot, source)
+        return bool(written)
 
     def _preview_maybe_heal_account_slots(self, cfg, account_map):
         """Run the slot heal iff `account_map.revision` moved since the last run,
