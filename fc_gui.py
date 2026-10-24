@@ -21454,6 +21454,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         tile = self._preview_tiles.get(new.hwnd)
         if tile is None:
             self._preview_spawn_tile(new)
+            # No tile to re-key (EVE-O open, stranded, hidden-and-retired), but
+            # the login->character retitle is still the identity moment the
+            # pin keys on, and the pin moves the real client window, not the
+            # tile. No-op for the login key, so char->login stays inert.
+            self._preview_maybe_pin_monitor(new)
             return
         # Learn the window's account BEFORE anything can fail below: this is
         # the login->character moment the whole char-select stickiness is
@@ -23824,7 +23829,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # published, so give each tile-less one a single spawn. A failure is
             # booked by the spawn itself and left to the bounded sweep below.
             if getattr(self, "_preview_eveo_resume", False):
-                _spawned = {c.hwnd for c in added}
+                # `added` AND `retitled`: a retitle that found no tile already
+                # spawned (and, on failure, booked) its hwnd this tick.
+                _spawned = ({c.hwnd for c in added}
+                            | {n.hwnd for _o, n in retitled})
                 for hw, client in cur.items():
                     if hw not in self._preview_tiles and hw not in _spawned:
                         self._preview_spawn_tile(client)
