@@ -21451,14 +21451,22 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         the visible desktop — see _preview_clamp_saved_rect — so a retitle
         never restores a tile stranded on a disconnected monitor). Saved
         layouts of the OLD key are left untouched (foot-gun fix)."""
+        # On the EVE-O resume tick the diff is STALE: _preview_clients stayed
+        # frozen at the snapshot taken when EVE-O opened, so every title change
+        # of the whole session arrives at once, possibly hours after the login.
+        # That is a hand-over of already-logged-in clients, not an identity
+        # moment: never pin from it (it would yank hand-placed windows).
+        stale = getattr(self, "_preview_eveo_resume", False)
         tile = self._preview_tiles.get(new.hwnd)
         if tile is None:
             self._preview_spawn_tile(new)
-            # No tile to re-key (EVE-O open, stranded, hidden-and-retired), but
-            # the login->character retitle is still the identity moment the
-            # pin keys on, and the pin moves the real client window, not the
-            # tile. No-op for the login key, so char->login stays inert.
-            self._preview_maybe_pin_monitor(new)
+            # No tile to re-key (EVE-O open, the HWND-reuse guard, a per-tile
+            # failure retire in the tick, a stranded spawn), but the
+            # login->character retitle is still the identity moment the pin
+            # keys on, and the pin moves the real client window, not the tile.
+            # No-op for the login key, so char->login stays inert.
+            if not stale:
+                self._preview_maybe_pin_monitor(new)
             return
         # Learn the window's account BEFORE anything can fail below: this is
         # the login->character moment the whole char-select stickiness is
@@ -21497,14 +21505,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 tile.place(*r)
                 self._preview_tile_rects[new.hwnd] = r
         except OSError:
+            # Retire, book (so the bounded retry sweep brings the preview back
+            # instead of it silently vanishing), then pin below.
             self._preview_retire_tile(new.hwnd)
-            return
+            self._preview_note_stranded(new)
         # Monitor pinning: the login→character retitle is the exact moment the
         # pilot's identity becomes known, so resolve its monitor assignment and
         # move the real client window now. No-op for login windows (key "") and
         # for unassigned chars. Deliberately NOT done on plain spawn (a mid-session
-        # FCTool restart must not yank windows the user hand-placed).
-        self._preview_maybe_pin_monitor(new)
+        # FCTool restart must not yank windows the user hand-placed), nor on a
+        # stale EVE-O resume diff (see `stale` above).
+        if not stale:
+            self._preview_maybe_pin_monitor(new)
 
     def _preview_retire_tile(self, hwnd):
         """Detach + destroy one tile. Saved layouts are NEVER cleared here."""
