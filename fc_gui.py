@@ -29421,6 +29421,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                         aliases[str(aid)] = norm
                     else:
                         aliases.pop(str(aid), None)
+                # An alias can change account_for_char answers (its hint step
+                # walks known_accounts(), alias keys included) without a map
+                # revision bump: fill any id slot that opened. Saved below.
+                try:
+                    FCToolGUI._preview_heal_account_slots(self, cfg)
+                except Exception:
+                    log.exception("[preview] account slot heal failed")
             self._save_config()
             # Re-register + surface conflicts (only if a service already exists;
             # the enable path registers otherwise). Dialog stays open on failures.
@@ -30229,6 +30236,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             accounts.pop(stored, None)
         if want:
             accounts[key] = want
+        # A label edit moves characters between "acct:<label>" and
+        # "account:<id>" slots (clearing an account's only manual label
+        # lands them on an empty id slot) with no map revision bump, so fill
+        # what opened now; the save below covers it.
+        try:
+            FCToolGUI._preview_heal_account_slots(self, cfg)
+        except Exception:
+            log.exception("[preview] account slot heal failed")
         self._save_config()
         return True
 
@@ -30516,8 +30531,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         migration for configs it missed (a v5.2 config has no account map at
         boot; the map learns the accounts on the first tick). Called at boot,
         from the tick via `_preview_maybe_heal_account_slots` (only when the
-        map's `revision` moves), and at the end of
-        `_preview_seed_account_slots`.
+        map's `revision` moves), at the end of `_preview_seed_account_slots`,
+        and after a manual-label (`_preview_set_char_account`) or
+        account-alias (cycle-groups dialog OK) write, neither of which moves
+        the revision.
 
         Returns True iff anything was written; the caller saves. Inert --
         returns False and writes nothing -- without a map, with
