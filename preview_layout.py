@@ -407,6 +407,70 @@ def heal_preview_sizes(cfg):
     return changed
 
 
+def account_slot_source(block, *, width, account_id, own_char, members,
+                        auto_label, manual_labels, label_prefix="acct:"):
+    """Pick what an ABSENT id-keyed account slot should be seeded from.
+
+    `block` is one preview geometry dict (`layouts` or `sizes`) and `width` the
+    shortest entry that counts as well-formed there (4 / 2 -- the same rule as
+    the account-slot seeder). Candidates, first well-formed one wins:
+
+      1. `<label_prefix><auto_label>` -- the account's CURRENT auto label (what
+         a label-keyed build reads today, so where the latest drag lives);
+      2. `<label_prefix>Account <account_id>` -- the no-alias, no-hint label;
+      3. `<label_prefix><name>` for each of `members`, sorted -- an old
+         hint-derived label (the hint names a character);
+      4. the per-character entry of `own_char`, then of the other `members`,
+         sorted.
+
+    A label candidate is matched case-insensitively (an alias or hint keeps the
+    character's display case while member keys are lowercased; an exact key
+    wins over a case variant, then the sorted-first variant). A label that
+    casefold-equals one of `manual_labels` is SKIPPED: that `acct:` slot
+    belongs to a hand-made group, not to this account. A per-character
+    candidate containing ":" is never a character and is skipped.
+
+    Returns `(source_key, list(entry))` -- a COPY, so a later edit of the
+    source can never move the slot -- or None. Pure: reads `block` only."""
+    if not isinstance(block, dict):
+        return None
+    own_char = own_char if isinstance(own_char, str) else ""
+    manual = {str(m).strip().casefold() for m in (manual_labels or ())
+              if isinstance(m, str) and m.strip()}
+
+    def _ok(entry):
+        return isinstance(entry, (list, tuple)) and len(entry) >= width
+
+    # casefolded label -> the block keys carrying it (exact spelling first)
+    by_label: dict = {}
+    for key in sorted(k for k in block if isinstance(k, str)
+                      and k.startswith(label_prefix)):
+        by_label.setdefault(key[len(label_prefix):].strip().casefold(),
+                            []).append(key)
+    others = sorted(m for m in (members or ()) if isinstance(m, str)
+                    and m and m != own_char)
+    names = sorted(set(others) | ({own_char} if own_char else set()))
+    labels = [auto_label, f"Account {account_id}"] + names
+    tried = set()
+    for label in labels:
+        if not isinstance(label, str) or not label.strip():
+            continue
+        folded = label.strip().casefold()
+        if folded in tried or folded in manual:
+            continue
+        tried.add(folded)
+        exact = label_prefix + label.strip()
+        keys = by_label.get(folded, [])
+        for key in ([exact] if exact in keys else []) + keys:
+            if _ok(block.get(key)):
+                return key, list(block[key])
+    chars = ([own_char] if own_char else []) + others
+    for key in chars:
+        if isinstance(key, str) and ":" not in key and _ok(block.get(key)):
+            return key, list(block[key])
+    return None
+
+
 def snap_to_grid(x, y, grid_w, grid_h):
     return (round(x / grid_w) * grid_w, round(y / grid_h) * grid_h)
 
