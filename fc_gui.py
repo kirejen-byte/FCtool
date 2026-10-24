@@ -1788,6 +1788,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # _preview_migrate_default_slots). Placed AFTER the account-map load so
         # the observed-account seed pass has self._account_map + sidecar ready.
         self._preview_migrate_default_slots()
+        # ...then fill any still-absent "account:<id>" slot from the saved
+        # geometry (every launch, not one-time: fill-only, so a no-op once
+        # healed). The tick re-runs it whenever the map's revision moves.
+        self._preview_account_heal_rev = None
+        self._preview_maybe_heal_account_slots(self._preview_cfg(),
+                                               self._account_map)
         self._preview_hotkey_factory = hotkey_service.HotkeyService  # injectable
         # ── Damage flash (Task B6) ──────────────────────────────────────────
         self._preview_damage = damage_flash.DamageFlashTracker()  # rolling-window tracker
@@ -20451,11 +20457,20 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
     # Namespace for an ACCOUNT's saved geometry inside preview['layouts'] /
     # preview['sizes'], which are otherwise keyed by character. One owner:
-    # _preview_layout_key writes it and _preview_all_known_chars reads it back
-    # to keep a slot key out of the character lists. A character key is a
-    # lowercased EVE name and can never contain a colon, so the two namespaces
-    # cannot collide.
+    # _preview_layout_key builds it. A character key is a lowercased EVE name
+    # and can never contain a colon, so every namespaced key ("acct:",
+    # "account:", "login:") is told apart from a character by that colon alone
+    # (_preview_all_known_chars, the slot heal).
+    # "acct:<label>" = a slot keyed by a MANUAL account label (own or a
+    # same-account sibling's).
     _PREVIEW_ACCOUNT_SLOT_PREFIX = "acct:"
+    # "account:<id>" = the slot of an account known only by OBSERVATION (auto
+    # slots). Keyed by the ground-truth account id, never by its display label:
+    # that label (alias, else the last-active-character hint, else
+    # "Account <id>") changes between sessions, and every change used to strand
+    # the tile on a fresh empty slot. Cannot collide with "acct:" (different
+    # text before the colon) or with a character (no colon in EVE names).
+    _PREVIEW_ACCOUNT_ID_SLOT_PREFIX = "account:"
 
     # ── Native preview controller config ───────────────────────────────────
     _PREVIEW_DEFAULTS = {
@@ -23503,13 +23518,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 if not c.is_login and c.char_name:
                     known.add(c.char_name.strip().lower())
             cfg = self._preview_cfg()
-            slot = FCToolGUI._PREVIEW_ACCOUNT_SLOT_PREFIX
             for key in (cfg.get("layouts", {}) or {}):
                 k = str(key).strip().lower()
-                # An "acct:<label>" entry is an ACCOUNT's shared rect, not a
-                # pilot: offering it here would put a fake character in the
-                # Previews... checklist and in the gamelog tracked-set.
-                if k and not k.startswith(slot):
+                # An "acct:<label>" / "account:<id>" / "login:<id>" entry is an
+                # account's or a login's rect, not a pilot: offering it here
+                # would put a fake character in the Previews... checklist and
+                # in the gamelog tracked-set. EVE names never contain ":", so
+                # the colon alone tells every namespace apart.
+                if k and ":" not in k:
                     known.add(k)
         except Exception:
             log.exception("[preview] known-char union failed")
@@ -23828,6 +23844,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 except Exception:
                     log.debug("[account] opportunistic sidecar save skipped",
                               exc_info=True)
+                # Fill any "account:<id>" slot the map just made reachable,
+                # BEFORE the diff, so a tile spawned this tick reads its healed
+                # slot. Revision-gated (one compare in steady state, no write);
+                # getattr-guarded for the bare synthetic hosts.
+                _heal = getattr(self, "_preview_maybe_heal_account_slots", None)
+                if _heal is not None:
+                    _heal(cfg, account_map)
             cur = {c.hwnd: c for c in clients if c.key not in disabled}
             added, retitled, removed = eve_client_tracker.diff_clients(
                 self._preview_clients, cur)
@@ -27881,6 +27904,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # fires on the OFF->ON edge only, and by then cfg already holds the new
         # value with nothing left to compare it against.
         was_slots = bool(cfg.get("account_slots", False))
+        was_auto = bool(cfg.get("account_slots_auto", False))
         # Same reason, other direction: unticking "Hotkeys only while EVE is
         # focused" has to ACT, not just persist (see the ON->OFF block below).
         was_eve_only = bool(cfg.get("hotkeys_eve_only", False))
@@ -27943,6 +27967,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # OFF->ON edge (`was_slots`) -- a re-apply must never re-seed.
         if not was_slots and cfg.get("account_slots", False):
             self._preview_seed_account_slots(cfg)
+        # Same edge for "Auto-slot detected accounts" under an already-on
+        # master: observed-only characters move onto their "account:<id>"
+        # slots, so fill the absent ones from the saved geometry now (the
+        # seeder above already ends with this heal on the master's own edge).
+        elif not was_auto and cfg.get("account_slots_auto", False):
+            FCToolGUI._preview_heal_account_slots(self, cfg)
         # ── "Hotkeys only while EVE is focused" turned OFF: give the keys back
         # HERE, not on the next tick. Persisting the flag is NOT enough, and the
         # gap is not cosmetic:
@@ -30064,32 +30094,56 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         manual-only — exactly today's behaviour. `account_for_char` /
         `label_for_account` are pure reads; a fault in either degrades to "".
         `_preview_account_of` is the single owner of the manual answer, so the
-        two can never disagree about what "manual" means."""
-        manual = self._preview_account_of(char_key)
-        if manual:
-            return manual
-        amap = getattr(self, "_account_map", None)
-        if amap is None:
-            return ""
+        two can never disagree about what "manual" means.
+
+        Steps (1)-(2) and the account lookup live in
+        `_preview_account_basis`, shared with `_preview_layout_key` (which
+        keys step 3 by account ID instead of this display label)."""
+        label, acct = FCToolGUI._preview_account_basis(self, char_key)
+        if label or acct is None:
+            return label
         try:
-            acct = amap.account_for_char(char_key)
-            if acct is None:
-                return ""
-            # Same account, same slot: an unlabelled alt on an account that a
-            # DIFFERENT character hand-labelled shares that label (sorted-first
-            # labelled char wins when they disagree). Pure dict pass, no IO; any
-            # fault falls through to the auto label below.
-            try:
-                own = str(char_key).strip().lower()
-                manual_all = self._preview_char_accounts()
-                for other in sorted(manual_all):
-                    if other != own and amap.account_for_char(other) == acct:
-                        return manual_all[other]
-            except Exception:
-                pass
-            return amap.label_for_account(acct)
+            return self._account_map.label_for_account(acct)
         except Exception:
             return ""
+
+    def _preview_account_basis(self, char_key):
+        """`(manual_label, account_id)` behind both the display label and the
+        slot key: the character's own manual label, else a same-account
+        sibling's manual label (sorted-first labelled sibling) -- account_id is
+        then None, or the observed id when the label is inherited -- else
+        `("", <observed id or None>)`. One owner of "manual, then sibling", so
+        `_preview_effective_account_of` (display) and `_preview_layout_key`
+        (slot) can never disagree about which characters a manual label owns.
+
+        Called as `FCToolGUI._preview_account_basis(self, ...)` so the bare
+        SimpleNamespace test hosts need no extra binding. No map (or a fault in
+        it) degrades to manual-only."""
+        manual = self._preview_account_of(char_key)
+        if manual:
+            return manual, None
+        amap = getattr(self, "_account_map", None)
+        if amap is None:
+            return "", None
+        try:
+            acct = amap.account_for_char(char_key)
+        except Exception:
+            return "", None
+        if acct is None:
+            return "", None
+        # Same account, same slot: an unlabelled alt on an account that a
+        # DIFFERENT character hand-labelled shares that label (sorted-first
+        # labelled char wins when they disagree). Pure dict pass, no IO; any
+        # fault falls through to "no inherited label".
+        try:
+            own = str(char_key).strip().lower()
+            manual_all = self._preview_char_accounts()
+            for other in sorted(manual_all):
+                if other != own and amap.account_for_char(other) == acct:
+                    return manual_all[other], acct
+        except Exception:
+            pass
+        return "", acct
 
     def _preview_account_mismatches(self) -> dict:
         """{char_key: observed_account_id} for characters whose MANUAL grouping
@@ -30189,19 +30243,28 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         returns `char_key` UNCHANGED, which is what makes the feature
         byte-identical to not existing: same keys read, same keys written.
 
-        With `account_slots_auto` ALSO on, the label comes from the EFFECTIVE
-        (manual-else-observed) account, so a character FCTool has only observed
+        With `account_slots_auto` ALSO on, a character FCTool has only observed
         on an account -- never hand-labelled -- shares that account's slot too.
-        The effective view is manual-first, so a hand-labelled character is
-        byte-identical either way -- manual always wins. Auto off (the default)
-        keeps the manual-only answer, byte-identical to before this option
-        existed. A tile re-routes to its slot on its next spawn/rekey/resize, so
+        Manual first (`_preview_account_basis`): the character's own label,
+        then a same-account sibling's label, keeps "acct:<label>", so a
+        hand-labelled character is byte-identical either way -- manual always
+        wins. With no manual label on the account the slot is
+        "account:<id>" (`_PREVIEW_ACCOUNT_ID_SLOT_PREFIX`), keyed by the
+        ground-truth account id and NOT by the account's display label: that
+        label (alias, else the last-active-character hint, else
+        "Account <id>") changes between sessions, and keying by it stranded the
+        tile on a new empty slot at every change. An absent id slot is filled
+        from what is already saved by `_preview_heal_account_slots`.
+        Auto off keeps the manual-only answer, byte-identical to before this
+        option existed; so does the `account_identity` kill switch (the legacy
+        label key). A tile re-routes to its slot on its next spawn/rekey/resize, so
         turning this on mid-session moves an already-drawn observed-only tile
         only when it is next touched -- accepted, not chased.
 
         Accounted LOGIN screens (identity `login:<id>`, no character of their
         own) bridge to a representative character of the same account before the
-        label lookup, so a login shares its account's `acct:<label>` slot -- both
+        label lookup, so a login shares its account's slot ("acct:<label>" or
+        "account:<id>") -- both
         for READS (spawn/rekey position) and drag WRITES. Off (or with no
         representative character known yet, e.g. before the AV-delayed probe
         resolves) the login keeps its `login:<id>` drag namespace, byte-identical
@@ -30224,7 +30287,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         would silently relocate an existing entry.
 
         Both FLAG reads -- `account_slots` and `account_slots_auto`, and only
-        the flag reads -- go to the RAW block rather than through
+        the flag reads (plus `account_identity` on the auto path) -- go to the
+        RAW block rather than through
         `_preview_cfg()`: that accessor materializes every absent default INTO
         the block, and this method is asked on the per-tick size path
         (`_preview_resolve_size`), where the auto-fit pass owes a
@@ -30251,8 +30315,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # THAT character's slot -- so a login lands exactly where its account's
         # main sits, and a login-drag persists to the shared account slot too.
         # `rep` is always a char key (never a `login:`/`acct:` token), so the
-        # single re-entry below resolves to `acct:<label>` (or the char's own key
-        # if ungrouped) and cannot recurse into this branch again. Guarded on the
+        # single re-entry below resolves to `acct:<label>`, `account:<id>` (an
+        # auto-only account) or the char's own key if ungrouped, and cannot
+        # recurse into this branch again. Guarded on the
         # map (None under the kill switch / a bare unit host) and on a non-int id
         # -> fall through to `login:<id>`, keeping login-drag persistence and the
         # account_slots-off path byte-identical. The map read is the same
@@ -30295,10 +30360,21 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             return char_key                 # no representative yet -> login:<id>
         if block.get("account_slots_auto", False):
             # Auto-slot on: an observed-only character (detected on an account
-            # but never hand-labelled) routes to that account's slot too. The
-            # effective view is manual-first, so a hand-labelled character is
-            # byte-identical to the manual branch below -- manual still wins.
-            label = self._preview_effective_account_of(char_key)
+            # but never hand-labelled) routes to that account's slot too. Manual
+            # first -- own label, then a same-account sibling's -- so a
+            # hand-labelled character is byte-identical to the manual branch
+            # below. With no manual label anywhere on the account the slot is
+            # keyed by the account ID, not by its display label (which changes
+            # between sessions and used to strand the tile each time). Under
+            # the account_identity kill switch (raw read, absent = on) the map
+            # is never fed, so only the alias+hint corner of account_for_char
+            # can answer; that keeps the legacy label key, byte-identical.
+            label, acct = FCToolGUI._preview_account_basis(self, char_key)
+            if not label and acct is not None:
+                if block.get("account_identity", True):
+                    return (FCToolGUI._PREVIEW_ACCOUNT_ID_SLOT_PREFIX
+                            + str(acct))
+                label = self._preview_effective_account_of(char_key)
         else:
             label = self._preview_account_of(char_key)
         if not label:
@@ -30323,17 +30399,20 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         character can own a saved rect without owning a size override and the
         two blocks must each pick the first member that can actually answer.
 
-        The manual grouping is seeded first; a SECOND (observed-only) pass then
-        labels each unlabelled character that has saved geometry and a
-        ground-truth account by its EFFECTIVE account
-        (`_preview_effective_account_of`: a same-account sibling's manual label,
-        sorted-first, before the observed auto label), so an auto-detected alt
-        keeps its hand-placed position on opt-in and lands in the slot the
-        runtime reads. Because manual groups are seeded first, a hand-labelled
-        main's own well-formed entry wins over an alt's for the shared slot.
-        That pass reads the ground-truth map only and never writes
-        preview.char_accounts (manual wins, structurally); it is inert when no
-        map is present.
+        The manual grouping is seeded first; a SECOND (observed) pass then
+        adds each unlabelled character that has saved geometry and a
+        ground-truth account to the group of the manual label it INHERITS from
+        a same-account sibling (`_preview_account_basis`, sorted-first labelled
+        sibling), so an unlabelled alt's hand-placed rect can answer for its
+        main's "acct:<label>" slot. Because manual groups are seeded first, a
+        hand-labelled main's own well-formed entry wins over an alt's for the
+        shared slot. Finally `_preview_heal_account_slots` fills the
+        "account:<id>" slots of accounts known ONLY by observation -- the key
+        the runtime reads for them since 2026-10-24; this seeder no longer
+        writes the old "acct:<auto label>" keys, which nothing reads any more.
+        Both observed steps read the ground-truth map only and never write
+        preview.char_accounts (manual wins, structurally); they are inert when
+        no map is present.
 
         - An EXISTING slot is never overwritten: the user has already placed
           that account's tile and this is not the moment to move it.
@@ -30358,18 +30437,17 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # pre-overlay behaviour.
         groups = [(prefix + label, self._preview_account_members(label))
                   for label in self._preview_account_labels()]
-        # Then accounts known ONLY by observation (spec §9.3 read-time overlay):
-        # a character with saved geometry, no manual label, but a ground-truth
-        # account the map resolves seeds THAT account's slot, so an auto-detected
-        # alt keeps its hand-placed position when the user opts in. Reads the
-        # account map directly and NEVER writes preview.char_accounts — "manual
-        # wins" stays structural (manually-labelled keys are skipped, and an
-        # already-seeded slot is never overwritten by the unified loop below).
-        # Inert without a map, which is why the manual behaviour above is
-        # unchanged for every no-map host. The label is the EFFECTIVE one
-        # (`_preview_effective_account_of`): a same-account sibling's manual
-        # label (sorted-first labelled sibling) before the observed auto label,
-        # so the seeded slot is exactly the one the runtime reads.
+        # Then unlabelled characters that INHERIT a manual label from a
+        # same-account sibling (spec 9.3 read-time overlay): their saved
+        # geometry may answer for that label's "acct:" slot, so an alt's
+        # hand-placed rect survives opt-in when the labelled main has none.
+        # Reads the account map directly and NEVER writes
+        # preview.char_accounts -- "manual wins" stays structural (manually-
+        # labelled keys are skipped, and an already-seeded slot is never
+        # overwritten by the unified loop below). Inert without a map, which
+        # is why the manual behaviour above is unchanged for every no-map host.
+        # An account with NO manual label anywhere is not handled here: its
+        # slot is "account:<id>", filled by the heal at the end.
         amap = getattr(self, "_account_map", None)
         if amap is not None:
             manual_keys = set(self._preview_char_accounts())
@@ -30379,20 +30457,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 if not isinstance(block, dict):
                     continue
                 for k in block:
-                    if not isinstance(k, str) or k.startswith(prefix):
-                        continue
+                    if not isinstance(k, str) or ":" in k:
+                        continue            # a namespaced key is no character
                     nk = k.strip().lower()
                     if nk and nk not in manual_keys:
                         candidates.add(nk)  # manual wins; never observed-seeded
             observed: dict = {}
             for nk in candidates:
                 try:
-                    if amap.account_for_char(nk) is None:
-                        continue
-                    label = self._preview_effective_account_of(nk)
+                    label, acct = FCToolGUI._preview_account_basis(self, nk)
                 except Exception:
                     continue
-                if label:
+                if label and acct is not None:
                     observed.setdefault(label, []).append(nk)
             for label, members in observed.items():
                 groups.append((prefix + label, sorted(members)))
@@ -30406,6 +30482,127 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     if isinstance(entry, (list, tuple)) and len(entry) >= width:
                         block[slot] = list(entry)
                         break               # first answerable member wins
+        # Last, the id-keyed slots of accounts known only by observation.
+        # Class-qualified so the bare seeder test hosts need no extra binding;
+        # it is inert without a map or with either slot flag off.
+        FCToolGUI._preview_heal_account_slots(self, cfg)
+
+    def _preview_heal_account_slots(self, cfg) -> bool:
+        """Fill every ABSENT "account:<id>" slot from geometry already saved.
+
+        The id slot (see `_preview_layout_key`) starts empty, and an empty slot
+        means the tile cascades into the corner. This adopts what the user
+        already has, for every character the account map can place on an
+        account -- live and sidecar characters plus the character keys of
+        `layouts` / `sizes` -- whose slot key is an id slot. The source is
+        picked by the pure `preview_layout.account_slot_source`: the current
+        auto-label slot, then "acct:Account <id>", then "acct:<name>" of the
+        account's characters, then the per-character entries (the live
+        character's own first). A label slot belonging to a manual group is
+        never a source.
+
+        Lazy and data-driven, so it also completes the v5.4.0 default-slots
+        migration for configs it missed: that one-time seed ran at boot before
+        a config upgraded from v5.2 had any account map, and the map only
+        learns the accounts on the first tick. Called at boot, from the tick
+        via `_preview_maybe_heal_account_slots` (only when the map's
+        `revision` moves), and at the end of `_preview_seed_account_slots`.
+
+        Same rules as the seeder: an existing slot is NEVER overwritten, no key
+        is ever deleted (house rule), entries are copied (never aliased),
+        malformed ones skipped, and `sizes` is filled only while
+        `uniform_size` is OFF. Returns True iff anything was written; the
+        caller saves. Inert -- returns False and writes nothing -- without a
+        map, with `account_slots` or `account_slots_auto` off (raw flag reads,
+        the `_preview_layout_key` discipline), or when no `account:` key comes
+        back."""
+        raw = self.config.get("preview")
+        if not (isinstance(raw, dict) and raw.get("account_slots", False)
+                and raw.get("account_slots_auto", False)):
+            return False
+        amap = getattr(self, "_account_map", None)
+        layout_key = getattr(self, "_preview_layout_key", None)
+        if amap is None or not callable(layout_key) or not isinstance(cfg, dict):
+            return False
+        blocks = [("layouts", 4)]
+        if not cfg.get("uniform_size", True):
+            blocks.append(("sizes", 2))
+        try:
+            live = list(amap.live_chars())
+            known = list(amap.known_chars())
+        except Exception:
+            return False
+        # The live characters first: when several characters answer for one
+        # account, the one whose window is on screen offers its own entry.
+        order = live + known
+        for name, _width in blocks:
+            block = cfg.get(name)
+            if isinstance(block, dict):
+                order += sorted(k for k in block
+                                if isinstance(k, str) and k and ":" not in k)
+        prefix = FCToolGUI._PREVIEW_ACCOUNT_ID_SLOT_PREFIX
+        accounts: dict = {}                 # id -> (slot key, chars in order)
+        seen = set()
+        for char in order:
+            if char in seen:
+                continue
+            seen.add(char)
+            try:
+                slot = layout_key(char)
+                acct = int(slot[len(prefix):]) if (
+                    isinstance(slot, str) and slot.startswith(prefix)) else None
+            except Exception:
+                continue
+            if acct is not None:
+                accounts.setdefault(acct, (slot, []))[1].append(char)
+        if not accounts:
+            return False
+        try:
+            manual = list(self._preview_char_accounts().values())
+        except Exception:
+            manual = []
+        changed = False
+        for acct, (slot, chars) in accounts.items():
+            try:
+                auto_label = amap.label_for_account(acct)
+                members = sorted(set(amap.chars_for_account(acct)) | set(chars))
+            except Exception:
+                continue
+            for name, width in blocks:
+                block = cfg.get(name)
+                if not isinstance(block, dict) or slot in block:
+                    continue                # absent block, or already placed
+                picked = preview_layout.account_slot_source(
+                    block, width=width, account_id=acct, own_char=chars[0],
+                    members=members, auto_label=auto_label,
+                    manual_labels=manual,
+                    label_prefix=FCToolGUI._PREVIEW_ACCOUNT_SLOT_PREFIX)
+                if picked is not None:
+                    block[slot] = picked[1]
+                    changed = True
+                    # %a: a source label may be a user alias with any glyph,
+                    # and the console handler is cp1252 (map/facts.md).
+                    log.info("[preview] %s slot %s seeded from %a",
+                             name, slot, picked[0])
+        return changed
+
+    def _preview_maybe_heal_account_slots(self, cfg, account_map):
+        """Run the slot heal iff `account_map.revision` moved since the last run,
+        and save config only if it wrote something. The tick calls this on
+        every pass, so steady state costs one compare and writes nothing (the
+        write-nothing-on-unchanged contract); __init__ calls it once at boot.
+        A map without `revision` (the duck-typed test fakes) never heals. The
+        revision is recorded BEFORE the heal, so a raising heal is not retried
+        on every tick -- it waits for the next real change."""
+        rev = getattr(account_map, "revision", None)
+        if rev is None or rev == getattr(self, "_preview_account_heal_rev", None):
+            return
+        self._preview_account_heal_rev = rev
+        try:
+            if self._preview_heal_account_slots(cfg):
+                self._save_config()
+        except Exception:
+            log.exception("[preview] account slot heal failed")
 
     def _preview_migrate_fit_height_default(self):
         """One-time migration (owner refinement, 2026-09-13, renamed from the
@@ -30498,7 +30695,15 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         slot keys: a fresh config has no members to seed and an already-on
         config's slots are all present, so both are no-ops; only an existing OFF
         config with saved geometry actually adopts anything. Mirrors
-        `_migrate_fittings_config`: idempotent, and saves once."""
+        `_migrate_fittings_config`: idempotent, and saves once.
+
+        Known gap, closed elsewhere: this runs at boot, when the account map
+        holds only the sidecar. A config upgraded straight from a build older
+        than the sidecar (v5.2) has none, so the observed-only accounts cannot
+        be seeded here -- and the marker makes this final. Their slots
+        ("account:<id>") are filled later by `_preview_heal_account_slots`,
+        which runs at boot right after this and again on the tick whenever the
+        map learns something (`_preview_maybe_heal_account_slots`)."""
         cfg = self._preview_cfg()
         if cfg.get("account_slots_migrated"):
             return
