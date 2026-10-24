@@ -20644,6 +20644,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # "auto" = on, "off" = spawn the helper with --no-transient. Inert on
         # Windows like the four above.
         "linux_transient_for": "auto",   # "auto" | "off"
+        "linux_tile_nofocus": "auto",    # "auto" | "off" (no WM_TAKE_FOCUS on tiles)
     }
 
     def _account_char_hint(self, account_id):

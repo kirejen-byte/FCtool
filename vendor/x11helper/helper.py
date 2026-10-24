@@ -33,6 +33,13 @@
 # an EWMH _NET_ACTIVE_WINDOW ClientMessage to the root, then EPM's one-pixel
 # synthetic MotionNotify so Wine re-evaluates hover.  See XSession.
 #
+# And one more WM hint: every tile is made an ICCCM "No Input" window (no
+# WM_TAKE_FOCUS, WM_HINTS.input False).  Wine marks each of its X windows
+# "globally active" (WM_TAKE_FOCUS, input False); on a tile click the WM sends
+# WM_TAKE_FOCUS, Wine sees the tile may not activate (WS_EX_NOACTIVATE) and
+# hands X focus to FCTool's MAIN window instead -- a visible bounce through
+# FCTool before 'activate' lands on the client.  See HelperCore._enforce_nofocus.
+#
 # Constraints (Steam 'sniper' runtime ships Python 3.9):
 #
 #   * Python 3.9 syntax and APIs only -- no match, no runtime X | Y unions, no
@@ -131,7 +138,15 @@ CONNECT_TIMEOUT_S = 10.0
 RECV_CHUNK = 65536
 
 _USAGE = ("usage: helper.py --host H --port N --token T "
-          "[--vendor PATH] [--display D] [--no-transient]")
+          "[--vendor PATH] [--display D] [--no-transient] "
+          "[--no-tile-nofocus]")
+
+#: The helper's valueless flags (each may sit anywhere, last included).
+_BOOL_FLAGS = ("--no-transient", "--no-tile-nofocus")
+
+#: ICCCM WM_HINTS flags bit 0 (Xlib.Xutil.InputHint): the ``input`` field is
+#: meaningful.  A plain constant so this module still never imports Xlib.
+WM_HINTS_INPUT_HINT = 1
 
 
 def _log(text):
@@ -223,14 +238,17 @@ class Options(object):
         #: --no-transient is the kill switch: the whole mechanism becomes a
         #: no-op, which is how a tester isolates it from everything else.
         self.transient = True
+        #: "No Input" tiles (see HelperCore._enforce_nofocus).
+        #: --no-tile-nofocus is its kill switch, the same way.
+        self.tile_nofocus = True
 
 
 def parse_args(argv):
     """Parse the helper's argv (without argv[0]).  Raises UsageError.
 
-    Every flag takes a value EXCEPT the boolean --no-transient: probing is a
-    'probe' MESSAGE, so there is no --probe switch to parse (FCTool never
-    passed one).
+    Every flag takes a value EXCEPT the booleans --no-transient and
+    --no-tile-nofocus: probing is a 'probe' MESSAGE, so there is no --probe
+    switch to parse (FCTool never passed one).
     """
     opts = Options()
     items = list(argv or ())
@@ -239,10 +257,13 @@ def parse_args(argv):
     seen_token = False
     while index < len(items):
         arg = items[index]
-        # The ONE valueless flag: checked before the "needs a value" guard so
-        # it may also be the last argument on the line.
-        if arg == "--no-transient":
-            opts.transient = False
+        # The valueless flags: checked before the "needs a value" guard so
+        # they may also be the last argument on the line.
+        if arg in _BOOL_FLAGS:
+            if arg == "--no-transient":
+                opts.transient = False
+            else:
+                opts.tile_nofocus = False
             index += 1
             continue
         if index + 1 >= len(items):
@@ -333,8 +354,11 @@ class XSession(object):
         self._net_active_window = None
         # Xlib.Xatom, for the predefined WM_TRANSIENT_FOR / WINDOW / ATOM ids.
         self._Xatom = None
-        #: name -> atom cache for the DIAGNOSTIC reads only (_NET_WM_STATE and
-        #: the state atoms it returns).  Never on a per-frame path.
+        #: name -> atom cache for the DIAGNOSTIC reads (_NET_WM_STATE and the
+        #: state atoms it returns) and the "No Input" tile hints
+        #: (WM_PROTOCOLS, WM_TAKE_FOCUS -- interned at the first attach, then
+        #: read back from here by next_events() without a round trip).  Never
+        #: on a per-frame path.
         self._atoms = {}
 
     # ---- lifecycle ------------------------------------------------------
@@ -748,8 +772,9 @@ class XSession(object):
                 raise
             return False
 
-    def select_structure(self, xid, expose=False, focus=False):
-        """StructureNotify (plus ``expose`` / ``focus``) on a FOREIGN window.
+    def select_structure(self, xid, expose=False, focus=False, prop=False):
+        """StructureNotify (plus ``expose`` / ``focus`` / ``prop``) on a
+        FOREIGN window.
 
         Event masks are per-client in X, so this never disturbs the owner
         (unlike SubstructureRedirect) and Wine never learns we asked.
@@ -757,14 +782,18 @@ class XSession(object):
         ONE call -- selecting them one after the other would keep only the
         last.  So the SOURCE windows take ``StructureNotify|FocusChange`` (the
         FocusIn is how we time an activation) and the TILES take
-        ``StructureNotify|Expose`` (the Wine-flush repair); neither ever gets
-        the other's bit implicitly.
+        ``StructureNotify|Expose`` (the Wine-flush repair) plus, while the
+        "No Input" tiles are on, ``PropertyChange`` (a WM_PROTOCOLS/WM_HINTS
+        rewrite by Wine is re-stripped); neither ever gets the other's bit
+        implicitly.
         """
         mask = self._X.StructureNotifyMask
         if expose:
             mask |= self._X.ExposureMask
         if focus:
             mask |= self._X.FocusChangeMask
+        if prop:
+            mask |= self._X.PropertyChangeMask
         self._checked(self._window(xid).change_attributes, event_mask=mask)
 
     # ---- WM hints -------------------------------------------------------
@@ -794,6 +823,100 @@ class XSession(object):
         self._checked(self._window(int(dst)).delete_property,
                       self._Xatom.WM_TRANSIENT_FOR)
 
+    # ---- "No Input" tiles ---------------------------------------------
+    #
+    # ICCCM input models: a window with WM_TAKE_FOCUS in WM_PROTOCOLS and
+    # WM_HINTS.input False is "globally active" -- the WM asks the CLIENT to
+    # take focus with a WM_TAKE_FOCUS message.  Wine (use_take_focus, its
+    # default) makes every X window exactly that, and its WM_TAKE_FOCUS
+    # handler, refused by a WS_EX_NOACTIVATE tile, XSetInputFocus'es the
+    # thread's MAIN window instead.  Removing WM_TAKE_FOCUS (and keeping input
+    # False) makes the tile "No Input": the WM never offers it focus at all.
+
+    def _read_protocols(self, win):
+        """The window's WM_PROTOCOLS as a list of atom ints ([] when unset)."""
+        return [int(atom) for atom in (win.get_wm_protocols() or ())]
+
+    def _read_wm_hints(self, win):
+        """The window's raw WM_HINTS longs as a list, or None when unset.
+
+        Read RAW (format-32 longs) rather than through the library's WMHints
+        struct: a rewrite must preserve every other field byte for byte, and
+        the struct's re-encode would validate fields (initial_state) we have
+        no business judging.
+        """
+        prop = win.get_full_property(self._Xatom.WM_HINTS,
+                                     self._Xatom.WM_HINTS)
+        if prop is None or getattr(prop, "format", 0) != 32:
+            return None
+        return [int(value) for value in (prop.value or ())]
+
+    def drop_take_focus(self, xid):
+        """Remove WM_TAKE_FOCUS from the tile's WM_PROTOCOLS.
+
+        Every other atom stays, in its order.  ZERO-WRITE: nothing is written
+        when the atom is not there (one GetProperty is the whole cost).
+        Returns True only when a write was issued.  Raises XCallError.
+        """
+        take_focus = self._atom("WM_TAKE_FOCUS")
+        # Interned here (the first attach) so next_events() can classify a
+        # PropertyNotify on it later without a round trip.
+        self._atom("WM_PROTOCOLS")
+        if not take_focus:
+            return False
+        win = self._window(int(xid))
+        try:
+            protocols = self._read_protocols(win)
+        except Exception as exc:
+            if _is_display_dead(exc):
+                raise
+            raise self._as_call_error(exc, xid)
+        if take_focus not in protocols:
+            return False
+        kept = [atom for atom in protocols if atom != take_focus]
+        self._checked(win.set_wm_protocols, kept)
+        return True
+
+    def clear_input_hint(self, xid):
+        """Rewrite WM_HINTS.input True -> False, every other field kept.
+
+        Only when the InputHint flag is SET with input True (Wine writes that
+        when a user turned its UseTakeFocus off); input already False, or no
+        InputHint at all, or no WM_HINTS, writes nothing.  Returns True only
+        when a write was issued.  Raises XCallError.
+        """
+        win = self._window(int(xid))
+        try:
+            hints = self._read_wm_hints(win)
+        except Exception as exc:
+            if _is_display_dead(exc):
+                raise
+            raise self._as_call_error(exc, xid)
+        if not hints or len(hints) < 2:
+            return False
+        if not hints[0] & WM_HINTS_INPUT_HINT or not hints[1]:
+            return False
+        hints[1] = 0
+        self._checked(win.change_property, self._Xatom.WM_HINTS,
+                      self._Xatom.WM_HINTS, 32, hints)
+        return True
+
+    def _focus_hint_kind(self, atom):
+        """'protocols' / 'hints' for the two "No Input" properties, else None.
+
+        Event path: reads the atom cache only, never interns.
+        """
+        try:
+            atom = int(atom)
+        except (TypeError, ValueError):
+            return None
+        if self._Xatom is not None and atom == int(self._Xatom.WM_HINTS):
+            return "hints"
+        protocols = self._atoms.get("WM_PROTOCOLS")
+        if protocols and atom == protocols:
+            return "protocols"
+        return None
+
     def _atom(self, name):
         """Intern ``name`` once.  0 when the server refused (diagnostic only)."""
         atom = self._atoms.get(name)
@@ -810,12 +933,17 @@ class XSession(object):
         """DIAGNOSTIC read-only facts about one window.  Never raises.
 
         ``{"dst", "override_redirect", "state" (a list of _NET_WM_STATE atom
-        NAMES), "transient_for"}`` plus ``"error"`` for whichever half the
-        server refused.  This is what MEASURES the managed-vs-override-redirect
-        premise on the tester's box instead of assuming it.
+        NAMES), "transient_for", "take_focus", "input"}`` plus ``"error"``
+        for whichever part the server refused.  This is what MEASURES the
+        managed-vs-override-redirect premise on the tester's box instead of
+        assuming it -- and whether the tile is "No Input": ``take_focus`` is
+        True while WM_TAKE_FOCUS is in WM_PROTOCOLS, ``input`` is the
+        WM_HINTS input field (None when the InputHint flag is unset or there
+        is no WM_HINTS); both None when unreadable.
         """
         info = {"dst": int(xid), "override_redirect": None,
-                "state": [], "transient_for": 0}
+                "state": [], "transient_for": 0,
+                "take_focus": None, "input": None}
         win = self._window(xid)
         try:
             info["override_redirect"] = bool(
@@ -833,6 +961,18 @@ class XSession(object):
         try:
             parent = win.get_wm_transient_for()
             info["transient_for"] = _xid_of(parent)
+        except Exception as exc:
+            info.setdefault("error", _describe(exc))
+        take_focus = self._atom("WM_TAKE_FOCUS")
+        try:
+            info["take_focus"] = bool(take_focus) and \
+                take_focus in self._read_protocols(win)
+        except Exception as exc:
+            info.setdefault("error", _describe(exc))
+        try:
+            hints = self._read_wm_hints(win)
+            if hints and len(hints) >= 2 and hints[0] & WM_HINTS_INPUT_HINT:
+                info["input"] = bool(hints[1])
         except Exception as exc:
             info.setdefault("error", _describe(exc))
         return info
@@ -1038,8 +1178,9 @@ class XSession(object):
 
         ``("damage", xid, (x, y, w, h))`` / ``("configure", xid, w, h)`` /
         ``("expose", xid)`` / ``("destroy", xid)`` / ``("unmap", xid)`` /
-        ``("focus_in", xid)`` / ``("error", code, resource)``.  Anything else
-        is dropped here so HelperCore never sees an Xlib object.
+        ``("focus_in", xid)`` / ``("focus_hints", xid, "protocols"|"hints")``
+        / ``("error", code, resource)``.  Anything else is dropped here so
+        HelperCore never sees an Xlib object.
 
         Damage carries the damaged AREA (None when the event has none): a
         source's area is ignored, but on a TILE it is the whole story -- it
@@ -1102,6 +1243,14 @@ class XSession(object):
                 out.append(("unmap", _xid_of(ev.window)))
             elif etype == X.DestroyNotify:
                 out.append(("destroy", _xid_of(ev.window)))
+            elif etype == X.PropertyNotify:
+                # Selected on TILES only, for the "No Input" hints.  Every
+                # other property a tile carries (_NET_WM_STATE, WM_STATE,
+                # _NET_WM_USER_TIME, ...) is dropped right here, so only a
+                # WM_PROTOCOLS / WM_HINTS change ever reaches HelperCore.
+                kind = self._focus_hint_kind(getattr(ev, "atom", None))
+                if kind is not None:
+                    out.append(("focus_hints", _xid_of(ev.window), kind))
             elif etype == X.FocusIn:
                 # The ONE event that says an activation actually landed: the
                 # WM never answers _NET_ACTIVE_WINDOW, so this is how the
@@ -1313,6 +1462,12 @@ class Thumb(object):
         #: not set one", which is also the state of a freshly shown tile, so
         #: a clear with nothing to clear costs no round trip either.
         self.transient_for = 0
+        #: "No Input" mirror, one flag per property: True once that property
+        #: was read clean (or made clean).  A clean tile costs NO request on
+        #: any trigger; only a PropertyNotify for that very property (Wine
+        #: rewrote it) clears its flag again.  A failed check leaves it False,
+        #: so the next trigger retries.
+        self.nofocus_ok = {"protocols": False, "hints": False}
         #: probe mode owns the destination window and must destroy it too.
         self.owns_dst = bool(owns_dst)
 
@@ -1341,7 +1496,7 @@ class HelperCore(object):
     """
 
     def __init__(self, session, transport, clock=time.monotonic,
-                 sleep=time.sleep, transient=True):
+                 sleep=time.sleep, transient=True, tile_nofocus=True):
         self.session = session
         self.transport = transport
         self.clock = clock
@@ -1381,6 +1536,10 @@ class HelperCore(object):
         #: shows.
         self._transient_parent = None
         self.transient_writes = 0
+        #: "No Input" tiles (see _enforce_nofocus).  ``--no-tile-nofocus``
+        #: turns the whole mechanism off, PropertyChange selection included.
+        self.tile_nofocus = bool(tile_nofocus)
+        self.nofocus_writes = 0
         #: sources already offered to Composite (asked once, never again).
         self._redirected = set()
         #: Deadline for the deferred RandR re-push (see _on_screen_change());
@@ -1481,8 +1640,11 @@ class HelperCore(object):
             session.select_structure(src, focus=True)
             # Expose on the TILE is how the server tells us Wine just flushed
             # its own surface over our child; StructureNotify comes along for
-            # the drag/resize case (one call -- the mask is replaced, not OR'd).
-            session.select_structure(dst, expose=True)
+            # the drag/resize case, PropertyChange for a Wine rewrite of the
+            # "No Input" hints on a REAL tile (one call -- the mask is
+            # replaced, not OR'd).
+            session.select_structure(dst, expose=True,
+                                     prop=self.tile_nofocus and tid >= 0)
             thumb.src_pic = session.create_source_picture(src)
             thumb.dst_pic = session.create_dest_picture(child)
             thumb.damage = session.damage_create(src)
@@ -1513,6 +1675,9 @@ class HelperCore(object):
         # or it would be the one tile the active client still buries.
         if self._transient_parent is not None:
             self._write_transient(thumb, self._transient_parent)
+        # Every attach is a NEW Thumb with a cold mirror -- a re-attach, or a
+        # new dst xid after Wine recreated the tile's X window, included.
+        self._enforce_nofocus(thumb)
         try:
             src_w, src_h = self.session.geometry(thumb.src)[2:4]
         except XCallError as exc:
@@ -1654,6 +1819,80 @@ class HelperCore(object):
                 raise
             _log("is_viewable 0x%x: %s" % (int(src), _describe(exc)))
             return False
+
+    # ---- "No Input" tiles -----------------------------------------------
+
+    def _enforce_nofocus(self, thumb, kinds=("protocols", "hints")):
+        """Make one tile an ICCCM "No Input" window: mirrored, error-isolated.
+
+        THE click-bounce fix.  Wine marks every X window globally active
+        (WM_TAKE_FOCUS in WM_PROTOCOLS, WM_HINTS.input False).  On a tile
+        click the WM sends WM_TAKE_FOCUS; Wine finds the tile may not activate
+        (WS_EX_NOACTIVATE) and falls back to the thread's focus/active window
+        -- FCTool's MAIN window -- and XSetInputFocus'es it, so the focus
+        visibly bounces through FCTool before our own 'activate' lands on the
+        client.  With WM_TAKE_FOCUS gone and input False the WM never offers
+        the tile focus at all (the user's own ``xprop`` test proved it).
+
+        ``kinds`` names which property to (re)check: "protocols" (strip
+        WM_TAKE_FOCUS, every other atom kept in order) and/or "hints" (input
+        True -> False, only with the InputHint flag set -- Wine's
+        UseTakeFocus=N case).  ZERO-WRITE twice over: a property whose
+        mirror flag is set costs no request at all, and a check that finds
+        the property already clean writes nothing.  One tile's X error never
+        touches another, and leaves that flag cold so the next trigger
+        (a PropertyNotify, a re-attach, any 'activate') retries.
+
+        Nothing is restored on detach or shutdown: an FCTool tile never wants
+        focus, with or without this helper, so the "No Input" state left
+        behind is the right state for that window anyway (unlike the
+        transient hint, it cannot get a tile minimised).
+        """
+        if not self.tile_nofocus or thumb.id < 0:
+            return
+        for kind in kinds:
+            if thumb.nofocus_ok.get(kind):
+                continue
+            try:
+                if kind == "protocols":
+                    wrote = self.session.drop_take_focus(thumb.dst)
+                else:
+                    wrote = self.session.clear_input_hint(thumb.dst)
+            except XCallError as exc:
+                _log("no-input %s on 0x%x: %s" % (kind, thumb.dst, exc.msg))
+                continue
+            except Exception as exc:
+                if _is_display_dead(exc):
+                    raise
+                _log("no-input %s on 0x%x: %s"
+                     % (kind, thumb.dst, _describe(exc)))
+                continue
+            thumb.nofocus_ok[kind] = True
+            if wrote:
+                self.nofocus_writes += 1
+
+    def _enforce_nofocus_all(self):
+        """Retry every tile whose last check failed (clean tiles: free)."""
+        for thumb in list(self.thumbs.values()):
+            self._enforce_nofocus(thumb)
+
+    def _on_focus_hints(self, xid, kind=None):
+        """WM_PROTOCOLS or WM_HINTS changed on a tile: re-check that one.
+
+        Wine writes WM_PROTOCOLS only when it creates the X window, but it
+        rewrites WM_HINTS on every style change (input = !use_take_focus), so
+        this is what keeps a UseTakeFocus=N tile at input False.  Our OWN
+        write comes back here too, and is closed in one read: the re-check
+        finds the property clean and writes nothing.
+        """
+        kinds = (kind,) if kind in ("protocols", "hints") \
+            else ("protocols", "hints")
+        for thumb in list(self.thumbs.values()):
+            if thumb.dst != xid:
+                continue
+            for name in kinds:
+                thumb.nofocus_ok[name] = False
+            self._enforce_nofocus(thumb, kinds)
 
     def _release(self, thumb):
         """Free every X resource of ``thumb``.  Never raises."""
@@ -1827,6 +2066,10 @@ class HelperCore(object):
             self._error(None, "internal",
                         "activate 0x%x failed: %s: %s"
                         % (src, type(exc).__name__, exc))
+        # AFTER the focus request, so it can never delay it: a tile whose
+        # "No Input" check failed earlier gets another try.  Every clean tile
+        # is a mirror hit and costs no request.
+        self._enforce_nofocus_all()
 
     # ---- monitor layout -------------------------------------------------
 
@@ -1887,6 +2130,9 @@ class HelperCore(object):
                 self._on_destroy(int(ev[1]))
             elif kind == "focus_in":
                 self._on_focus_in(int(ev[1]))
+            elif kind == "focus_hints":
+                self._on_focus_hints(int(ev[1]),
+                                     ev[2] if len(ev) > 2 else None)
             elif kind == "screen_change":
                 self._on_screen_change()
             elif kind == "error":
@@ -2266,6 +2512,9 @@ class HelperCore(object):
                    # many property writes it has actually cost.
                    "transient": "on" if self.transient else "off",
                    "transient_writes": self.transient_writes,
+                   # "No Input" tiles: on/off, and how many writes it cost.
+                   "nofocus": "on" if self.tile_nofocus else "off",
+                   "nofocus_writes": self.nofocus_writes,
                    "errors": self.errors,
                    "uptime_s": round(now - self.started_ts, 3)})
 
@@ -2349,6 +2598,7 @@ class HelperCore(object):
         self.send({"type": proto.T_PROBE_RESULT, "results": results,
                    "wm": self._wm_rows(),
                    "transient": "on" if self.transient else "off",
+                   "nofocus": "on" if self.tile_nofocus else "off",
                    "round_trip_ms": self._round_trip_ms()})
 
     def _wm_rows(self):
@@ -2356,7 +2606,8 @@ class HelperCore(object):
 
         This is what measures the premise the whole keep-above fix rests on:
         whether Wine has upgraded the tiles to MANAGED windows, what
-        _NET_WM_STATE they carry, and who they are transient for right now.
+        _NET_WM_STATE they carry, and who they are transient for right now
+        -- plus whether each is "No Input" (``take_focus`` / ``input``).
         Never raises and never writes.
         """
         rows = []
@@ -2603,7 +2854,8 @@ def main(argv=None):
                            "%s: %s" % (type(exc).__name__, exc),
                            EXIT_NO_DISPLAY)
 
-    core = HelperCore(session, transport, transient=opts.transient)
+    core = HelperCore(session, transport, transient=opts.transient,
+                      tile_nofocus=opts.tile_nofocus)
     code = EXIT_OK
     try:
         # Inside the guard: build_hello QUERIES the server, so it can die too,

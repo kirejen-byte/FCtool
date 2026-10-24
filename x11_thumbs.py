@@ -160,6 +160,11 @@ class HelperStatus:
     #: until the first ``stats`` lands.
     transient: str = "-"
     transient_writes: int = 0
+    #: "No Input" tiles (no WM_TAKE_FOCUS, WM_HINTS.input False): "on"/"off"
+    #: and how many property writes it has cost.  "-" until the first
+    #: ``stats`` lands.
+    nofocus: str = "-"
+    nofocus_writes: int = 0
     uptime_s: float = 0.0
     last_error: Optional[str] = None
     spawn_attempts: int = 0
@@ -471,7 +476,8 @@ class HelperSupervisor(object):
     """Owns the helper process, the control socket and the reader thread."""
 
     def __init__(self, spawn=None, listen_factory=None, facts=None,
-                 bundle_dir=None, log=None, transient_for=True):
+                 bundle_dir=None, log=None, transient_for=True,
+                 tile_nofocus=True):
         #: None means "decide at spawn time" (see :meth:`_default_spawn`):
         #: the Wine verdict is a DLL probe, which must not run at import.
         self._spawn = spawn
@@ -483,6 +489,10 @@ class HelperSupervisor(object):
         #: for the WM_TRANSIENT_FOR keep-above (preview.linux_transient_for
         #: == "off").  Read at spawn time only, so it is per-helper-process.
         self._transient_for = bool(transient_for)
+        #: False adds ``--no-tile-nofocus``: the kill switch for the "No
+        #: Input" tiles (preview.linux_tile_nofocus == "off").  Spawn time
+        #: only, like the one above.
+        self._tile_nofocus = bool(tile_nofocus)
 
         self._lock = threading.Lock()          # guards every snapshot field
         self._send_lock = threading.Lock()     # serialises sendall
@@ -503,6 +513,8 @@ class HelperSupervisor(object):
         self._activate_focus_missed = 0
         self._transient = "-"
         self._transient_writes = 0
+        self._nofocus = "-"
+        self._nofocus_writes = 0
         self._uptime_s = 0.0
         self._last_error = None
         self._spawn_attempts = 0
@@ -547,6 +559,8 @@ class HelperSupervisor(object):
                 activate_focus_missed=self._activate_focus_missed,
                 transient=self._transient,
                 transient_writes=self._transient_writes,
+                nofocus=self._nofocus,
+                nofocus_writes=self._nofocus_writes,
                 uptime_s=self._uptime_s,
                 last_error=self._last_error,
                 spawn_attempts=self._spawn_attempts,
@@ -868,6 +882,9 @@ class HelperSupervisor(object):
             # the END of argv (sys.argv[-1]) to seed sys.path, so that pair
             # must stay last no matter what else goes on the line.
             argv.append("--no-transient")
+        if not self._tile_nofocus:
+            # Same rule: a valueless flag, and BEFORE the --vendor pair.
+            argv.append("--no-tile-nofocus")
         argv += ["--vendor", vendor]
         spawn = self._spawn
         if spawn is None:
@@ -1208,15 +1225,20 @@ class HelperSupervisor(object):
                               ("activate_focus_seen", "_activate_focus_seen"),
                               ("activate_focus_missed",
                                "_activate_focus_missed"),
-                              ("transient_writes", "_transient_writes")):
+                              ("transient_writes", "_transient_writes"),
+                              ("nofocus_writes", "_nofocus_writes")):
                 total = _as_int(msg.get(key))
                 if total is not None:
                     setattr(self, attr, total)
-            # The one STRING the helper reports: "on"/"off" for the keep-above
-            # kill switch.  Anything else is ignored rather than rendered.
+            # The STRINGS the helper reports: "on"/"off" for the keep-above
+            # and the "No Input" kill switches.  Anything else is ignored
+            # rather than rendered.
             mode = msg.get("transient")
             if mode in ("on", "off"):
                 self._transient = mode
+            mode = msg.get("nofocus")
+            if mode in ("on", "off"):
+                self._nofocus = mode
             # The one float the helper reports: a bool would pass isinstance
             # (True is an int) and land in the report as 1.0 ms of nonsense.
             activate_ms = msg.get("last_activate_ms")
@@ -1873,9 +1895,10 @@ def make_backend(cfg, log=None):
     """Build the Wine-side backend and start the helper OFF-thread.
 
     ``cfg`` is the materialised preview config; only ``linux_fps_cap``,
-    ``linux_heartbeat_ms`` and ``linux_transient_for`` are read (the last one
-    is a kill switch: "off" spawns the helper with ``--no-transient`` and the
-    WM_TRANSIENT_FOR keep-above never runs).  Returns None ONLY when this is not a
+    ``linux_heartbeat_ms``, ``linux_transient_for`` and ``linux_tile_nofocus``
+    are read (the last two are kill switches: "off" spawns the helper with
+    ``--no-transient`` / ``--no-tile-nofocus`` and the WM_TRANSIENT_FOR
+    keep-above / the "No Input" tiles never run).  Returns None ONLY when this is not a
     Wine process - the one verdict that costs nothing - and then nothing at
     all was started.  Otherwise the backend comes back immediately with its
     supervisor still ``starting``: the caller gates real work on
@@ -1911,12 +1934,21 @@ def make_backend(cfg, log=None):
     except Exception:
         transient = "auto"
     transient_for = transient.strip().lower() != "off"
+    # Same rule for the "No Input" tiles: only the literal "off" disables
+    # them -- an unreadable value must never bring the click bounce back.
+    try:
+        nofocus = str(cfg.get("linux_tile_nofocus", "auto") or "auto")
+    except Exception:
+        nofocus = "auto"
+    tile_nofocus = nofocus.strip().lower() != "off"
     logger.info("[x11] starting helper (fps_cap=%s heartbeat_ms=%s "
-                "transient_for=%s)",
+                "transient_for=%s tile_nofocus=%s)",
                 _ascii(cap), _ascii(heartbeat),
-                _ascii("on" if transient_for else "off"))
+                _ascii("on" if transient_for else "off"),
+                _ascii("on" if tile_nofocus else "off"))
     supervisor = HelperSupervisor(facts=None, log=logger,
-                                  transient_for=transient_for)
+                                  transient_for=transient_for,
+                                  tile_nofocus=tile_nofocus)
     supervisor.start()
     return X11ThumbBackend(supervisor, min_interval_ms=max(1, 1000 // cap),
                            heartbeat_ms=heartbeat)
@@ -2139,9 +2171,11 @@ def _report_wm(snapshot, payload):
     the whole diagnosis is wrong.  Rows come from the probe (read-only), so
     they are ``none`` until one has run.
     """
-    lines = ["mode=%s writes=%s"
+    lines = ["mode=%s writes=%s nofocus=%s nofocus_writes=%s"
              % (_ascii(getattr(snapshot, "transient", "-")),
-                _ascii(getattr(snapshot, "transient_writes", 0)))]
+                _ascii(getattr(snapshot, "transient_writes", 0)),
+                _ascii(getattr(snapshot, "nofocus", "-")),
+                _ascii(getattr(snapshot, "nofocus_writes", 0)))]
     rows = payload.get("wm") if isinstance(payload, dict) else None
     rows = rows if isinstance(rows, list) else []
     shown = 0
@@ -2155,16 +2189,40 @@ def _report_wm(snapshot, payload):
         state = row.get("state")
         state = ",".join(_ascii(s) for s in state) if isinstance(state, list) \
             else "-"
-        lines.append("dst=%s or=%s state=%s transient_for=%s%s"
+        lines.append("dst=%s or=%s state=%s transient_for=%s%s%s"
                      % (_ascii(row.get("dst")),
                         _ascii(row.get("override_redirect")),
                         state or "-",
                         _ascii(row.get("transient_for")),
+                        _nofocus_fields(row),
                         (" error=%s" % (_ascii(row.get("error")),))
                         if row.get("error") else ""))
     if not shown:
         lines.append("none")
     return lines
+
+
+def _nofocus_fields(row):
+    """`` take_focus=yes|no|? input=yes|no|unset|?`` for one ``[wm]`` row.
+
+    A tile is "No Input" -- the WM never offers it focus, so a click no
+    longer bounces focus through FCTool's main window -- when it reads
+    ``take_focus=no`` and ``input=no`` (or ``unset``).  ``?`` = the helper
+    could not read it.  An older helper sends neither key: nothing is
+    rendered then, so its rows read exactly as before.
+    """
+    if "take_focus" not in row and "input" not in row:
+        return ""
+
+    def word(value, unset):
+        if value is True:
+            return "yes"
+        if value is False:
+            return "no"
+        return unset
+
+    return " take_focus=%s input=%s" % (word(row.get("take_focus"), "?"),
+                                        word(row.get("input"), "unset"))
 
 
 def _merge_clients(clients, results):
