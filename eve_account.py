@@ -221,8 +221,11 @@ class AccountMap:
 
     @property
     def revision(self) -> int:
-        """Opaque change counter (see ``__init__``): differs from an earlier
-        read iff what this map knows about chars and accounts has changed."""
+        """Opaque change counter (see ``__init__``): moves whenever what this
+        map knows about chars and accounts changes. Not "iff": it also moves on
+        a change that is later reverted (equal knowledge, new value), and an
+        alias edit -- read live from config, not tracked here -- never moves
+        it even though it can change ``account_for_char`` answers."""
         return self._revision
 
     # -- persistence --------------------------------------------------------

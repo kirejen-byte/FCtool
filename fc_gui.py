@@ -20456,13 +20456,17 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
     _PREVIEW_ACCOUNT_CAP = 3
 
     # Namespace for an ACCOUNT's saved geometry inside preview['layouts'] /
-    # preview['sizes'], which are otherwise keyed by character. One owner:
-    # _preview_layout_key builds it. A character key is a lowercased EVE name
-    # and can never contain a colon, so every namespaced key ("acct:",
-    # "account:", "login:") is told apart from a character by that colon alone
-    # (_preview_all_known_chars, the slot heal).
+    # preview['sizes'], which are otherwise keyed by character. Two builders:
+    # _preview_layout_key (every runtime read and drag write, and the slot the
+    # heal fills) and _preview_seed_account_slots, which composes
+    # "acct:<label>" keys itself when it seeds; keep the two in step. A
+    # character key is a lowercased EVE name and can never contain a colon,
+    # so every namespaced key ("acct:", "account:", "login:") is told apart
+    # from a character by that colon alone (_preview_all_known_chars, the
+    # slot heal).
     # "acct:<label>" = a slot keyed by a MANUAL account label (own or a
-    # same-account sibling's).
+    # same-account sibling's), or, under the account_identity kill switch
+    # only, by an observed account's display label (the legacy key).
     _PREVIEW_ACCOUNT_SLOT_PREFIX = "acct:"
     # "account:<id>" = the slot of an account known only by OBSERVATION (auto
     # slots). Keyed by the ground-truth account id, never by its display label:
