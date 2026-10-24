@@ -30408,9 +30408,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         hand-labelled main's own well-formed entry wins over an alt's for the
         shared slot. Finally `_preview_heal_account_slots` fills the
         "account:<id>" slots of accounts known ONLY by observation -- the key
-        the runtime reads for them since 2026-10-24; this seeder no longer
-        writes the old "acct:<auto label>" keys, which nothing reads any more.
-        Both observed steps read the ground-truth map only and never write
+        the runtime reads for them since 2026-10-24 -- so with identity on,
+        this seeder no longer writes "acct:<auto label>" keys. Under the
+        `account_identity` kill switch the runtime still reads exactly those
+        keys, so there the observed pass groups every unlabelled character by
+        `_preview_effective_account_of` and seeds "acct:<label>", as before
+        id slots existed. Both observed steps read the ground-truth map only and never write
         preview.char_accounts (manual wins, structurally); they are inert when
         no map is present.
 
@@ -30447,8 +30450,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # overwritten by the unified loop below). Inert without a map, which
         # is why the manual behaviour above is unchanged for every no-map host.
         # An account with NO manual label anywhere is not handled here: its
-        # slot is "account:<id>", filled by the heal at the end.
+        # slot is "account:<id>", filled by the heal at the end -- except
+        # under the account_identity kill switch (raw read, absent = on),
+        # where the runtime still keys it "acct:<display label>": there the
+        # pass groups by `_preview_effective_account_of`, exactly as before
+        # id slots existed (the heal is inert then).
         amap = getattr(self, "_account_map", None)
+        raw = self.config.get("preview")
+        legacy = isinstance(raw, dict) and not raw.get("account_identity", True)
         if amap is not None:
             manual_keys = set(self._preview_char_accounts())
             candidates = set()
@@ -30465,7 +30474,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             observed: dict = {}
             for nk in candidates:
                 try:
-                    label, acct = FCToolGUI._preview_account_basis(self, nk)
+                    if legacy:
+                        acct = amap.account_for_char(nk)
+                        label = (self._preview_effective_account_of(nk)
+                                 if acct is not None else "")
+                    else:
+                        label, acct = FCToolGUI._preview_account_basis(self, nk)
                 except Exception:
                     continue
                 if label and acct is not None:
