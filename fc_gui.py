@@ -1679,6 +1679,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # client set, so the tick diff never reports it as `added` again.
         self._preview_spawn_retry = {}
         self._preview_eveo_resume = False      # EVE-O gate blocked -> respawn once
+        self._preview_diff_stale = False       # diff base frozen until a tick publishes
         self._preview_intel = {}               # system_id -> (ts, kind)
         # char key -> (system_id, radius, frozenset(system_ids)) — the gate-jump
         # ball the intel flash fires inside. POLLER-WRITTEN (_overlay_build_state),
@@ -21451,12 +21452,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         the visible desktop — see _preview_clamp_saved_rect — so a retitle
         never restores a tile stranded on a disconnected monitor). Saved
         layouts of the OLD key are left untouched (foot-gun fix)."""
-        # On the EVE-O resume tick the diff is STALE: _preview_clients stayed
-        # frozen at the snapshot taken when EVE-O opened, so every title change
-        # of the whole session arrives at once, possibly hours after the login.
-        # That is a hand-over of already-logged-in clients, not an identity
-        # moment: never pin from it (it would yank hand-placed windows).
-        stale = getattr(self, "_preview_eveo_resume", False)
+        # While the diff is STALE, _preview_clients is frozen at the snapshot
+        # taken when EVE-O opened, so every title change of the whole session
+        # arrives at once, possibly hours after the login. That is a hand-over
+        # of already-logged-in clients, not an identity moment: never pin from
+        # it (it would yank hand-placed windows). Unlike the one-shot resume
+        # flag, this stays set until a tick PUBLISHES, so a resume tick that
+        # raised before the publish cannot leak a late pin onto the next one.
+        stale = getattr(self, "_preview_diff_stale", False)
         tile = self._preview_tiles.get(new.hwnd)
         if tile is None:
             self._preview_spawn_tile(new)
@@ -23764,6 +23767,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # EVE-O closes the diff reports nobody `added`: arm a ONE-SHOT
             # respawn for the first normal tick (consumed after the spawn loop).
             self._preview_eveo_resume = True
+            self._preview_diff_stale = True        # cleared only by a publish
             return "○ EVE-O Preview detected — close it to enable native previews"
         # Linux/X11: while the helper is still coming up, do NOTHING this tick.
         # X11ThumbBackend.register raises OSError instantly while not ready, so
@@ -24054,6 +24058,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # captions: both resolve char keys against the live set (activation
             # by key needs the just-diffed `cur`, not the previous tick's set).
             self._preview_clients = cur
+            self._preview_diff_stale = False       # the diff base is fresh again
             # "Hotkeys only while EVE is focused": suspend/resume the global
             # registrations on the FOREGROUND edge, reusing the fg_info sampled
             # above. Sitting here is LOCALITY, not a dependency — it reads no
@@ -24410,6 +24415,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # and the next enable spawns everything fresh anyway.
         self._preview_spawn_retry = {}
         self._preview_eveo_resume = False     # the EVE-O respawn edge is session state
+        self._preview_diff_stale = False
         self._preview_retire_all_tiles()
         self._preview_clients = {}
         # The active-highlight anchor is an HWND, i.e. session state: hwnds do
