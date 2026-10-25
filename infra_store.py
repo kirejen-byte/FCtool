@@ -44,8 +44,10 @@ NOT interchangeable with ``last_seen``:
   naive stamp means.
 * ``miss_count`` - how many CONSECUTIVE completed scan passes a fully-searched
   system failed to return this structure (``bump_miss``). Any sighting (any
-  upsert, ping included) resets it to 0, so a consumer can require a structure
-  to be missed more than once before marking it dead. Neither field ever
+  upsert, ping included) resets it to 0, and so does an explicit
+  ``set_status(key, "alive")`` (a record declared alive has no run of misses),
+  so a consumer can require a structure to be missed more than once before
+  marking it dead. Neither field ever
   contributes to a MergeReport's "updated" tally - a bare ping stays
   "unchanged".
 
@@ -516,11 +518,28 @@ class InfraStore:
         return removed
 
     def set_status(self, key: str, status: str) -> None:
+        """Set a record's status (atomic save); silent no-op for an unknown key.
+
+        Setting exactly ``"alive"`` also resets ``miss_count`` to 0: a record
+        explicitly declared alive has, by definition, no run of consecutive
+        misses. Without this a "Mark alive" on a record sitting at two misses
+        would be bumped to three by the next scan of its system and hidden again
+        at once. It lives here, not in the dialog, so every caller gets it. Any
+        other status (``"dead"``, which the reaper itself writes) leaves the
+        counter alone.
+
+        This only helps a structure hidden by a transient run of misses. It
+        cannot save one the search can never find again (e.g. renamed in-game so
+        its name no longer contains its system's name): that is missed twice
+        more and hidden again. The durable exemption for that case is the
+        ``reinforced`` flag (``set_reinforced``)."""
         with self._lock:
             entry = self._entries.get(key)
             if entry is None:
                 return
             entry["status"] = status
+            if status == "alive":
+                entry["miss_count"] = 0
             self._save_or_defer()
 
     def set_notes(self, key: str, notes: str) -> None:
