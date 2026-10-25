@@ -17,6 +17,34 @@ The store resolves ``system_id``/``region_id`` (and an Ansiblex's
 ``gate_to_system_id``) from an injected ``system_lookup`` (casefolded
 system_name -> (system_id, region_id)); with no lookup those stay ``None``.
 
+Two record fields serve the scanner's freshness bookkeeping and are deliberately
+NOT interchangeable with ``last_seen``:
+
+* ``last_resolved`` - aware-UTC ISO stamp of the last update that came from a
+  FULL ESI ``/universe/structures/{id}/`` resolve, i.e. the last time ``name``
+  and ``owner_id`` were actually re-read from the server. ``last_seen`` is a
+  *sighting* stamp: the scanner bumps it on every pass with a cheap
+  ``{"structure_id": ..., "status": "alive"}`` ping that carries no owner or name,
+  so ``last_seen`` can be minutes old on a record whose owner has been wrong for
+  months (a sold Fortizar keeps its former owner's id forever). Only an incoming
+  row that sets ``resolved`` truthy stamps ``last_resolved``, which lets a
+  consumer re-resolve on a TTL. An empty string means NEVER resolved - records
+  written before this field therefore all re-resolve once, which is the point:
+  that one-time refresh is what repairs the frozen owner ids. It is NEVER
+  backfilled from ``first_seen``/``last_seen`` (that would suppress the refresh),
+  and a non-string stored value reads as "" (treat an unparsable stamp as never
+  resolved).
+* ``miss_count`` - how many CONSECUTIVE completed scan passes a fully-searched
+  system failed to return this structure (``bump_miss``). Any sighting (any
+  upsert, ping included) resets it to 0, so a consumer can require a structure
+  to be missed more than once before marking it dead. Neither field ever
+  contributes to a MergeReport's "updated" tally - a bare ping stays
+  "unchanged".
+
+The incoming-row flag ``resolved`` is explicit and is never inferred from the
+presence of a ``type_id``: a clipboard paste (`infra_parser`) can carry a
+type_id without having spoken to ESI, and must not look like a resolve.
+
 Thread-safe (`threading.RLock`); every mutator persists — unless the calling
 thread has an open `deferred_save()` batch (see below), which collapses a
 multi-mutation run (e.g. a region scan's per-system loop) into one on-disk
@@ -58,6 +86,14 @@ _ENTRY_DEFAULTS: dict = {
     "source": "manual",
     "first_seen": "",
     "last_seen": "",
+    # When this record last came back from a FULL ESI structure resolve (aware
+    # UTC ISO), as opposed to the cheap "still alive" ping that bumps last_seen
+    # on every scan pass. "" = never resolved. See the module docstring: never
+    # backfilled from first_seen/last_seen.
+    "last_resolved": "",
+    # Consecutive completed scan passes in which a fully-searched system did not
+    # return this structure. Any sighting resets it to 0 (see bump_miss).
+    "miss_count": 0,
     "status": "alive",
     "notes": "",
     # Manual "reinforced/offline" flag (separate from status): a reinforced
@@ -76,6 +112,22 @@ def _as_int(value):
         return int(value)
     except (TypeError, ValueError):
         return None
+
+
+def _as_count(value) -> int:
+    """Coerce to a non-negative miss count, or 0.
+
+    Anything that is not a sane count reads as 0 - None, "", "abc", a negative,
+    a list/dict, a float (``2.7`` is 0, never a silently truncated 2) - and
+    bools are rejected by ``_as_int`` by design, so True/False are 0 rather than
+    1/0. An integral string ("3") is accepted, matching ``_as_int``'s tolerance
+    for a hand-edited file."""
+    if isinstance(value, float):
+        return 0
+    num = _as_int(value)
+    if num is None or num < 0:
+        return 0
+    return num
 
 
 class InfraStore:
@@ -189,6 +241,12 @@ class InfraStore:
         entry["status"] = entry["status"] or "alive"
         entry["notes"] = entry["notes"] or ""
         entry["reinforced"] = bool(entry["reinforced"])   # tolerate any JSON shape
+        entry["miss_count"] = _as_count(entry["miss_count"])
+        # "" means NEVER resolved and is deliberately NOT backfilled from
+        # first_seen/last_seen: every pre-existing record must re-resolve once
+        # (that refresh is what repairs owner ids frozen by the cheap ping).
+        if not isinstance(entry["last_resolved"], str):
+            entry["last_resolved"] = ""
         if not entry["first_seen"]:
             entry["first_seen"] = self._now_iso()
         if not entry["last_seen"]:
@@ -305,6 +363,11 @@ class InfraStore:
             "position": raw.get("position"),
             "status": raw.get("status") or None,
             "notes": raw.get("notes") or None,
+            # Explicit "this row came from a FULL ESI structure resolve" flag.
+            # NEVER inferred from type_id: a clipboard paste can carry one
+            # without having spoken to ESI, and must not stamp last_resolved
+            # (that would suppress the re-resolve TTL).
+            "resolved": bool(raw.get("resolved")),
         }
         if inc["system_name"] and (inc["system_id"] is None or inc["region_id"] is None):
             hit = self._lookup.get(inc["system_name"].casefold())
@@ -330,7 +393,13 @@ class InfraStore:
         """Overlay MEANINGFUL incoming fields onto ``entry`` (None / "" / a
         downgrade-to-"unknown" category never wipe a good value), refresh source
         and status, and bump last_seen. Returns True if any persistent field
-        (other than last_seen, which always bumps) changed."""
+        (other than last_seen, which always bumps) changed.
+
+        ``last_resolved`` and ``miss_count`` are bookkeeping, NOT content: like
+        last_seen they are deliberately excluded from ``changed``, so a bare
+        "still alive" ping keeps reporting "unchanged" in the MergeReport. They
+        still persist - ``upsert_many`` calls ``_save_or_defer()`` once after
+        its loop regardless of what any row reported."""
         changed = False
         if inc["type_id"] is not None:
             changed |= self._set(entry, "type_id", inc["type_id"])
@@ -357,6 +426,11 @@ class InfraStore:
         changed |= self._set(entry, "source", source)
         changed |= self._set(entry, "status", inc["status"] or "alive")
         entry["last_seen"] = now
+        if inc["resolved"]:
+            entry["last_resolved"] = now
+        # Any upsert at all is a sighting: the structure was returned on this
+        # pass, so the CONSECUTIVE-miss run ends here.
+        entry["miss_count"] = 0
         return changed
 
     def _new_entry(self, inc: dict, source: str, now: str) -> dict:
@@ -463,6 +537,30 @@ class InfraStore:
                 return
             entry["reinforced"] = bool(reinforced)
             self._save_or_defer()
+
+    def bump_miss(self, key: str) -> int:
+        """Count one more consecutive scan-pass miss for a record; return the
+        NEW count (0 for an unknown key).
+
+        A "miss" is a structure that a FULLY searched system did not return -
+        the caller owns that judgement (a failed or empty search is not a miss).
+        Any sighting resets the counter to 0 (see ``_apply_incoming``), so the
+        value is a run length, which lets a consumer require a structure to be
+        missed more than once before acting on it.
+
+        Mirrors ``set_status``/``set_notes``: RLock-guarded, silent no-op
+        returning 0 for an unknown key, and persisted through the deferred-save
+        choke point - NOT ``save()`` - so a reaper looping over N misses inside
+        an open ``deferred_save()`` batch still costs ONE whole-file write. A
+        corrupt stored value counts as 0 before the increment."""
+        with self._lock:
+            entry = self._entries.get(key)
+            if entry is None:
+                return 0
+            count = _as_count(entry.get("miss_count")) + 1
+            entry["miss_count"] = count
+            self._save_or_defer()
+            return count
 
     # ── Read views ────────────────────────────────────────────────────────────
 
