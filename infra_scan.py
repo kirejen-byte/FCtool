@@ -13,6 +13,16 @@ Architecture (plan §2): may import ``esi_auth`` (owned this wave), ``map_data``
 (``auth``/``store``/``model``/``ui_post``) are injected instances, duck-typed, so
 the unit tests drive it with fakes.
 
+Freshness (2026-10-24): an already-typed structure is NOT resolved again on
+every pass -- it gets a cheap ``{"structure_id": ..., "status": "alive"}`` ping
+that bumps ``last_seen`` only -- but that skip is now gated on a ``RESOLVE_TTL_S``
+(7 day) re-resolve TTL read from the record's ``last_resolved`` stamp, because a
+ping carries no owner or name: before the TTL, ``owner_id`` and ``name`` froze
+permanently after the FIRST resolve (780 of the owner's 784 alive records, one
+of them a Fortizar still naming its former owner three months after the sale).
+Gates stay exempt from the skip entirely (the phantom-bridge self-heal), and a
+structure the store has NO type for is always resolved.
+
 Governor (plan §3.5): after EVERY ESI call it inspects the
 ``X-ESI-Error-Limit-Remain``/``-Reset`` headers that ``esi_get_ex`` surfaces; on
 a 420 or a remaining budget below ``ERROR_FLOOR`` it sleeps out the reset window
@@ -60,6 +70,7 @@ class InfraScanner:
     ERROR_FLOOR = 20             # pause when X-ESI-Error-Limit-Remain < this
     MAX_403_STREAK = 30          # abort resolve phase for this scan after N straight 403s
     RESCAN_GATE_S = 3600         # skip systems searched within the last hour (server cache)
+    RESOLVE_TTL_S = 7 * 24 * 3600   # re-resolve an already-typed structure after this (refreshes owner + name)
     MIN_QUERY_LEN = 3            # ESI /search/ rejects terms shorter than 3 chars
 
     def __init__(self, auth, store, model, ui_post,
@@ -131,12 +142,13 @@ class InfraScanner:
         streak_403 = 0
         found = 0
         errors = 0
-        # Undead-gate reaper bookkeeping (owner "SVM again" bug, 2026-07-23).
+        # Undead-structure reaper bookkeeping (owner "SVM again" bug, 2026-07-23;
+        # generalised past gates 2026-10-24).
         # scan_start = the aware-UTC instant this run began, floored to whole
         # seconds so it can never trail a same-second upsert "seen" bump.
         # scanned_ok = {system_id: system_name} for systems this run FULLY walked
-        # with a SUCCESSFUL, NON-EMPTY search -- the only systems whose gate roster
-        # is trusted as authoritative (see _reap_missing_gates).
+        # with a SUCCESSFUL, NON-EMPTY search -- the only systems whose structure
+        # roster is trusted as authoritative (see _reap_missing_structures).
         scan_start = datetime.now(timezone.utc).replace(microsecond=0)
         scanned_ok: dict[int, str] = {}
 
@@ -167,15 +179,15 @@ class InfraScanner:
                 if search_errored:
                     errors += 1
 
-                known, gate_ids = self._known_ids()
+                typed, gate_ids, fresh = self._known_ids()
                 rows: list[dict] = []
                 system_cancelled = False
                 for sid in ids:
                     if self._cancel.is_set():
                         cancelled = system_cancelled = True
                         break
-                    if sid in known and sid not in gate_ids:
-                        # Already-resolved NON-gate: a light "seen" ping bumps
+                    if sid in fresh and sid not in gate_ids:
+                        # Recently-resolved NON-gate: a light "seen" ping bumps
                         # last_seen without an ESI call and carries NO placement.
                         # It must NEVER restamp system_id/system_name from the
                         # search term (sys_id/sys_name) -- the system we happened to
@@ -183,14 +195,20 @@ class InfraScanner:
                         # phantom-bridge root cause). GATES are deliberately excluded
                         # so they are re-resolved every scan and a mis-filed gate
                         # self-heals to its true solar_system_id (gates are few ->
-                        # negligible budget).
+                        # negligible budget). A structure whose last_resolved is
+                        # older than RESOLVE_TTL_S is NOT in `fresh`, so it falls
+                        # through to a full resolve -- a ping carries no owner_id
+                        # or name, so without that TTL both froze forever.
                         rows.append({"structure_id": sid, "status": "alive"})
                         continue
                     if resolve_aborted:
-                        # A known structure keeps its record on abort (a "seen"
+                        # A TYPED structure keeps its record on abort (a "seen"
                         # bump); only a genuinely new id becomes a placeholder stub.
+                        # Gated on `typed`, NEVER on `fresh`: a stale-but-known
+                        # structure must not be stubbed (a stub restamps its system
+                        # from the search term and downgrades type/category).
                         rows.append({"structure_id": sid, "status": "alive"}
-                                    if sid in known
+                                    if sid in typed
                                     else self._stub(sid, sys_id, sys_name))
                         errors += 1
                         continue
@@ -207,12 +225,15 @@ class InfraScanner:
                         found += 1
                         streak_403 = 0
                     else:
-                        # A KNOWN structure that failed to re-resolve (e.g. a role-
+                        # A TYPED structure that failed to re-resolve (e.g. a role-
                         # gated 403) must NOT be stubbed: a stub restamps its system
                         # from the search term and downgrades type/category. Keep the
                         # existing record with a "seen" bump; only a new id stubs.
+                        # `typed`, NEVER `fresh` -- a structure past the TTL reaches
+                        # this branch precisely BECAUSE it was due a re-resolve, and
+                        # stubbing it would re-introduce the mis-file bug.
                         rows.append({"structure_id": sid, "status": "alive"}
-                                    if sid in known
+                                    if sid in typed
                                     else self._stub(sid, sys_id, sys_name))
                         errors += 1
                         if status == 403:
@@ -235,10 +256,10 @@ class InfraScanner:
                 if not search_errored and ids:
                     scanned_ok[sys_id] = sys_name
 
-            # After the walk (still inside the batch so set_status folds into the
-            # single flush): dead-mark gates a searched system should have returned
-            # but did not -- their Ansiblex is gone from ESI (see below).
-            reaped = self._reap_missing_gates(scanned_ok, scan_start)
+            # After the walk (still inside the batch so bump_miss/set_status fold
+            # into the single flush): dead-mark structures a searched system should
+            # have returned but did not -- they are gone from ESI (see below).
+            reaped = self._reap_missing_structures(scanned_ok, scan_start)
 
         done = dict(report)
         done["cancelled"] = cancelled
@@ -246,43 +267,67 @@ class InfraScanner:
         done["reaped"] = reaped
         self._emit(self.on_done, done)
 
-    def _reap_missing_gates(self, scanned_ok: dict, scan_start) -> int:
-        """Mark ``status='dead'`` any stored ALIVE, non-reinforced GATE that a
-        fully-searched system this run should have returned but did NOT -- its
-        Ansiblex is gone from ESI (unanchored/destroyed). Leaving it 'alive' draws
-        a phantom bridge + a duplicate chip long after the structure died, because
-        it still emits a ``gate_pairs`` pair AND both endpoint systems may still
-        host a DIFFERENT current gate, so ``corroborated_gate_pairs``'s system-level
-        check cannot tell the stale cross-pair from a real bridge (owner "SVM again"
-        bug, 2026-07-23). ``status='dead'`` is the existing hide-but-keep mechanism:
+    def _reap_missing_structures(self, scanned_ok: dict, scan_start) -> int:
+        """Mark ``status='dead'`` any stored ALIVE, non-reinforced structure -- of
+        ANY category -- that a fully-searched system this run should have returned
+        but did NOT, once it has been missed often enough for its category. The
+        structure is gone from ESI (unanchored/destroyed/sold out of the search's
+        reach). Leaving it 'alive' is not harmless: the store's contract is "scan
+        absence NEVER deletes a record" and ``stale`` is only an OPTIONAL display
+        filter, so an undead record renders as a normal live chip forever (296 of
+        them on the owner's live store, 2026-10-24: 214 refinery, 49 citadel, 27
+        engineering, 6 flex, the oldest last seen 2026-07-13). A dead GATE is worse
+        still: it keeps emitting a ``gate_pairs`` pair, and because both endpoint
+        systems may still host a DIFFERENT current gate, ``corroborated_gate_pairs``
+        cannot tell the stale cross-pair from a real bridge -- a phantom bridge in
+        the map AND in jump-range routing (owner "SVM again" bug, 2026-07-23).
+        ``status='dead'`` is the existing hide-but-keep mechanism:
         ``_entry_survives`` drops it from chips/lists and ``gate_pairs`` skips it, so
         the phantom vanishes from map + routing at once; the record is PRESERVED
-        (reversible -- a rebuilt gate flips back to 'alive' on its next sighting).
+        (reversible -- a rebuilt structure flips back to 'alive' on its next
+        sighting, which also zeroes its miss counter).
 
-        Gate-scoped + why that is safe:
-          * Gates are re-resolved EVERY scan (exempt from the known-type skip), and a
-            live gate in system X is named ``"X » Y"`` so ESI's fuzzy NAME
-            ``/search/`` for X returns it -> its record's ``last_seen`` is bumped past
-            ``scan_start``. A gate whose id has vanished from that authoritative
-            search keeps its OLD ``last_seen`` -- the reap signal.
+        TWO STRIKES for a non-gate, ONE for a gate (owner's decision):
+          * ``store.bump_miss`` counts CONSECUTIVE qualifying misses (any upsert at
+            all, the cheap "seen" ping included, resets it to 0), and a non-gate is
+            dead-marked only on the SECOND one. A citadel/refinery missed once is
+            far more likely to be an incomplete ESI search result than a destroyed
+            structure, and a wrongly hidden chip is invisible until the owner
+            notices it is gone.
+          * A GATE still dies on the first miss. That behaviour is field-proven (it
+            fixed the owner's phantom-bridge bug on 2026-07-23) and a phantom
+            bridge corrupts ROUTING, not just a chip, so it must not linger an
+            extra pass.
+
+        Why absence is trustworthy here, and the guards that keep it so:
+          * A live structure in system X is named ``"X - ..."`` (a gate ``"X >> Y"``,
+            whose arrow glyph is immaterial), so ESI's fuzzy NAME ``/search/`` for
+            X returns it -> its record's ``last_seen`` is bumped past
+            ``scan_start``. A structure whose id has
+            vanished from that authoritative search keeps its OLD ``last_seen`` --
+            the miss signal.
           * Only ``scanned_ok`` systems (this run FULLY walked, search SUCCEEDED and
             was NON-EMPTY) are trusted -- a transient errored/empty search never
-            mass-reaps.
-          * Extra guard: reap only when the scanned system's NAME is a substring of
-            the gate's stored name, i.e. the search that ran WOULD have returned this
-            structure if it still existed. Protects a live gate whose name lost its
-            system tag from ever being deaded on absence.
+            mass-reaps, and never even counts a miss.
+          * Extra guard: count a miss only when the scanned system's NAME is a
+            substring of the stored name, i.e. the search that ran WOULD have
+            returned this structure if it still existed. Protects a live structure
+            whose name lost its system tag from ever being deaded on absence.
           * ``reinforced`` is the owner's explicit manual flag -> never auto-reaped.
 
-        Returns the count newly marked dead. No-op (and never calls ``store_key``/
-        ``set_status``) when nothing matches, so FakeStore-driven tests whose
-        ``entries()`` is empty are untouched."""
+        Returns the count NEWLY marked dead this run -- a first miss is not a reap,
+        so the ``on_done`` payload's ``reaped`` keeps meaning "just hidden". No-op
+        (and never calls ``store_key``/``bump_miss``/``set_status``) when nothing
+        matches, so FakeStore-driven tests whose ``entries()`` is empty are
+        untouched. Runs inside the caller's ``deferred_save()`` batch, so N misses
+        still cost ONE whole-file write; the broad except keeps a reaper failure
+        from ever killing a scan."""
         if not scanned_ok:
             return 0
         reaped = 0
         try:
             for e in self.store.entries():
-                if e.get("category") != "gate" or e.get("status") != "alive":
+                if e.get("status") != "alive":
                     continue
                 if e.get("reinforced"):
                     continue
@@ -294,10 +339,13 @@ class InfraScanner:
                 last = self._parse_seen(e.get("last_seen"))
                 if last is not None and last >= scan_start:
                     continue                       # re-seen this run -> still alive
-                self.store.set_status(self.store.store_key(e), "dead")
-                reaped += 1
+                n = self.store.bump_miss(self.store.store_key(e))
+                limit = 1 if e.get("category") == "gate" else 2
+                if n >= limit:
+                    self.store.set_status(self.store.store_key(e), "dead")
+                    reaped += 1
         except Exception:
-            log.exception("[infra-scan] gate reaper failed")
+            log.exception("[infra-scan] structure reaper failed")
         return reaped
 
     @staticmethod
@@ -351,15 +399,35 @@ class InfraScanner:
         return queue
 
     def _known_ids(self):
-        """``(typed_ids, gate_ids)`` from ONE store pass.
+        """``(typed_ids, gate_ids, fresh_ids)`` from ONE store pass.
 
-        ``typed_ids``: structures the store already has a type_id for -- skipped from
-        re-resolution (their type never changes) to save error budget.
-        ``gate_ids``: structures of category ``gate`` -- the caller EXEMPTS these
-        from that skip so a mis-filed gate is re-resolved every scan and self-heals
-        to its true ``solar_system_id`` (the phantom-bridge heal). Gates are few, so
-        re-resolving them is negligible against the budget."""
-        typed, gates = set(), set()
+        ``typed_ids``: structures the store already has a ``type_id`` for.
+        ``gate_ids``: structures of category ``gate``.
+        ``fresh_ids``: the subset of ``typed_ids`` whose ``last_resolved`` parses to
+        an instant within ``RESOLVE_TTL_S`` of now. An empty, absent or unparsable
+        stamp means NOT fresh (``""`` = never resolved, which is every record
+        written before the field existed -- their one-time refresh is the point).
+
+        The two gates the caller applies are DELIBERATELY different sets, and
+        conflating them re-introduces a fixed bug:
+
+        * ``fresh`` + not ``gate_ids`` drives the cheap-ping SKIP: no ESI call, no
+          placement. Gates are exempt so a mis-filed gate re-resolves every scan
+          and self-heals to its true ``solar_system_id`` (the phantom-bridge heal);
+          they are few, so the budget cost is negligible.
+        * ``typed`` alone drives the "a resolve that FAILED keeps the existing
+          record instead of stubbing it" decision, in BOTH failure branches. If
+          that decision were moved onto ``fresh``, a stale structure whose resolve
+          403s (role-gated structures 403 by design) would be ``_stub``bed -- and a
+          stub restamps ``system_id``/``system_name`` from the SEARCH TERM and
+          downgrades type/category, i.e. exactly the phantom-bridge mis-file fixed
+          in July (see ``tests/test_infra_scan_heal.py``).
+
+        Timestamp parsing is the module's existing ``_within`` helper (tolerant:
+        junk/None/naive all handled), so the TTL can never raise out of here; an
+        unavailable store yields three empty sets."""
+        typed, gates, fresh = set(), set(), set()
+        now = datetime.now(timezone.utc)
         try:
             for e in self.store.entries():
                 sid = e.get("structure_id")
@@ -367,11 +435,13 @@ class InfraScanner:
                     continue
                 if e.get("type_id") is not None:
                     typed.add(sid)
+                    if self._within(e.get("last_resolved"), now, self.RESOLVE_TTL_S):
+                        fresh.add(sid)
                 if e.get("category") == "gate":
                     gates.add(sid)
         except Exception:
             log.debug("[infra-scan] store.entries() failed", exc_info=True)
-        return typed, gates
+        return typed, gates, fresh
 
     @staticmethod
     def _stub(sid, sys_id, sys_name):
@@ -406,7 +476,13 @@ class InfraScanner:
         mis-filed those gates and drew phantom bridges (owner bug, 2026-07-22).
         ``name_of`` (the injected ``self._system_name``) resolves the true id ->
         canonical name locally (no ESI); it falls back to ``sys_id``/``sys_name``
-        only when ``solar_system_id`` is absent or unknown to the local map model."""
+        only when ``solar_system_id`` is absent or unknown to the local map model.
+
+        The row carries ``resolved: True`` -- the store's explicit "this came from a
+        FULL /universe/structures/ read" flag, which stamps ``last_resolved`` and so
+        restarts the ``RESOLVE_TTL_S`` clock. It is the ONLY place in the scanner
+        that sets it: neither ``_stub`` nor the cheap "seen" ping may, or the TTL
+        would be suppressed and the owner/name freeze (bug A) would return."""
         pos = info.get("position")
         position = None
         if isinstance(pos, dict) and all(k in pos for k in ("x", "y", "z")):
@@ -426,6 +502,7 @@ class InfraScanner:
             "owner_id": info.get("owner_id"),
             "position": position,
             "status": "alive",
+            "resolved": True,
         }
 
     # ── governor + helpers ─────────────────────────────────────────────────────
