@@ -281,6 +281,7 @@ class InfraManagerDialog(tk.Toplevel):
         self._add_btn = mkbtn("Add manual…", self._open_add_manual)
         self._reverify_btn = mkbtn("Re-verify selected", self._on_reverify)
         self._markdead_btn = mkbtn("Mark dead", self._on_mark_dead)
+        self._markalive_btn = mkbtn("Mark alive", self._on_mark_alive)
         self._reinforced_btn = mkbtn("Toggle reinforced", self._on_toggle_reinforced)
         self._delete_btn = mkbtn("Delete", self._on_delete)
 
@@ -598,6 +599,22 @@ class InfraManagerDialog(tk.Toplevel):
         self._on_changed()
         self._reload_tree()
         self._set_status(f"Marked {len(keys)} dead.")
+
+    def _on_mark_alive(self):
+        """Undo a dead mark (the reaper's or the owner's). Reversible and
+        non-destructive -> NO confirm, like the reinforced toggle."""
+        keys = self._selected_keys()
+        if not keys:
+            self._set_status("Select rows to mark alive.")
+            return
+        for k in keys:
+            try:
+                self.store.set_status(k, "alive")
+            except Exception as exc:
+                log.warning("infra store.set_status failed: %s", exc)
+        self._on_changed()
+        self._reload_tree()
+        self._set_status(f"Marked {len(keys)} alive.")
 
     def _on_toggle_reinforced(self):
         """Toggle the manual reinforced/offline flag on the selected rows.
@@ -946,6 +963,7 @@ class InfraManagerDialog(tk.Toplevel):
         menu.add_command(label="Edit…", command=self._on_edit_selected)
         menu.add_command(label="Re-verify selected", command=self._on_reverify)
         menu.add_command(label="Mark dead", command=self._on_mark_dead)
+        menu.add_command(label="Mark alive", command=self._on_mark_alive)
         menu.add_command(label="Toggle reinforced",
                          command=self._on_toggle_reinforced)
         menu.add_command(label="Delete", command=self._on_delete)
