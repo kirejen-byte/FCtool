@@ -681,7 +681,12 @@ class InfraManagerDialog(tk.Toplevel):
 
     def push_scan_done(self, report):
         """Format an InfraScanner on_done payload (MergeReport + cancelled/
-        resolve_aborted flags) and ALWAYS append the role-gated caveat (§6)."""
+        resolve_aborted flags) and ALWAYS append the role-gated caveat (§6).
+
+        A non-zero ``reaped`` count gets its OWN clause after the counters
+        ("; N no longer found (hidden)") - it is records HIDDEN, not merged, so
+        it is kept out of the counter list. The records are preserved and come
+        back on the next sighting. Zero/absent/junk adds nothing."""
         r = report or {}
         parts = ", ".join(f"{k} {r.get(k, 0)}" for k in
                           ("added", "updated", "upgraded", "unchanged") if k in r)
@@ -691,6 +696,12 @@ class InfraManagerDialog(tk.Toplevel):
         if r.get("resolve_aborted"):
             flags.append("resolve aborted (403 streak)")
         line = "Scan complete" + (f": {parts}" if parts else "")
+        try:
+            reaped = int(r.get("reaped") or 0)
+        except (TypeError, ValueError):
+            reaped = 0
+        if reaped > 0:
+            line += f"; {reaped} no longer found (hidden)"
         if flags:
             line += " (" + ", ".join(flags) + ")"
         line += "  " + SCAN_CAVEAT
