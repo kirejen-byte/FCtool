@@ -341,9 +341,10 @@ class InfraScanner:
                     # unanchored or sold, so its absence from the authed
                     # structure /search/ can never mean it is gone -- reaping one
                     # is always a false positive. ``categorize`` files any
-                    # structure_id < 1e9 as "npc" and such ids are fixture-proven
-                    # to come back from the search, so a scan really can create
-                    # one of these records; this guard is what makes that safe.
+                    # structure_id < 1e9 as "npc", so such a record CAN exist in
+                    # the store (a clipboard import with NPC stations included
+                    # is one route); this guard makes that safe whether or not
+                    # the authed search ever returns one.
                     continue
                 if e.get("source") != "esi_scan":
                     # Only a record ESI ITSELF discovered is reapable. A
@@ -365,10 +366,11 @@ class InfraScanner:
                 last = self._parse_seen(e.get("last_seen"))
                 if last is not None and last >= scan_start:
                     continue                       # re-seen this run -> still alive
-                n = self.store.bump_miss(self.store.store_key(e))
+                key = self.store.store_key(e)
+                n = self.store.bump_miss(key)
                 limit = 1 if e.get("category") == "gate" else 2
                 if n >= limit:
-                    self.store.set_status(self.store.store_key(e), "dead")
+                    self.store.set_status(key, "dead")
                     reaped += 1
         except Exception:
             log.exception("[infra-scan] structure reaper failed")
