@@ -31,9 +31,17 @@ NOT interchangeable with ``last_seen``:
   consumer re-resolve on a TTL. An empty string means NEVER resolved - records
   written before this field therefore all re-resolve once, which is the point:
   that one-time refresh is what repairs the frozen owner ids. It is NEVER
-  backfilled from ``first_seen``/``last_seen`` (that would suppress the refresh),
-  and a non-string stored value reads as "" (treat an unparsable stamp as never
-  resolved).
+  backfilled from ``first_seen``/``last_seen`` (that would suppress the refresh).
+  ``_coerce_entry`` normalises only a non-STRING stored value to "": an
+  unparsable string ("garbage", "   ", "2026-13-45T99:99:99") is passed through
+  verbatim, and so is a string that parses but is NAIVE ("2026-07-13"), which is
+  the sharp one - comparing it with an aware ``datetime.now(timezone.utc)``
+  raises ``TypeError``, not the ``ValueError`` an unparsable stamp would. So a
+  consumer MUST tolerate both (the scanner's ``_within`` does: it catches
+  ``(TypeError, ValueError)`` and coerces a naive stamp to UTC). Parsing or
+  normalising the string here is deliberately OUT of scope - the consumer
+  absorbs it, and normalising fully would force a separate decision about what a
+  naive stamp means.
 * ``miss_count`` - how many CONSECUTIVE completed scan passes a fully-searched
   system failed to return this structure (``bump_miss``). Any sighting (any
   upsert, ping included) resets it to 0, so a consumer can require a structure

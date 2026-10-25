@@ -314,6 +314,11 @@ class InfraScanner:
             returned this structure if it still existed. Protects a live structure
             whose name lost its system tag from ever being deaded on absence.
           * ``reinforced`` is the owner's explicit manual flag -> never auto-reaped.
+          * Category ``npc`` is EXEMPT: an NPC station is indestructible, so its
+            absence carries no information and a reap is always a false positive.
+          * A record whose ``source`` is not ``esi_scan`` is EXEMPT: ESI never
+            confirmed it (it was pasted or typed from in-game info), so absence
+            proves nothing. Self-correcting -- a sighting rewrites the source.
 
         Returns the count NEWLY marked dead this run -- a first miss is not a reap,
         so the ``on_done`` payload's ``reaped`` keeps meaning "just hidden". No-op
@@ -330,6 +335,27 @@ class InfraScanner:
                 if e.get("status") != "alive":
                     continue
                 if e.get("reinforced"):
+                    continue
+                if e.get("category") == "npc":
+                    # An NPC station is INDESTRUCTIBLE: it cannot be destroyed,
+                    # unanchored or sold, so its absence from the authed
+                    # structure /search/ can never mean it is gone -- reaping one
+                    # is always a false positive. ``categorize`` files any
+                    # structure_id < 1e9 as "npc" and such ids are fixture-proven
+                    # to come back from the search, so a scan really can create
+                    # one of these records; this guard is what makes that safe.
+                    continue
+                if e.get("source") != "esi_scan":
+                    # Only a record ESI ITSELF discovered is reapable. A
+                    # clipboard-pasted or manually added record (``infra_parser``
+                    # writes source "clipboard"; the manual-add path "manual")
+                    # was typed from in-game information and may never appear in
+                    # the authed search at all, so its absence proves nothing --
+                    # dead-marking it contradicts the store's "absence is not
+                    # destruction" philosophy for unproven records. SELF-
+                    # CORRECTING: the moment a scan sights such a record,
+                    # ``_apply_incoming`` overwrites its source with "esi_scan",
+                    # so it becomes reapable once ESI has actually confirmed it.
                     continue
                 sys_name = scanned_ok.get(e.get("system_id"))
                 if not sys_name:
