@@ -43,28 +43,33 @@ loudest event this feature exists to surface must never be demoted.  A cased
 ``"NPC"`` is therefore a player too -- the parser emits lower case, and
 guessing at a variant it does not emit would be the unsafe direction.
 
-THE REPLAY GUARD (spec 10.3, corrected 2026-10-30).  The gamelog tailer
-re-reads a rotated or truncated file FROM POSITION ZERO and replays it.
-Windows expire on arrival time, so an unguarded replay lights every icon on a
-tile at once for up to 30 s -- the one failure this feature cannot have.
+===========================================================================
+THE REPLAY GUARD (spec 10.3, corrected twice on 2026-10-30)
+===========================================================================
 
-Comparing log stamps only to EACH OTHER does not catch it, which is what the
-first cut of this module got wrong: a replayed file is internally consistent
-and monotonically increasing, so its newest lines always look fresh relative
-to the ones before them.  A three-hour-old fight replayed after a truncation
-lit four icons on a calm tile.
+The gamelog tailer re-reads a rotated or truncated file FROM POSITION ZERO and
+replays it.  Windows expire on arrival time, so an unguarded replay lights
+every icon on a tile at once for up to 30 s -- the one failure this feature
+cannot have.  Two earlier rules were implemented faithfully and measured not to
+work; both corrections are recorded here because each looks like
+over-engineering without its counter-example.
 
-So log-stamp space is ANCHORED to the monotonic clock, per character:
+**What does not work (correction 1):** comparing log stamps only to EACH
+OTHER.  A replayed file is internally consistent and monotonically increasing,
+so its newest lines always look fresh relative to the ones before them.  A
+three-hour-old fight replayed after a truncation lit four icons on a calm tile.
 
-  - ``newest`` is the newest accepted stamp and ``newest_at`` the monotonic
+**The rule.**  Log-stamp space is ANCHORED to the monotonic clock:
+
+  - ``_newest`` is the newest accepted stamp and ``_newest_at`` the monotonic
     reading when it was accepted -- together, one point of correspondence
     between the two clocks.
-  - a line's EXPECTED arrival is ``newest_at + (stamp - newest)``;
+  - a line's EXPECTED arrival is ``_newest_at + (stamp - _newest)``;
     it is accepted only while ``abs(now - expected) <= _REPLAY_SKEW_S``.
   - the anchor advances on every ACCEPTED stamped line, in either direction.
-    Forward-only advance was the other half of the original bug: one line
-    stamped ahead of real time would make every later genuine line read as
-    stale for the rest of the session, silently.
+    Forward-only advance was half of the original bug: one line stamped ahead
+    of real time made every later genuine line read as stale, for the rest of
+    the session, silently.
   - the hold is armed from the line's OWN AGE:
     ``until = now + window - max(0, now - expected)``.  That subtrahend is
     zero for a line arriving in step with the clock, so the normal path is
@@ -72,53 +77,93 @@ So log-stamp space is ANCHORED to the monotonic clock, per character:
 
 Only deltas on each clock are ever compared -- never one clock's reading
 against the other's -- so this needs no agreement between EVE's UTC stamps and
-the Windows monotonic clock, and no clock-skew reasoning.
+the Windows clock, and a mis-set system clock cannot break it.
 
-Note the bound is two-sided.  Bounding the FUTURE side is what makes a
-future-dated line cost only itself: it is discarded and leaves the anchor
-untouched, so the next genuine line is judged against the anchor it should be.
+**THE ANCHOR IS TRACKER-GLOBAL, NOT PER CHARACTER (correction 2).**  A
+per-character anchor was the first attempt, and the cost was measured rather
+than reasoned about: a replay that is a character's FIRST EWAR of the session
+has no anchor to be judged against, and it arms FOUR icons at their FULL 30 s
+window with the border red -- the whole of anti-goal 4, not the "last few
+seconds" an earlier draft of the spec claimed.  The arithmetic is the part
+worth keeping: in a fast-forward replay each line arrives EARLY against the
+anchor its predecessor just set, and age-based arming only trims LATE lines,
+so it trims nothing at all.  Every stamp gap from 1 s to 120 s armed at least
+one full window.
 
-An unparsable stamp is still ACCEPTED, with age 0, and still leaves the anchor
-untouched: the guard only ever compares log timestamps to each other, so it
-has no opinion when it cannot read one.  Dropping instead would silence the
-feature outright on any client whose stamp format this parser misses.
+Every EVE client on the machine stamps its logs from the same clock, so one
+anchor is sound for all of them -- and a character's first line is then judged
+against an anchor that already exists.  The alternative, arming nothing on a
+first line, was rejected: it throws away a genuine scramble icon, and tackle
+logs once and never again.
 
-TWO RESIDUALS, accepted rather than fixed:
+**RE-ANCHOR AFTER SUSTAINED REJECTION.**  Bounding the future side introduced a
+failure of its own, and a worse one: a wall-clock STEP larger than the skew --
+NTP step correction, a manual clock fix, a VM resume, a dual-boot UTC mismatch
+-- makes every later line read as out of step, and a rejected line never
+re-anchors, so the feature went silent permanently and with no symptom.  (The
+rule this replaced survived a forward step, so that was a regression, not a
+trade.)  So: when every stamped line has been rejected for more than
+:data:`_REPLAY_SKEW_S` of MONOTONIC time, the next one re-anchors instead.
+This separates the two cases by the shape of their rejections rather than by
+guesswork -- a replay's rejections arrive as a burst within a second or two and
+never reach the threshold, while a clock step's persist and do.  The normal
+path is untouched: one accepted line clears the streak.
 
-  1. A replay that is a character's FIRST EWAR of the session has no anchor to
-     be judged against, so its newest lines read as live.  Age-based arming
-     keeps that to the last few seconds of the replayed file, and the monitor
-     seeds new files at EOF so a cold start never backfills -- which is what
-     makes this narrow.  The same hole swallows a FIRST line stamped far ahead
-     of real time: it becomes the anchor, and every later genuine line then
-     reads as a replay for the rest of the session.
-  2. A long DESCENDING staircase of sub-skew backward hops walks the anchor
-     backwards (each hop is accepted but, being older than its own window,
-     arms nothing).  Far enough back and the live stream starts failing the
-     future-side bound.  Real gamelogs do not do this -- stamps within a file
-     never decrease -- and the price of the alternative is residual 1's
-     silence class, which is worse.
+An unparsable stamp is still ACCEPTED, with age 0, and leaves both the anchor
+and the rejection streak untouched: the guard only ever compares log timestamps
+to each other, so it has no opinion when it cannot read one, and a line it
+cannot read is not evidence either way about the stream.  Dropping instead
+would silence the feature outright on any client whose stamp format this parser
+misses.
+
+**TWO RESIDUALS, accepted rather than fixed.**
+
+  1. The tracker's VERY FIRST stamped line has no anchor to be judged against
+     and becomes one, so a replay arriving as the whole session's first EWAR
+     still arms.  The global anchor removes this for every character after the
+     first line, and the monitor seeds new files at EOF so a cold start never
+     backfills -- which is what makes the remainder narrow.  The same hole
+     swallows a first line stamped far ahead of real time; the re-anchor rule
+     above bounds that to roughly one skew window rather than the session.
+  2. A DESCENDING run of backward stamp hops walks the anchor backwards, and
+     TWO hops of 50 s are already enough to start rejecting live traffic --
+     which, before the re-anchor rule, meant permanent silence; it is now
+     bounded to roughly one skew window.  This is accepted ON MEASUREMENT, not
+     assumption: a scan of 2,669,525 stamped lines across 13,580 archive files
+     found ZERO files with any stamp decrease, and zero decreases in the
+     9,187-line incoming-EWAR sequence this tracker actually sees.
+
+===========================================================================
 
 NEVER RAISES, for any input.  This is read from fc_gui's per-tile ``try`` on
 every FCPreview tick: an exception escaping here retires the tile, and five
 failed ticks disable every preview.  So a character key that is not a
-non-empty, hashable string, a malformed hit, a non-finite ``now`` and an
-effect outside :data:`ewar_parse.ICON_ORDER` are each dropped in silence
-rather than coerced onto some other key, and the readers answer "nothing
-live" for a ``now`` they cannot use.  The hit is read behind a broad
-``except Exception`` on purpose, not behind ``except AttributeError``: the
-realistic shape change is a dataclass that grows a COMPUTED field, whose
-property raises something else entirely, and that is precisely the case the
-guard exists for.  ``cycle_ms_for`` carries the same contract, for the same
-reason, for module names and amounts.
+non-empty string, a malformed hit, a non-finite ``now`` and an effect outside
+:data:`ewar_parse.ICON_ORDER` are each dropped in silence rather than coerced
+onto some other key, and the readers answer "nothing live" for a ``now`` they
+cannot use.  Two guards are deliberately broader than they look:
+
+  - the hit is read behind ``except Exception``, not ``except
+    AttributeError``.  The realistic shape change is a dataclass that grows a
+    COMPUTED field, whose property raises something else entirely, and that is
+    precisely the case the guard exists for.
+  - a ``str`` SUBCLASS key is normalised to an exact ``str`` before it reaches
+    any dict here (see :func:`_as_key`), because an overridden ``__hash__`` or
+    ``__eq__`` raises INSIDE this module's own lookups, where no caller's
+    ``try`` is watching.
+
+``cycle_ms_for`` carries the same never-raises contract, for the same reason,
+for module names and amounts.
 
 BOUNDED MEMORY.  At most :data:`_MAX_CHARS` character records; seven hold
 entries per record are reachable (one per effect for a player, plus NPC
 scramble and disruption -- the other three NPC effects are never stored),
-within an ``(effect, cls)`` key space of ten.  A record with no live hold that
-has seen no event for :data:`_IDLE_RETENTION_S` is dropped when the next new
-character arrives, and the cap behind it evicts a record with no live hold
-before one with (see :meth:`EwarTracker._prune`).
+within an ``(effect, cls)`` key space of ten.  A record is created only when a
+hold is actually stored, so a rejected, dropped or fully-aged line costs no
+memory at all.  A record with no live hold that has seen no stored hold for
+:data:`_IDLE_RETENTION_S` is dropped when the next new character arrives, and
+the cap behind it evicts a record with no live hold before one with (see
+:meth:`EwarTracker._prune`).
 
 Threading: every caller is on the Tk thread (ingest via fc_gui's ``_post_ui``,
 reads via the preview tick), so the unlocked mutations here are
@@ -150,10 +195,14 @@ _WINDOW_FACTOR = 1.25
 _WINDOW_FLOOR_S = 6.0
 _WINDOW_CEILING_S = 30.0
 
-#: How far a line's arrival may differ from what this character's clock anchor
-#: predicts, in either direction, before it is rejected.  Generous on purpose:
-#: a genuine line is at most a poll interval out, while a replay is minutes to
-#: hours out.
+#: Serves two jobs, deliberately with one number.  (1) How far a line's
+#: arrival may differ from what the clock anchor predicts, in either
+#: direction, before it is rejected -- generous, because a genuine line is at
+#: most a poll interval out while a replay is minutes to hours out.  (2) How
+#: long an unbroken run of rejections may last before the next line
+#: re-anchors.  One number because the two are the same question asked of a
+#: line and of a stream: anything that stays out of step for longer than a
+#: line is allowed to be out of step indicts the anchor, not the stream.
 _REPLAY_SKEW_S = 60
 
 #: Memory bounds -- see the module docstring.
@@ -176,17 +225,24 @@ def _as_key(char_key):
     also resolved to ``""`` -- so it is dropped rather than accepted, and
     nothing is ever coerced onto a substitute key.
 
-    The ``hash()`` probe is not paranoia about ``str``: it is what keeps an
-    exotic key out of the three dict operations below, any of which would
-    otherwise raise straight through the preview tick.
+    A ``str`` SUBCLASS is normalised to an exact ``str``, because an overridden
+    ``__hash__`` or ``__eq__`` raises inside this module's own dict lookups --
+    an ``__eq__`` that raises only needs to COLLIDE with a stored key to get
+    there, so probing ``hash()`` alone does not cover it.  ``str.__str__`` is
+    called unbound so that an overridden ``__str__`` cannot intercept it, and
+    it returns an exact copy for a subclass instance.  The ``hash()`` probe
+    stays as the backstop for anything this reasoning missed.
     """
     if not isinstance(char_key, str) or not char_key:
         return None
     try:
-        hash(char_key)
+        key = char_key if type(char_key) is str else str.__str__(char_key)
+        if not isinstance(key, str) or type(key) is not str or not key:
+            return None
+        hash(key)
     except Exception:
         return None
-    return char_key
+    return key
 
 
 def _finite(value):
@@ -258,20 +314,18 @@ def _window_s_for(effect: str, module, amount) -> float:
 
 
 class _CharState:
-    """One character's holds plus its own clock anchor.
+    """One character's holds.
 
-    ``holds`` maps ``(effect, cls)`` to the monotonic time the hold ends.
-    ``newest`` / ``newest_at`` are the replay guard's single point of
-    correspondence between log time and monotonic time (see the module
-    docstring), and ``last_add`` is the idle prune's clock.
+    ``holds`` maps ``(effect, cls)`` to the monotonic time the hold ends;
+    ``last_add`` is the idle prune's clock, and is stamped only when a hold is
+    actually stored, so a rejected line cannot keep a record alive.  The clock
+    anchor is NOT here -- it is tracker-global (see the module docstring).
     """
 
-    __slots__ = ("holds", "newest", "newest_at", "last_add")
+    __slots__ = ("holds", "last_add")
 
     def __init__(self, now: float):
         self.holds: dict[tuple[str, str], float] = {}
-        self.newest = None
-        self.newest_at = now
         self.last_add = now
 
     def live(self, now: float) -> dict[tuple[str, str], float]:
@@ -294,6 +348,13 @@ class EwarTracker:
         # would make the eviction order depend on which tiles happen to be
         # shown, and a character being read is exactly one worth keeping.
         self._chars: "OrderedDict[str, _CharState]" = OrderedDict()
+        # The clock anchor, shared by every character on this machine (see the
+        # module docstring), plus the monotonic time the current unbroken run
+        # of rejections began -- None whenever the last stamped line was
+        # accepted.
+        self._newest = None
+        self._newest_at = 0.0
+        self._rejecting_since = None
 
     # --- ingest -------------------------------------------------------------
 
@@ -314,18 +375,12 @@ class EwarTracker:
             return
         effect, cls, module, amount = parts
 
-        record = self._chars.get(key)
-        if record is None:
-            # Prune before inserting so the cap is an upper bound on what this
-            # tracker ever holds, not one it transiently exceeds.
-            self._prune(stamped)
-            record = self._chars[key] = _CharState(stamped)
-        record.last_add = stamped
-
         # The replay guard runs BEFORE the NPC drop so that an NPC line still
-        # advances this character's anchor: more lines anchoring it makes the
-        # guard tighter, and a dropped line's stamp is no less true.
-        age = self._age_or_reject(record, log_ts, stamped)
+        # advances the anchor: more lines anchoring it makes the guard
+        # tighter, and a dropped line's stamp is no less true.  It also runs
+        # before the record lookup, which the global anchor is what allows --
+        # so a rejected or dropped line creates no record at all.
+        age = self._age_or_reject(log_ts, stamped)
         if age is None:
             return
         if cls == "npc" and effect not in _NPC_EFFECTS_KEPT:
@@ -333,45 +388,67 @@ class EwarTracker:
 
         until = stamped + _window_s_for(effect, module, amount) - age
         if until <= stamped:
-            # The line is older than its own window: accepted for anchoring
-            # purposes, but there is nothing left of it to show.
+            # The line is older than its own window: it anchored, but there is
+            # nothing left of it to show.
             return
+
+        record = self._chars.get(key)
+        if record is None:
+            # Prune before inserting so the cap is an upper bound on what this
+            # tracker ever holds, not one it transiently exceeds.
+            self._prune(stamped)
+            record = self._chars[key] = _CharState(stamped)
+        record.last_add = stamped
         previous = record.holds.get((effect, cls))
         # Refresh EXTENDS only: a shorter module's line must never cut a
         # longer one's live hold.
         if previous is None or until > previous:
             record.holds[(effect, cls)] = until
 
-    @staticmethod
-    def _age_or_reject(record: _CharState, log_ts, now: float):
+    def _anchor_on(self, stamp, now: float) -> None:
+        """Move the anchor onto this line and clear the rejection streak.
+        Every acceptance goes through here, so the streak can never outlive
+        an accepted line."""
+        self._newest = stamp
+        self._newest_at = now
+        self._rejecting_since = None
+
+    def _age_or_reject(self, log_ts, now: float):
         """The line's age in seconds (0.0 when it arrived in step with the
         clock), or None when the replay guard rejects it.
 
         This is the whole of the corrected spec 10.3 rule; the module
-        docstring carries the reasoning.
+        docstring carries the reasoning for each branch.
         """
         stamp = _parse_ts(log_ts)
         if stamp is None:
-            return 0.0                      # no opinion; anchor untouched
-        if record.newest is None:
-            record.newest = stamp           # first stamp: it IS the anchor
-            record.newest_at = now
+            # No opinion: neither the anchor nor the streak moves.
             return 0.0
-        expected = record.newest_at + (stamp - record.newest).total_seconds()
+        if self._newest is None:
+            self._anchor_on(stamp, now)     # the first stamp IS the anchor
+            return 0.0
+        expected = self._newest_at + (stamp - self._newest).total_seconds()
         if abs(now - expected) > _REPLAY_SKEW_S:
-            return None
-        # Accepted: re-anchor, in EITHER direction (see the docstring -- a
-        # forward-only anchor lets one future-dated line silence a character
-        # for the whole session).
-        record.newest = stamp
-        record.newest_at = now
+            if self._rejecting_since is None:
+                self._rejecting_since = now
+                return None
+            if now - self._rejecting_since <= _REPLAY_SKEW_S:
+                return None
+            # Nothing but rejections for longer than a line is allowed to be
+            # out of step: the ANCHOR is wrong, not the stream (a clock step,
+            # not a replay).  Re-anchor and let this line through.
+            self._anchor_on(stamp, now)
+            return 0.0
+        # Accepted: re-anchor, in EITHER direction (a forward-only anchor lets
+        # one future-dated line silence the feature -- see the docstring).
+        self._anchor_on(stamp, now)
         return max(0.0, now - expected)
 
     def _prune(self, now: float) -> None:
         """Drop idle records, then enforce the hard cap.
 
-        Idle = no live hold AND no event for :data:`_IDLE_RETENTION_S`.  The
-        hold conjunct cannot fire today -- the 30 s window ceiling is well
+        Idle = no live hold AND no stored hold for :data:`_IDLE_RETENTION_S`.
+        The hold conjunct cannot fire today -- the 30 s window ceiling is well
         inside the 300 s retention -- and is kept only so that raising the
         ceiling cannot silently start evicting live holds.
 
