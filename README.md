@@ -200,6 +200,8 @@ The Discord ping's emoji pack is built from third-party data and is bundled insi
 
 The full notices are bundled inside `FCTool.exe` with the tiles, and the same text is in the repository at [`assets/emoji/NOTICE.txt`](assets/emoji/NOTICE.txt).
 
+The preview's EWAR icons are EVE module artwork from CCP's own image server, bundled the same way rather than fetched while you fly. Their notice, the module type IDs the art came from and the sprite sheet's layout travel with the sheet inside `FCTool.exe`, and the same text is in the repository at [`assets/ewar/NOTICE.txt`](assets/ewar/NOTICE.txt). CCP may require that material be removed on seven days' notice, so the sheet is a plain asset: it can be replaced or removed without a code change.
+
 EVE Online and the EVE logo are the registered trademarks of CCP hf. All
 rights are reserved worldwide. FCTool is a free fan-made tool; CCP hf. is
 not affiliated with it and does not endorse it.

@@ -37,6 +37,11 @@ a = Analysis(
         ('emoji_table.json.gz', '.'),
         ('assets/emoji/twemoji_22.png', 'assets/emoji'),
         ('assets/emoji/NOTICE.txt', 'assets/emoji'),
+        # FCPreview EWAR icons: one sprite sheet of CCP module artwork plus the
+        # licence notice it must travel with (CCP may require the art to be
+        # pulled on seven days' notice, so it ships as a replaceable asset).
+        ('assets/ewar/ewar_icons.png', 'assets/ewar'),
+        ('assets/ewar/NOTICE.txt', 'assets/ewar'),
         # Vendored python-xlib + six for the Linux (Proton/Wine) preview helper;
         # dead weight on Windows, so it ships as ONE zip (built by
         # tools/build_x11helper_zip.py) to keep the one-file cold boot unchanged.
