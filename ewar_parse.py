@@ -27,9 +27,17 @@ Three things here are load-bearing and look like detail:
 2. **The cheap gate.**  The poll loop runs every second; an unconditional
    regex per line is not acceptable.  :func:`_ewar_gate` is four raw substring
    tests and nothing else, in the shape of ``gamelog_monitor._cyno_gate``.
-   The gate and the patterns behind it are both case-SENSITIVE, so the gate can
-   never be stricter than its regex (a gate stricter than its pattern is a
-   silent filter -- the rule gamelog_monitor records above its own gate).
+   Both the gate and the patterns behind it are case-SENSITIVE, which removes
+   the obvious way for a gate to end up stricter than its pattern.  It is not a
+   proof of agreement, and the claim is deliberately not made here: the words
+   are matched on the RAW line and the patterns on the STRIPPED one, so a
+   client that doubled a space or pushed a tag through the middle of a phrase
+   could in principle pass a pattern the gate rejects, and such a gate is a
+   SILENT filter rather than a loud failure (the rule gamelog_monitor records
+   above its own gate).  What is measured: across 2,760,250 archive lines
+   there is no line the patterns accept and the gate rejects, and the gate
+   words are single tokens wherever a single token will do, so no phrase-
+   internal whitespace or tag can split one.
 
 3. **Player vs NPC is read off the attacker segment, in three cases.**  A
    player renders as ``Ship [CORP] [ALLY] [Pilot]``; an NPC is a bare name; and
@@ -43,12 +51,14 @@ DELIBERATE and reviewed -- please do not "fix" it by importing that one.
 ``gamelog_monitor`` imports THIS module (it dispatches the events), so importing
 it back is a circular import that fails in both directions: that module defines
 its own ``_TAG_RE`` far below its import block, so whichever of the two is
-loaded first, the other gets a half-initialised module.  It also computes
-``app_dir()`` at import time, which does a filesystem write probe -- importing
-it would cost this pure module its purity.  Re-pointing ``gamelog_monitor`` at
-this module instead was considered and REJECTED (2026-10-30): it would put
-three working parsers -- damage, decloak, cyno -- behind a new cross-module
-dependency in order to deduplicate a ten-character regex.  Keep both.
+loaded first, the other gets a half-initialised module.  Even without the
+cycle, importing it would cost this module its independence: measured, the
+import pulls in dozens of modules (86 ``sys.modules`` entries), CONFIGURES THE
+ROOT LOGGER and opens ``fctool.log``, none of which a line parser should need
+to be loaded or tested.  Re-pointing ``gamelog_monitor`` at this module instead
+was considered and REJECTED (2026-10-30): it would put three working parsers --
+damage, decloak, cyno -- behind a new cross-module dependency in order to
+deduplicate a ten-character regex.  Keep both.
 """
 from __future__ import annotations
 
@@ -73,14 +83,29 @@ class EwarHit:
     module: str        # module name verbatim, "" when the line names none
     amount: int = 0    # GJ for neut/nos, 0 otherwise -- feeds the cycle fallback
 
+    # Two things about `module` a consumer should know.  On an NPC capacitor-
+    # warfare line the client repeats the SHIP name where a player line names
+    # the module, so `module` is a ship name there; harmless, because NPC
+    # capacitor warfare is discarded before any cycle lookup.  And it is NOT
+    # ASCII-safe: it is client text passed through verbatim, and one archive
+    # value carries U+2666 (a diamond-marked NPC hull).  Anything that logs or
+    # encodes it must not assume ASCII.
+
 
 # ---------------------------------------------------------------------------
 # Cheap gate -- raw substrings only, before any regex
 # ---------------------------------------------------------------------------
 _GATE_JAM = "jammed"
 _GATE_TACKLE = "attempt"
-_GATE_NEUT = "energy neutralized"
-_GATE_NOS = "energy drained"
+# Single tokens, not the two-word phrases: "energy neutralized" would be
+# defeated by a doubled space or by a tag pushed between the words, and a gate
+# that rejects a line its pattern accepts is a silent filter.  Neither variant
+# occurs in the archive, so this closes a gap rather than a live bug, and it
+# costs nothing measurable.  `attempt` stays a bare word for the same reason it
+# is not "attempt from": the client writes `attempt</b> ... <font ...>from`, so
+# the two-word form would lose every one of the 1,628 tackle hits.
+_GATE_NEUT = "neutralized"
+_GATE_NOS = "drained"
 
 
 def _ewar_gate(line: str) -> bool:
@@ -196,7 +221,13 @@ def _gj_of(line: str):
         return ("", 0)
     try:
         amount = abs(int(m.group("amount")))
-    except (TypeError, ValueError):       # unreachable via the pattern; cheap
+    except (TypeError, ValueError):
+        # REACHABLE, which is why the try is here: the pattern's `\d+` has no
+        # length bound, and CPython refuses to convert an integer literal of
+        # more than 4,300 digits ("Exceeds the limit (4300 digits) for integer
+        # string conversion", a ValueError).  A corrupt or adversarial line
+        # therefore yields a readable colour and no amount, rather than
+        # throwing out of the poll thread.
         return (m.group("colour").lower(), 0)
     return (m.group("colour").lower(), amount)
 
@@ -208,8 +239,14 @@ def parse_ewar_line(line: str):
     ``(notify)`` lines that merely mention the vocabulary -- the archive's
     ``"(notify) Some drones were unable to engage with your target due to
     being target jammed"`` is the standing example -- truncated lines and
-    garbage all yield ``None``.  Never raises."""
-    if not line or not _ewar_gate(line):
+    garbage all yield ``None``.
+
+    Never raises, for ANY input: the type test below makes that true of a
+    non-string too (bytes, an int, a list), which keeps this total in the same
+    way ``ewar_cycles.cycle_ms_for`` is.  The live caller only ever passes a
+    ``str``, so this is about the function being honest about its contract
+    rather than about a reachable bug."""
+    if not isinstance(line, str) or not _ewar_gate(line):
         return None
     # Every detectable effect is a (combat) line.  This single test is what
     # keeps the (notify) drone line from drawing a jam icon.
