@@ -49,7 +49,9 @@ import sys
 
 import tkinter as tk
 
+import ewar_icons
 import preview_band
+import preview_ewar_band
 import preview_layout
 import ui_helpers
 from app_path import bundle_dir
@@ -60,6 +62,8 @@ log = logging.getLogger(__name__)
 STRIP_H = 20
 _MOVE_JITTER = 4          # left-release within this many px still counts as a click
 _CORNER_ZONE = 12         # px hot-zone at each tile corner that arms a resize
+_EWAR_WIDE_TILE_PX = 200  # at/above this tile width the EWAR icons are 18 px,
+                          # below it 14 px, both before DPI scaling (spec A4)
 # Drag-move coalescing window (ms), Linux/Wine backend ONLY. X11 delivers raw
 # pointer motion far faster than a compositor can redraw, and every per-motion
 # SetWindowPos under Wine expose-repaints each tile the move uncovers (black
@@ -494,7 +498,7 @@ class TileWindow:
                  on_activate=None, on_minimize=None, on_move_end=None,
                  on_resize_end=None, on_exclude=None, on_switch_external=None,
                  on_snap_others=None, on_snap_screens=None, lock_layout=False,
-                 *, band_factory=None):
+                 *, band_factory=None, ewar_factory=None):
         self._win32 = win32 or _real_tile_win32()
         self._lock_layout = bool(lock_layout)   # when True, all drag-moves are no-ops
         self._dwm_backend = dwm
@@ -582,7 +586,28 @@ class TileWindow:
         # window away from _pos and leaves _pos alone. The band is placed from
         # this. None until the first placement.
         self._placed_pos = None
-        self._band_px_per_pt = None   # cached Tk scaling (see _band_font_px)
+        self._band_px_per_pt = None   # cached Tk scaling (see _px_per_pt)
+
+        # -- EWAR icon row over the video (set_ewar_icons) --------------------
+        # A SECOND owned layered popup, the band's sibling: the icon row sits
+        # at the TOP of the body where the band sits at the bottom, so the two
+        # never overlap and neither has to be re-stacked (spec 10.2). Every
+        # member below is the band's exact parallel, deliberately - the band's
+        # ordering rules are load-bearing and parity is what makes them
+        # reviewable side by side.
+        # ewar_factory(owner_hwnd) -> an object with EwarWindow's sync /
+        # destroy / hwnd. None = preview_ewar_band.EwarWindow, resolved at
+        # first need; tests inject a recording fake.
+        self._ewar_factory = ewar_factory
+        self._ewar_req = ()          # LAST REQUEST of set_ewar_icons
+        self._ewar_off = False       # latched by an EWAR fault (or destroy()):
+                                     # no icons for the rest of this tile's life
+        self._ewar = None            # the popup; None until first NEEDED
+        # What the popup was last successfully told: (x, y, w, icons,
+        # icon_px, alpha, visible). An unchanged _sync_ewar() stops at this
+        # compare and never reaches the popup - the tile's half of the
+        # zero-write rule.
+        self._ewar_synced = None
 
         self._thumb = None
         self._src_size = (0, 0)
@@ -1090,10 +1115,11 @@ class TileWindow:
         the tile back at the head of the topmost band."""
         if not self._x11_backend:
             self._win32.set_window_pos(self._hwnd, x, y, w, h)
-            # Same motion event, same position: the band does not move with
-            # its owner by itself. Every caller has already written the new
-            # _w / _body_h, so (x, y) is all the band still needs.
+            # Same motion event, same position: neither owned popup moves
+            # with its owner by itself. Every caller has already written the
+            # new _w / _body_h, so (x, y) is all they still need.
             self._band_follow(x, y)
+            self._ewar_follow(x, y)
             return
         self._pending_move = (x, y, w, h)
         if self._move_after_id is not None:
@@ -1117,9 +1143,10 @@ class TileWindow:
         x, y, w, h = pend
         self._win32.set_window_pos(self._hwnd, x, y, w, h,
                                    zorder=False, redraw=False)
-        # X11-only path, where the band is refused (set_text_band): this keeps
+        # X11-only path, where both owned popups are refused: this keeps
         # _placed_pos honest and is otherwise a no-op.
         self._band_follow(x, y)
+        self._ewar_follow(x, y)
 
     def _flush_drag_move(self):
         """Cancel the armed flush and apply any pending position RIGHT NOW.
@@ -1447,6 +1474,7 @@ class TileWindow:
         # arrange paths that re-place a tile at the size it already had.
         self._render_caption()
         self._band_follow(x, y)
+        self._ewar_follow(x, y)
 
     def body_screen_rect(self):
         """(left, top, right, bottom) of the BODY region (below the caption strip)
@@ -1499,8 +1527,10 @@ class TileWindow:
             return
         self._hidden = True
         # An owned popup is NOT hidden with its owner: say so (visible=False)
-        # BEFORE the withdraw, so no frame ever shows the band without its tile.
+        # BEFORE the withdraw, so no frame ever shows the band or the EWAR
+        # icon row without its tile.
         self._sync_band()
+        self._sync_ewar()
         try:
             self.top.withdraw()
         except tk.TclError:
@@ -1528,8 +1558,9 @@ class TileWindow:
                                        self._w, self._body_h + STRIP_H)
             self._push_thumb_rect()
             # Inside the try on purpose: a tile whose Tk window is gone must
-            # not be handed a band (it would only fail and log).
+            # not be handed a popup (it would only fail and log).
             self._band_follow(self._pos[0], self._pos[1])
+            self._ewar_follow(self._pos[0], self._pos[1])
         except tk.TclError:
             pass
 
@@ -1699,9 +1730,10 @@ class TileWindow:
         # wiping WS_EX_TOOLWINDOW → re-assert the Alt-Tab exclusion every time.
         self._exclude_from_alt_tab()
         if wrote:
-            # The text band fades WITH its tile, from the APPLIED alpha (the
-            # mirror just latched) - so never after a failed write.
+            # Both owned popups fade WITH their tile, from the APPLIED alpha
+            # (the mirror just latched) - so never after a failed write.
             self._sync_band()
+            self._sync_ewar()
 
     def current_alpha(self):
         """Last requested window alpha (mirror for tests / logging)."""
@@ -1793,6 +1825,7 @@ class TileWindow:
         # (zx, zy), NOT _pos: on any anchor but "nw" the zoomed window sits
         # away from _pos, which this method deliberately leaves alone.
         self._band_follow(zx, zy)
+        self._ewar_follow(zx, zy)
         self._win32.retop(self._hwnd)
         self._relift_tooltips()
 
@@ -1817,6 +1850,7 @@ class TileWindow:
         self._win32.set_window_pos(self._hwnd, x, y, w, body_h + STRIP_H)
         self._push_thumb_rect()
         self._band_follow(x, y)
+        self._ewar_follow(x, y)
         self._win32.retop(self._hwnd)
         self._relift_tooltips()
 
@@ -2263,11 +2297,10 @@ class TileWindow:
             fsize = 9
         return max(_LABEL_MIN_SIZE, min(fsize, _LABEL_MAX_SIZE))
 
-    def _band_font_px(self, points):
-        """Glyph height in PHYSICAL px of a font drawn at `points` - what the
-        band's own renderer needs, since it draws with GDI, not Tk. Tk's
-        scaling factor IS pixels per point, so this is the size the same text
-        has on a strip.
+    def _px_per_pt(self):
+        """Tk's scaling factor = PHYSICAL px per point. THE one route to it on
+        this tile (the band's row heights and the EWAR icon size both read it
+        here, so there is one factor and one cache, not two).
 
         One Tcl round-trip for the tile's whole life: the factor is cached once
         read. A failed or senseless read falls back to 96 dpi (96 / 72 px per
@@ -2283,6 +2316,14 @@ class TileWindow:
                 self._band_px_per_pt = scale
             else:
                 scale = 96.0 / 72.0
+        return scale
+
+    def _band_font_px(self, points):
+        """Glyph height in PHYSICAL px of a font drawn at `points` - what the
+        band's own renderer needs, since it draws with GDI, not Tk. Tk's
+        scaling factor IS pixels per point, so this is the size the same text
+        has on a strip."""
+        scale = self._px_per_pt()
         # Halves round DOWN, as Tk does (round() goes to even: 9 pt at
         # 108 dpi is 13.5 -> Tk 13, round() 14). Plain-arithmetic ceil(x - .5).
         return max(1, -int(-(points * scale - 0.5) // 1))
@@ -2415,6 +2456,146 @@ class TileWindow:
         if band is not None:
             try:
                 band.destroy()
+            except Exception:
+                pass
+
+    # -- EWAR icon row over the video (set_ewar_icons) -----------------------
+    def set_ewar_icons(self, icons) -> None:
+        """Show these incoming-EWAR effect icons over the TOP-LEFT of the
+        video, in the order given (the tracker hands them over in ICON_ORDER);
+        () draws nothing. Called for every tile on every ~250 ms compose tick.
+
+        ZERO-WRITE: an unchanged request returns before the popup is touched,
+        so the steady state costs nothing at all. A NO-OP on the X11 thumbnail
+        backend (Proton/Wine), where an owned Win32 layered popup does not
+        exist - the feature is silently absent there, exactly as the band is -
+        and after an EWAR fault, for the rest of this tile's life.
+
+        NEVER raises: this is the preview tick, where an exception retires the
+        tile (five failed ticks disable every preview)."""
+        if self._x11_backend or self._ewar_off:
+            return
+        try:
+            shown = tuple(str(effect) for effect in icons) if icons else ()
+        except TypeError:                 # not iterable: nothing to show
+            shown = ()
+        if shown == self._ewar_req:
+            return
+        self._ewar_req = shown
+        self._sync_ewar()
+
+    def _ewar_icon_px(self) -> int:
+        """The artwork size this tile wants, in PHYSICAL px: 18 on a tile at
+        least _EWAR_WIDE_TILE_PX wide, 14 below that (spec A4), multiplied by
+        the DPI factor and snapped to the nearest size the sheet carries.
+
+        The TILE owns this, not the caller: only the tile knows its own width
+        and its Tk scaling. The multiplier is 1.0 at 100 % and 1.5 at 150 %,
+        i.e. Tk's px-per-point over the 96 dpi baseline (_px_per_pt is THE
+        route to that factor) - fixed physical pixels beside a caption that
+        scales would read wrong at 150 %. Ties snap DOWN, and the answer is
+        always a plain int member of ewar_icons.ICON_SIZES, which is what the
+        popup accepts (it refuses floats and bools)."""
+        base = 18 if self._w >= _EWAR_WIDE_TILE_PX else 14
+        want = base * (self._px_per_pt() / (96.0 / 72.0))
+        return min(ewar_icons.ICON_SIZES, key=lambda px: (abs(px - want), px))
+
+    def _ewar_follow(self, x, y):
+        """Called right after EVERY set_window_pos on this tile, with the
+        top-left it was handed: record where the window really is and bring
+        the icon row along (an owned popup does not move with its owner by
+        itself). The band's _band_follow, for the sibling popup."""
+        self._placed_pos = (x, y)
+        self._sync_ewar()
+
+    def _sync_ewar(self):
+        """Make the icon popup match the tile: its icons, the icon size this
+        tile's width and scaling ask for, the rect the window really has, the
+        tile's applied alpha, shown or hidden. THE one place the tile talks to
+        its icon popup; a no-op on the X11 backend and after a fault.
+
+        Reached from set_ewar_icons, set_alpha (after a successful write),
+        hide(), and every placement through _ewar_follow (place, show, zoom in
+        / out, each drag and resize motion).
+
+        NEVER raises. Callers include place() and the per-tick setters, and an
+        exception escaping into fc_gui's per-tile `try` retires the tile (five
+        failed ticks disable every preview). Any fault - the factory or sync
+        raising, sync answering False - ends in _ewar_fault instead: this tile
+        shows no icons for good."""
+        if self._ewar_off or self._x11_backend:
+            return
+        try:
+            ok, why = self._sync_ewar_now(), "the icon row could not be shown"
+        except Exception as exc:
+            ok, why = False, type(exc).__name__
+        if not ok:
+            self._ewar_fault(why)
+
+    def _sync_ewar_now(self) -> bool:
+        """_sync_ewar's body; may raise (the caller turns that into a fault).
+
+        Geometry is the tile's own PHYSICAL numbers - _placed_pos, _w,
+        _body_h, STRIP_H, the same ones that place the window - never
+        winfo_root* (logical px under per-monitor DPI, and stale until Tk has
+        pumped an external move). ZERO-WRITE: a request equal to the last one
+        the popup accepted returns before the popup is touched. No popup is
+        created while there is nothing to show (no icon, tile hidden or never
+        placed), so most tiles never build one at all (spec 10.2)."""
+        icons = self._ewar_req
+        visible = (not self._hidden) and self._w > 0 and self._body_h > 0
+        if self._ewar is None:
+            if not (icons and visible):
+                return True
+            factory = self._ewar_factory
+            if factory is None:
+                factory = preview_ewar_band.EwarWindow
+            self._ewar = factory(self._hwnd)
+        x, y = self._placed_pos if self._placed_pos is not None else self._pos
+        icon_px = self._ewar_icon_px()
+        req = (x, y + STRIP_H, self._w, icons, icon_px, self._alpha, visible)
+        if req == self._ewar_synced:
+            return True
+        if not self._ewar.sync(x, y + STRIP_H, self._w, icons, icon_px,
+                               alpha=self._alpha, visible=visible):
+            return False
+        self._ewar_synced = req       # latch only AFTER the popup accepted it
+        return True
+
+    def _ewar_fault(self, why):
+        """The icon row cannot be shown on this tile: latch that and destroy
+        the popup, with ONE log line. The latch makes set_ewar_icons a no-op
+        from now on, so this runs at most once per tile and the line cannot
+        repeat. Names no character (the log may be shared) and no effect: the
+        popup's own last_failure (the step + Win32 error code, never request
+        content) is appended when it has one.
+
+        There is nothing to fall back to - unlike the band, whose text goes
+        back on the strips - so this tile simply shows no icons. Never raises
+        (see _sync_ewar)."""
+        try:
+            detail = getattr(self._ewar, "last_failure", None)
+        except Exception:
+            detail = None
+        self._ewar_off = True
+        self._ewar_req = ()
+        self._destroy_ewar()
+        try:
+            if isinstance(detail, str) and detail:
+                why = "%s: %s" % (why, detail)
+            log.warning("preview: EWAR icons are unavailable for one tile "
+                        "(%s); that tile shows none", why)
+        except Exception:
+            pass
+
+    def _destroy_ewar(self):
+        """Drop the icon popup, if any. Tolerates a popup that is already gone
+        (an owned popup dies with its tile's window) and never raises."""
+        ewar, self._ewar = self._ewar, None
+        self._ewar_synced = None
+        if ewar is not None:
+            try:
+                ewar.destroy()
             except Exception:
                 pass
 
@@ -2809,10 +2990,14 @@ class TileWindow:
         self._press_root = None
         self._strip_moving = False
         self._corner_resizing = False
-        # The band goes BEFORE its owner (it would die with the Toplevel
-        # anyway; this is the explicit path). The layout drops back to strips
-        # and stays there, so nothing that still reaches this dead tile can
-        # ask for a new band - the strip paths all swallow a TclError.
+        # Both owned popups go BEFORE their owner (they would die with the
+        # Toplevel anyway; this is the explicit path), icon row first. Each
+        # latch stays set, so nothing that still reaches this dead tile can
+        # ask for a new popup - the strip paths all swallow a TclError and
+        # set_ewar_icons is a no-op once _ewar_off is latched.
+        self._ewar_off = True
+        self._ewar_req = ()
+        self._destroy_ewar()
         self._band_off = True
         self._text_band = False
         self._destroy_band()
