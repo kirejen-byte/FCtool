@@ -77,8 +77,9 @@ def _decode_rgba_png(data):
     ``rgba`` is ``width * height * 4`` bytes, top-down, straight alpha.  Parses
     IHDR, concatenates every IDAT, inflates once and undoes the five per-
     scanline filters.  Anything else -- another colour type, another bit depth,
-    interlacing, a truncated file, an unknown filter byte, rows that do not add
-    up -- is None, never an exception."""
+    interlacing, a file truncated mid-chunk, a deflate stream that never
+    properly ended or whose checksum failed, an unknown filter byte, rows that
+    do not add up -- is None, never an exception."""
     try:
         if not isinstance(data, (bytes, bytearray, memoryview)):
             return None
@@ -123,8 +124,18 @@ def _decode_rgba_png(data):
         # IDAT expands 1000:1 peaks at hundreds of MB if the size is only
         # checked afterwards.  ``decompressobj`` stops at the byte after the
         # one valid sheet's worth, and anything that long is refused below.
-        raw = zlib.decompressobj().decompress(b"".join(idat), wanted + 1)
-        if len(raw) != wanted:
+        #
+        # ``eof`` IS LOAD-BEARING, not belt and braces.  Unlike one-shot
+        # ``zlib.decompress``, a decompressobj does not complain about a
+        # truncated stream: it just returns what it got.  Cut the last bytes
+        # off a real IDAT and the output is still exactly ``wanted`` long, so
+        # the length check passes -- and because the stream never reached its
+        # end, the adler32 trailer is never verified, which is what would
+        # otherwise have caught the corruption.  ``eof`` is True only when the
+        # deflate stream ended properly and that checksum matched.
+        decomp = zlib.decompressobj()
+        raw = decomp.decompress(b"".join(idat), wanted + 1)
+        if not decomp.eof or len(raw) != wanted:
             return None
         out = bytearray(stride * height)
         prev = bytearray(stride)

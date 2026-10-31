@@ -165,12 +165,19 @@ def cache_path(type_id: int, cache_dir: str = CACHE_DIR) -> str:
     return os.path.join(cache_dir, "type_%d_%d.png" % (type_id, SOURCE_PX))
 
 
-def _verify(effect: str, blob: bytes, *, accept_changed: bool) -> str:
+def _verify(effect: str, blob: bytes, *, accept_changed: bool, fresh: bool) -> str:
     """The sha256 of ``blob``, after checking it against the pinned digest.
 
     Runs on EVERY byte the build reads, fetched or cached: a cache is just a
     directory on disk, and an unverified one would be baked into the sheet and
-    then certified by the digest list in NOTICE.txt."""
+    then certified by the digest list in NOTICE.txt.
+
+    ``fresh`` says this blob came off CCP's server in THIS run.  Only a fresh
+    blob may be adopted by ``accept_changed``: NOTICE.txt is the licence
+    artefact, and it must never put a digest beside CCP's name for bytes that
+    were never fetched from CCP.  Otherwise dropping a forged PNG into the
+    cache and running ``--build --accept-changed`` would bake the forgery into
+    the sheet AND have the notice certify it."""
     type_id, name, expected = SOURCES[effect]
     if not blob.startswith(PNG_SIGNATURE):
         raise BuildError("the source for %s (type %d) is not a PNG" % (effect, type_id))
@@ -184,6 +191,13 @@ def _verify(effect: str, blob: bytes, *, accept_changed: bool) -> str:
                 "Re-run with --force to re-download; if the new art is what you "
                 "want, --accept-changed proceeds and prints the digests to pin."
                 % (effect, name, type_id, expected, digest))
+        if not fresh:
+            raise BuildError(
+                "refusing to adopt %s (%s, type %d) from the cache: its bytes "
+                "do not match the pinned digest and were not downloaded in "
+                "this run, so nothing has seen them come from CCP. NOTICE.txt "
+                "would certify them anyway. Re-run with --force."
+                % (effect, name, type_id))
         print("  CHANGED  %s: pinned %s, got %s" % (effect, expected, digest))
     return digest
 
@@ -197,18 +211,21 @@ def fetch_all(cache_dir: str = CACHE_DIR, *, force: bool = False,
     for effect in ICON_ORDER:
         type_id, name, _expected = SOURCES[effect]
         path = cache_path(type_id, cache_dir)
+        fresh = False
         if (force or not os.path.exists(path)) and download:
             print("fetching %s (%s, type %d)" % (effect, name, type_id))
             blob = fetch_icon(type_id)
             with open(path, "wb") as fh:
                 fh.write(blob)
+            fresh = True
         else:
             if not os.path.exists(path):
                 raise BuildError("missing cached source %s -- run --fetch first" % path)
             with open(path, "rb") as fh:
                 blob = fh.read()
             print("cached   %s (%s, type %d)" % (effect, name, type_id))
-        digests[effect] = _verify(effect, blob, accept_changed=accept_changed)
+        digests[effect] = _verify(effect, blob, accept_changed=accept_changed,
+                                  fresh=fresh)
     return digests
 
 
@@ -361,7 +378,9 @@ def main(argv=None) -> int:
     ap.add_argument("--force", action="store_true", help="re-download cached sources")
     ap.add_argument("--accept-changed", action="store_true",
                     help="proceed when a source no longer matches its pinned "
-                         "digest, and print the new digests to pin")
+                         "digest, and print the new digests to pin; implies "
+                         "--force, since only freshly downloaded bytes may be "
+                         "adopted")
     ap.add_argument("--cache", default=CACHE_DIR, help="cache directory")
     ap.add_argument("--out", default=ASSET_DIR, help="asset output directory")
     args = ap.parse_args(argv)
@@ -377,11 +396,18 @@ def main(argv=None) -> int:
 
     do_fetch = args.fetch or not args.build
     do_build = args.build or not args.fetch
+    # Adopting a changed source means re-downloading it: --build alone would
+    # otherwise adopt whatever is in the cache and have NOTICE.txt certify it
+    # as CCP's.  _verify refuses that too; this makes the usual invocation do
+    # the right thing instead of merely failing.
+    force = args.force or args.accept_changed
+    if args.accept_changed:
+        do_fetch = True
     try:
         # Verifies every source byte against its pinned digest whether it was
         # just downloaded or came out of the cache, so NOTICE.txt can never
         # certify art that nothing checked.
-        digests = fetch_all(args.cache, force=args.force, download=do_fetch,
+        digests = fetch_all(args.cache, force=force, download=do_fetch,
                             accept_changed=args.accept_changed)
         if do_build:
             sheet = write_sheet(args.out, args.cache)
