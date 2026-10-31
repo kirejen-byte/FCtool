@@ -23777,6 +23777,17 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # its own feature with its own switch, and that switch is the one that
         # governs it. A tidy-up that re-nests this branch inside the guard
         # above BREAKS D8 -- test_preview_tick.py pins the combination.
+        #
+        # WINE/X11: this red is LIVE on every platform, deliberately, and the
+        # asymmetry with the icon row is not an oversight to be tidied into
+        # inertness. The row needs an owned layered Win32 popup and is
+        # therefore silently absent on the X11 thumbnail backend (spec C1) --
+        # but the border is a plain Tk frame colour that works everywhere, and
+        # knowing a hostile PLAYER is neuting or jamming an alt is worth
+        # having on its own. Suppressing it here to match the row would cost a
+        # supported platform real information for the sake of symmetry. The
+        # settings checkbox stays enabled under Wine for the same reason, and
+        # its tooltip states the split.
         _ewar = getattr(self, "_preview_ewar", None)
         ewar_red = (not client.is_login and _ewar is not None
                     and self._preview_ewar_on(cfg)
@@ -27155,9 +27166,23 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             _tip(sw, sw_tip)
             return var, sw
 
+        self._preview_dmg_color_var, self._preview_dmg_color_swatch = _dmg_swatch(
+            1, "Player color", "damage_flash_color",
+            damage_flash.PLAYER_COLOR_DEFAULT, "player")
+        (self._preview_dmg_npc_color_var,
+         self._preview_dmg_npc_color_swatch) = _dmg_swatch(
+            3, "NPC color", "damage_flash_npc_color",
+            damage_flash.NPC_COLOR_DEFAULT, "NPC")
+
         # EWAR icons -- the icon row over each tile's video, and (for a hostile
         # PLAYER's effect) the red border, which this box governs on its own:
         # it still reddens with "Damage flash" off (owner decision D8).
+        # Built LAST on this row so keyboard traversal (creation order) follows
+        # the grid: NPC damage, the two colour swatches, then this at column 5.
+        # NOT greyed out under Wine, unlike the band's controls: the icon row
+        # is inert on the X11 backend but the red border is NOT (see the border
+        # read in _preview_paint_border), so the box still does something
+        # there -- and the tooltip says which half a Linux reader gets.
         self._preview_ewar_icons_var = tk.BooleanVar(
             value=FCToolGUI._preview_ewar_on(pcfg))
         cbew = tk.Checkbutton(
@@ -27168,19 +27193,15 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             activeforeground=FG_TEXT)
         cbew.grid(row=0, column=5, padx=(0, 8))
         w.append(cbew)
-        _tip(cbew, "Show small module icons over a preview when that character "
-                   "is being jammed, pointed, scrambled, neuted or nos'd, read "
-                   "from your own combat logs. A hostile PLAYER's EWAR also "
-                   "pulses the border red (even with 'Damage flash' off); NPC "
-                   "neuts and jams are ignored, NPC tackle still shows.")
-
-        self._preview_dmg_color_var, self._preview_dmg_color_swatch = _dmg_swatch(
-            1, "Player color", "damage_flash_color",
-            damage_flash.PLAYER_COLOR_DEFAULT, "player")
-        (self._preview_dmg_npc_color_var,
-         self._preview_dmg_npc_color_swatch) = _dmg_swatch(
-            3, "NPC color", "damage_flash_npc_color",
-            damage_flash.NPC_COLOR_DEFAULT, "NPC")
+        _tip(cbew, "Pulse a preview's border red when a hostile PLAYER jams, "
+                   "points, scrambles, neuts or nos'es that character, read "
+                   "from your own combat logs -- on Windows and on Linux "
+                   "alike, and even with 'Damage flash' off. On WINDOWS it "
+                   "also draws small module icons over the preview naming "
+                   "those effects; the icons need the Windows preview backend, "
+                   "so on Linux you get the border only. NPC neuts and jams "
+                   "are ignored (ratting would light every tile); NPC tackle "
+                   "still shows.")
 
         # ── Alerts ▸ row 4 (native): Gamelogs source ─────────────────────────
         # Damage flash AND decloak both read EVE's combat Gamelogs, so a
