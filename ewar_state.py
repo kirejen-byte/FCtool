@@ -109,6 +109,26 @@ guesswork -- a replay's rejections arrive as a burst within a second or two and
 never reach the threshold, while a clock step's persist and do.  The normal
 path is untouched: one accepted line clears the streak.
 
+**AND ARM NOTHING FOR ONE SKEW WINDOW AFTER RE-ANCHORING** (:data:`EwarTracker.
+_quarantine_until`).  Without this, the re-anchor rule hands the whole hole
+straight back, and by an EASIER route than the residual it was meant to narrow:
+one rejected stamped line, with no accepted one for a skew window afterwards,
+lets the NEXT batch re-anchor itself and then be believed in full -- four icons
+at full windows with red armed, and, the anchor being global, every other
+client dragged onto an hours-old stamp and silenced too.  It needs no first-line
+coincidence, and incoming EWAR is rare enough (9,187 lines in 2.67 M) that an
+unbroken streak can persist for hours.  A replay batch arrives within
+milliseconds and cannot outlive the quarantine; a clock step pays one extra
+skew window, once, taking its outage from roughly 63 s to roughly 123 s -- the
+obviously right trade against a tile that lies.
+
+Arming nothing for the re-anchoring LINE alone was measured and does NOT close
+it: the lines behind it are then accepted against the new anchor with age 0.
+So the quarantine is a window, not a line, and the re-anchoring line falls
+inside its own quarantine by construction.  Lines keep anchoring throughout --
+only arming is suppressed -- so the stream is re-synchronised by the time it
+expires, and holds armed BEFORE it are genuine and left alone.
+
 An unparsable stamp is still ACCEPTED, with age 0, and leaves both the anchor
 and the rejection streak untouched: the guard only ever compares log timestamps
 to each other, so it has no opinion when it cannot read one, and a line it
@@ -118,19 +138,22 @@ misses.
 
 **TWO RESIDUALS, accepted rather than fixed.**
 
-  1. The tracker's VERY FIRST stamped line has no anchor to be judged against
-     and becomes one, so a replay arriving as the whole session's first EWAR
-     still arms.  The global anchor removes this for every character after the
-     first line, and the monitor seeds new files at EOF so a cold start never
-     backfills -- which is what makes the remainder narrow.  The same hole
-     swallows a first line stamped far ahead of real time; the re-anchor rule
-     above bounds that to roughly one skew window rather than the session.
+  1. IRREDUCIBLE: the session's VERY FIRST stamped line has nothing to be
+     judged against, so it becomes the anchor and arms.  A replay can
+     therefore light icons only by arriving as the whole session's first EWAR
+     -- which needs a tracked file to rotate before any client has logged a
+     single incoming effect, and the monitor seeds new files at EOF so a cold
+     start never backfills.  The alternative, arming nothing on a first line,
+     would throw away a genuine scramble icon; tackle logs once and never
+     again.  The same hole swallows a first line stamped far ahead of real
+     time, which the re-anchor rule then bounds to roughly two skew windows
+     rather than the session.
   2. A DESCENDING run of backward stamp hops walks the anchor backwards, and
      TWO hops of 50 s are already enough to start rejecting live traffic --
      which, before the re-anchor rule, meant permanent silence; it is now
-     bounded to roughly one skew window.  This is accepted ON MEASUREMENT, not
-     assumption: a scan of 2,669,525 stamped lines across 13,580 archive files
-     found ZERO files with any stamp decrease, and zero decreases in the
+     bounded to roughly two skew windows.  This is accepted ON MEASUREMENT,
+     not assumption: a scan of 2,669,525 stamped lines across 13,580 archive
+     files found ZERO files with any stamp decrease, and zero decreases in the
      9,187-line incoming-EWAR sequence this tracker actually sees.
 
 ===========================================================================
@@ -233,11 +256,14 @@ def _as_key(char_key):
     it returns an exact copy for a subclass instance.  The ``hash()`` probe
     stays as the backstop for anything this reasoning missed.
     """
-    if not isinstance(char_key, str) or not char_key:
+    if not isinstance(char_key, str):
         return None
     try:
         key = char_key if type(char_key) is str else str.__str__(char_key)
-        if not isinstance(key, str) or type(key) is not str or not key:
+        # The emptiness test lives INSIDE the guard and AFTER normalisation:
+        # `not key` runs __bool__ / __len__, so on a subclass it is one more
+        # place the caller's object gets to raise inside this module.
+        if type(key) is not str or not key:
             return None
         hash(key)
     except Exception:
@@ -349,12 +375,14 @@ class EwarTracker:
         # shown, and a character being read is exactly one worth keeping.
         self._chars: "OrderedDict[str, _CharState]" = OrderedDict()
         # The clock anchor, shared by every character on this machine (see the
-        # module docstring), plus the monotonic time the current unbroken run
-        # of rejections began -- None whenever the last stamped line was
-        # accepted.
+        # module docstring); the monotonic time the current unbroken run of
+        # rejections began -- None whenever the last stamped line was
+        # accepted; and the monotonic deadline until which nothing may arm
+        # after a re-anchor -- None when not quarantined.
         self._newest = None
         self._newest_at = 0.0
         self._rejecting_since = None
+        self._quarantine_until = None
 
     # --- ingest -------------------------------------------------------------
 
@@ -383,6 +411,15 @@ class EwarTracker:
         age = self._age_or_reject(log_ts, stamped)
         if age is None:
             return
+        # A re-anchor quarantines arming for one skew window, and the line
+        # that re-anchored is inside it: a re-anchored batch must not be
+        # believed just because it agrees with the anchor it brought with it.
+        # Lines still ANCHOR throughout (above), so the stream is back in step
+        # by the time this expires.
+        if self._quarantine_until is not None:
+            if stamped < self._quarantine_until:
+                return
+            self._quarantine_until = None
         if cls == "npc" and effect not in _NPC_EFFECTS_KEPT:
             return
 
@@ -436,8 +473,15 @@ class EwarTracker:
                 return None
             # Nothing but rejections for longer than a line is allowed to be
             # out of step: the ANCHOR is wrong, not the stream (a clock step,
-            # not a replay).  Re-anchor and let this line through.
+            # not a replay).  Re-anchor -- and quarantine arming, because on
+            # its own this branch believes a replay in full (see the module
+            # docstring, W1).
             self._anchor_on(stamp, now)
+            until = now + _REPLAY_SKEW_S
+            if self._quarantine_until is None or until > self._quarantine_until:
+                # Only ever extends: a caller handing back a smaller `now`
+                # must not be able to cut a live quarantine short.
+                self._quarantine_until = until
             return 0.0
         # Accepted: re-anchor, in EITHER direction (a forward-only anchor lets
         # one future-dated line silence the feature -- see the docstring).
