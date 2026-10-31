@@ -67,6 +67,10 @@ The helpers:
     Tear down ``widget``'s currently-shown tip explicitly, for the gestures
     where ``<Leave>`` cannot fire — see its docstring.
 
+``show_tooltip(widget)``
+    Show an attached tip now, with its current copy, for a tip whose target is
+    not the whole widget (so ``<Enter>`` cannot say whether it is wanted).
+
 ``update_tooltip(widget, text)``
     Change the copy of an ALREADY-attached tooltip. It exists because
     ``attach_tooltip``'s binds use ``add="+"``: calling it again on the same

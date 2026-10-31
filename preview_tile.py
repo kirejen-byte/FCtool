@@ -924,9 +924,17 @@ class TileWindow:
         self._body.pack(fill="both", expand=True, side="top")
         # ONE attach for the tile's lifetime, as for the implant icon, and with
         # the same reasons for topmost and place_above. It is on the body
-        # because the icons are not widgets: its text stays "" unless
-        # _track_ewar_tip has the cursor on an icon, so <Enter> alone never
-        # shows anything, and <Leave> and <Destroy> take the tip down for free.
+        # because the icons are not widgets: its text is "" until
+        # _track_ewar_tip has the cursor on an icon, so an <Enter> on the body
+        # while the cursor is off the row shows nothing, and <Leave> and
+        # <Destroy> take the tip down for free. Entering straight onto an icon
+        # from outside queues <Enter> on the toplevel and then on the body: the
+        # first opens the tip, and the second reaches this attach's own <Enter>,
+        # which rebuilds it from the now non-empty text. That is two builds
+        # (2-3 ms extra) and ends with one tip, which is correct.
+        # DO NOT blank _tooltip_text after the show to avoid that: _show calls
+        # _hide() before it reads the text, so the second <Enter> would then
+        # close the tip while the tile still believes it is up.
         ui_helpers.attach_tooltip(self._body, "", topmost=True, place_above=True,
                                   place_fn=self._place_ewar_tip)
 
@@ -2732,8 +2740,8 @@ class TileWindow:
         # (_ewar_px_or_none): a bare `self._w > 0` RAISES on None or a string,
         # and a raise here is a permanent fault - the very outcome "garbage is
         # no icons" exists to prevent. A width the gate refuses (a float, a
-        # bool, an out-of-range int) is therefore no icons too, and never
-        # reaches the popup (see the note on the request below).
+        # bool, an out-of-range int) is therefore no icons too, and is only
+        # ever sent with visible=False (see the note on the request below).
         visible = ((not self._hidden)
                    and _ewar_px_or_none(self._w) is not None
                    and _ewar_px_or_none(self._body_h) is not None)
@@ -2753,7 +2761,9 @@ class TileWindow:
         # answers False for a width it refuses (a float, a bool, an out-of-range
         # int) where BandWindow merely hides, and this tile turns any False into
         # a PERMANENT fault. The `visible` gate above is what keeps such a
-        # width from getting here: it accepts only what the popup accepts.
+        # width from being sent AS A VISIBLE ROW: it accepts only what the popup
+        # accepts. A refused width still arrives, with visible=False, and the
+        # popup's _sync returns before it reads the width.
         req = (x, y + STRIP_H, self._w, icons, icon_px, self._alpha, visible)
         if req == self._ewar_synced:
             return True
@@ -2839,17 +2849,24 @@ class TileWindow:
 
     def _track_ewar_tip(self, x, y):
         """Make the tooltip match a cursor at root point (x, y): the tip of the
-        icon under it, or none. THE one place a tip goes up, from a hover or
+        icon under it, or none. THE one place a tip is decided, from a hover or
         from a change under a still cursor (the icon row, its text, the tile's
         place). An unchanged answer touches no Tk, so this is free on the tick.
+        (_track_ewar_tip is the only code that decides a tip is wanted; the
+        body's own <Enter> can also rebuild one already up - see the attach in
+        __init__.)
 
         No tip opens mid-gesture: the grab has no <Leave> to close it with.
 
-        RE-ENTERED from show_tooltip: Tk holds <Motion> back to its idle queue,
-        and attach_tooltip's _show runs update_idletasks while it builds a tip.
-        Letting that nested hover build a tip of its own orphans the first
-        (nothing records it, so nothing ever closes it), so it is kept and
-        answered once the first is up.
+        RE-ENTRY GUARD (defensive): attach_tooltip's _show runs update_idletasks
+        while it builds a tip. MEASURED on Tk 8.6.15, that serves only idle
+        callbacks; a parked <Motion> is delivered by the next window pump, not
+        from there (7,884 posted moves under a real mainloop entered the guard
+        0 times). Only a Python after_idle callback can reach this method from
+        inside the build, and the app has one, an unrelated canvas settle. If
+        one did, a nested hover building a tip of its own would orphan the
+        first (nothing records it, so nothing ever closes it), so it is kept
+        and answered once the first is up.
 
         NEVER raises: set_ewar_icons reaches this from the preview tick. Nothing
         is logged, either - the text holds a module name from the log."""
