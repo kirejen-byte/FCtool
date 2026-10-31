@@ -23473,9 +23473,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         event's name is normalised the same way here or no tile would ever
         find its icons. The monitor's sink is attached UNCONDITIONALLY (see
         _preview_start_gamelog), so the feature toggle is read here -- that is
-        what lets the checkbox take effect without a restart. The line's own
-        log timestamp rides along: the tracker needs it to tell a replayed
-        file (the tailer re-reads from the top on rotation) from a live line."""
+        what lets the checkbox take effect without a restart. Everything that
+        arrives here is news: the tailer keeps this sink shut for any read of
+        a file that was not already caught up (spec 10.3)."""
         try:
             if not self._preview_ewar_on(self._preview_cfg()):
                 return
@@ -23483,7 +23483,6 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             if not key:
                 return
             self._preview_ewar.add(key, getattr(ev, "hit", None),
-                                   getattr(ev, "timestamp", ""),
                                    time.monotonic())
         except Exception:
             log.exception("[preview] EWAR ingest failed")

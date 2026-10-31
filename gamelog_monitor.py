@@ -59,6 +59,13 @@ The final " - " segment is always one of six hit-quality words
 (HIT_QUALITIES). An unrecognised final word is KEPT as the weapon, so a parse
 surprise fails toward "player" (red) — never toward silencing a hostile.
 
+EWAR cut-off (spec 10.3): a line is news only if its file was already caught
+up before the read that delivered it. Windows on the tiles expire on ARRIVAL
+time, so a backlog that reached them would light a calm tile for up to 30 s:
+history reads therefore never fire the EWAR sink. This tailer is the one place
+that KNOWS which reads are history (see _caught_up); damage, decloak and cyno
+dispatch are not affected, and nothing downstream re-checks a timestamp.
+
 ENGLISH CLIENT ONLY: the `(combat) … from` keyword match assumes the English
 localization. Localized clients use translated keywords and are out of scope
 for v1 (documented in the settings fine print).
@@ -265,11 +272,10 @@ class EwarEvent:
     """One INCOMING electronic-/capacitor-warfare line for one tailed character.
 
     Same WHO + WHEN + WHAT shape as its three siblings above. The timestamp is
-    the line's OWN, as written in the log, and it is load-bearing rather than
-    diagnostic: the tailer reseeds a rotated or truncated file from position
-    zero and REPLAYS it, so the consumer compares log timestamps to each other
-    to tell a live line from a replayed one (a replay that reached the icon
-    tracker would light every icon on a tile at once)."""
+    the line's OWN, as written in the log. Nothing compares it to anything: a
+    stale line never becomes an EwarEvent at all (see _caught_up), and a guard
+    on the consumer's side that inferred staleness from stamps is what the
+    cut-off replaced."""
     timestamp: str          # "YYYY.MM.DD HH:MM:SS" as written in the log
     character_name: str     # from the file's "Listener:" header
     hit: EwarHit            # effect / player-vs-npc / module / amount
@@ -579,6 +585,20 @@ class GamelogMonitor:
         #            predates the header line) but NOT always — see discover_files;
         #   "Name"   resolved and authoritative.
         self._listeners: dict[str, str | None] = {}
+        # The EWAR cut-off (spec 10.3): paths whose file had been read through
+        # to EOF at the last look. A line is news only if its file was ALREADY
+        # here before the read that delivered it; a read from any other path
+        # is history, so the EWAR sink stays shut for it and the path joins
+        # once that read has consumed the file. Membership is earned at exactly
+        # two places (seed_file at a real EOF, poll_file after a read) and lost
+        # when the tailer loses its place or stops reading: a rotation, an
+        # untracked file, a re-pointed folder. So it FAILS CLOSED: any route
+        # nobody thought of reads as history. The cost is that a first read can
+        # swallow up to one poll of fresh lines, which is the right way round
+        # for a tile that must never show a fight that is over.
+        # Poll-thread state, except that set_logs_dir clears it from the Tk
+        # thread with its neighbours above.
+        self._caught_up: set[str] = set()
         # New-file discovery gate (see discover_files) — mirrors chat_monitor's
         # `_last_dir_mtime` gate verbatim: re-globbing the Gamelogs directory is
         # O(files-in-dir) and, like Chatlogs, it accumulates files indefinitely
@@ -639,6 +659,7 @@ class GamelogMonitor:
         self._fingerprints.clear()
         self._buffers.clear()
         self._listeners.clear()
+        self._caught_up.clear()
         # _known_players is deliberately NOT cleared: player names are not
         # path-scoped, and it is poll-thread-owned (this runs on the Tk thread).
         self._last_dir_mtime = None
@@ -724,6 +745,15 @@ class GamelogMonitor:
         if mtime is None:
             return False
         return (time.time() - mtime) <= self._SEED_TAIL_WINDOW_SECONDS
+
+    def _at_eof(self, path, position) -> bool:
+        """True when a real stat puts EOF exactly at `position`.
+
+        A real stat, never a pre-fetched ``st``: see seed_file."""
+        try:
+            return os.path.getsize(path) == position
+        except OSError:
+            return False
 
     def _is_tracked(self, listener: str) -> bool:
         if self._tracked is None:
@@ -908,6 +938,22 @@ class GamelogMonitor:
         self._buffers[path] = ""
         eager = resume < size or self._within_tail_window(mtime)
         self._listeners[path] = self._read_listener(path) if eager else None
+        # The EWAR cut-off: only a file that really resumes at EOF starts out
+        # caught up. `size` cannot answer that. `st` is normally a directory
+        # enumeration entry, and that LAGS a file a writer holds open (measured
+        # on NTFS: 100 bytes reported for 25,100 written, until something
+        # opened the file). EVE holds its gamelog open, so on the very relaunch
+        # this rule exists for, a persisted position behind the real EOF equals
+        # the enumerated size. The extra stat is paid only here, once, by the
+        # few eager files, which have just paid a header read anyway.
+        # A DEFERRED file stays out as well: nothing reads it until the gated
+        # scan promotes it, so its bytes pile up exactly as a hidden tile's do.
+        # The discard matters when the path is already in the set: the poll
+        # thread can add it back just after set_logs_dir cleared the set.
+        if eager and self._at_eof(path, resume):
+            self._caught_up.add(path)
+        else:
+            self._caught_up.discard(path)
 
     def poll_once(self):
         """One cycle: discover new files, then tail each tracked file."""
@@ -931,6 +977,9 @@ class GamelogMonitor:
                 continue
             listener = self._listener_for(path)
             if not self._is_tracked(listener):
+                # Its unread bytes pile up while the tile is away and would
+                # otherwise arrive as one stale batch when it returns.
+                self._caught_up.discard(path)
                 continue
             self.poll_file(path)
         self._maybe_flush_state()
@@ -970,8 +1019,9 @@ class GamelogMonitor:
         cheap substring); on a hit a DecloakEvent is emitted via on_decloak, and
         again through parse_cyno_active_line() for on_cyno_active, and again
         through parse_ewar_line() for on_ewar (which additionally requires a
-        non-empty listener -- see the comment at that call site). All three
-        extra parses are skipped entirely when their sink is None.
+        non-empty listener and a live read -- see the comment where `ewar_sink`
+        is decided). All three extra parses are skipped entirely when their
+        sink is None.
 
         The file's `Listener:` is resolved only once there is actually new text
         to attribute (below), so a pass that finds nothing new never opens the
@@ -1009,9 +1059,14 @@ class GamelogMonitor:
             self._buffers[path] = ""
             self._fingerprints[path] = b""
             fingerprint = b""
+            # Before the re-read, and on the set rather than a local: the
+            # fingerprint is gone, so if that read fails the next pass cannot
+            # see a rotation at all and resumes from the old position.
+            self._caught_up.discard(path)
 
         if size <= read_start:
             self._positions[path] = read_start
+            self._caught_up.add(path)                # nothing left unread
             return
 
         try:
@@ -1029,6 +1084,20 @@ class GamelogMonitor:
         text = self._buffers.get(path, "") + raw.decode("utf-8", errors="replace")
         lines = text.split("\n")
         self._buffers[path] = lines.pop()            # trailing partial line
+        # Incoming EWAR's sink for THIS read, decided once (spec 10.3): shut
+        # unless the file was caught up before the read, which is why it costs
+        # no per-line state. An UNSET callback stays the cheap gate: no sink, no
+        # parse at all.
+        #
+        # `and listener` is NOT defensive noise: "" is one of this tailer's
+        # four real listener states (see _listeners above) and ~48% of a
+        # live Gamelogs folder predates the `Listener:` header line. The
+        # consumer keys its per-character icon state on the name, so an
+        # event named "" would smear ONE headerless file's EWAR across
+        # every other headerless character's tile. A nameless event is one
+        # the consumer cannot use, so it is dropped here instead.
+        ewar_sink = (self._on_ewar
+                     if listener and path in self._caught_up else None)
         for ln in lines:
             hit = parse_damage_detail(ln)
             if hit is not None:
@@ -1063,29 +1132,22 @@ class GamelogMonitor:
                 ev = parse_cyno_active_line(ln, listener)
                 if ev is not None:
                     self._on_cyno_active(ev)
-            # Incoming EWAR (the preview tiles' icon bar); same pass, same
-            # cheap-gate deal -- no sink, no parse at all.
-            #
-            # `and listener` is NOT defensive noise: "" is one of this tailer's
-            # four real listener states (see _listeners above) and ~48% of a
-            # live Gamelogs folder predates the `Listener:` header line. The
-            # consumer keys its per-character icon state on the name, so an
-            # event named "" would smear ONE headerless file's EWAR across
-            # every other headerless character's tile. A nameless event is one
-            # the consumer cannot use, so it is dropped here instead.
+            # Incoming EWAR (the preview tiles' icon bar); same pass. The only
+            # sink this read may shut (see `ewar_sink` above).
             #
             # `ewar_hit`, not `hit`: `hit` above is the damage tuple, and one
             # name carrying two types in one loop body is what a later edit
             # trips over.
-            if self._on_ewar is not None and listener:
+            if ewar_sink is not None:
                 ewar_hit = parse_ewar_line(ln)
                 if ewar_hit is not None:
-                    self._on_ewar(EwarEvent(timestamp=_ts_of(ln),
-                                            character_name=listener,
-                                            hit=ewar_hit))
+                    ewar_sink(EwarEvent(timestamp=_ts_of(ln),
+                                        character_name=listener,
+                                        hit=ewar_hit))
 
         new_pos = read_start + len(raw)              # raw byte length; no *2
         self._positions[path] = new_pos
+        self._caught_up.add(path)                    # the file is consumed
         # Record a tail fingerprint of what we just consumed (up to 64 bytes) so
         # a truncate-then-rewrite with unchanged size is still caught next poll.
         fp_len = min(64, len(raw))
