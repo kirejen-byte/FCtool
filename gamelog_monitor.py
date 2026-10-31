@@ -83,9 +83,19 @@ from chat_monitor import HEADER_LISTENER_PATTERN
 # ONE-WAY by design -- ewar_parse imports nothing from here. It keeps its own
 # copy of the tag-stripping regex instead of importing _TAG_RE back, because
 # that name is defined far BELOW this import block (either module would see a
-# half-initialised other) and because this module computes app_dir() at import
-# time, which would cost that pure module its purity. See ewar_parse's module
-# docstring: re-pointing _TAG_RE the other way was considered and rejected.
+# half-initialised other) and because importing THIS module is not free: it
+# pulls in dozens of others, and the module-level get_logger() call below
+# CONFIGURES THE ROOT LOGGER and opens fctool.log. None of that is something a
+# line parser should need in order to be loaded or tested. (It is NOT a write
+# probe -- app_dir() hard-codes writable=True on the from-source branch,
+# app_path.py:223-227; the probe runs only in the frozen branches.) See
+# ewar_parse's module docstring, which records the same reason: re-pointing
+# _TAG_RE the other way was considered and rejected.
+#
+# `EwarHit` is imported for EwarEvent's annotation and as a deliberate
+# re-export -- this module is where consumers and tests reach the event types.
+# `from __future__ import annotations` turns that annotation into a string, so
+# an unused-import sweep will read the name as dead. It is not. Keep it.
 from ewar_parse import EwarHit, parse_ewar_line
 
 log = get_logger(__name__)
@@ -1063,11 +1073,16 @@ class GamelogMonitor:
             # event named "" would smear ONE headerless file's EWAR across
             # every other headerless character's tile. A nameless event is one
             # the consumer cannot use, so it is dropped here instead.
+            #
+            # `ewar_hit`, not `hit`: `hit` above is the damage tuple, and one
+            # name carrying two types in one loop body is what a later edit
+            # trips over.
             if self._on_ewar is not None and listener:
-                hit = parse_ewar_line(ln)
-                if hit is not None:
+                ewar_hit = parse_ewar_line(ln)
+                if ewar_hit is not None:
                     self._on_ewar(EwarEvent(timestamp=_ts_of(ln),
-                                            character_name=listener, hit=hit))
+                                            character_name=listener,
+                                            hit=ewar_hit))
 
         new_pos = read_start + len(raw)              # raw byte length; no *2
         self._positions[path] = new_pos
