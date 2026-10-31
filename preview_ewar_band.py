@@ -53,8 +53,9 @@ here rather than borrowed from preview_band so that neither sibling's import
 surface or Win32 census depends on the other's.
 
 The ARTWORK comes from ewar_icons.icon_rgba as straight RGBA glyphs; the dark
-chip and the red hairline round it are composed HERE (design A4b), so swapping
-or withdrawing the art stays an asset edit.
+chip and its hairline - whose colour is PER EFFECT, see BORDER_COLORS - are
+composed HERE (design A4b), so swapping or withdrawing the art stays an asset
+edit.
 
 Compliance: every call here targets a window THIS process created on THIS
 thread. The owner hwnd is checked before a popup is created. No message, input
@@ -63,10 +64,35 @@ or focus function is bound, and nothing draws text (tests pin the census).
 from __future__ import annotations
 
 from ewar_icons import ICON_SIZES, icon_rgba
+from ewar_parse import ICON_ORDER
 
-#: The red hairline round each chip (owner decision D2). THE one place this hex
-#: is written.
-BORDER_COLOR = "#ff3b30"
+#: A chip's hairline is the aggression red by default - the same red player
+#: damage paints a border with (owner decision D2, and the equality with
+#: damage_flash.PLAYER_COLOR_DEFAULT is asserted, not coincidental: one fact,
+#: two renderings). THE one place this hex is written.
+BORDER_COLOR_DEFAULT = "#ff3b30"
+
+#: ... except where two icons cannot be told apart by their shape. MEASURED
+#: 2026-10-30: scramble and disruption are 96 % identical in silhouette at
+#: 14 px - pairwise RMS 13.2, against 34.5 for the next-closest pair - because
+#: both are the same grey module body and differ mainly in a blue-vs-teal
+#: highlight that a 14 px chip does not carry.
+#:
+#: The fixed bar order (spec A2) does NOT fix this, which is the whole reason a
+#: colour was needed: position separates the two only while BOTH are showing,
+#: and a LONE point icon is the common case - exactly the moment the pilot
+#: needs to know whether an MWD will get them out. So SCRAMBLE keeps the red,
+#: being the one that defeats an MWD, and disruption goes amber. jam, neut and
+#: nos were measured clearly distinct from each other and from the pair, so
+#: they keep the red: another colour there would add noise, not information.
+_BORDER_OVERRIDES = {"disruption": "#ffb01f"}
+
+#: Every effect's hairline, BUILT FROM ICON_ORDER rather than written out, so
+#: it cannot drift from it: a sixth effect added upstream arrives here with the
+#: default red on the same commit, with no edit, no missing key and no
+#: KeyError. Read it through border_color().
+BORDER_COLORS = {effect: _BORDER_OVERRIDES.get(effect, BORDER_COLOR_DEFAULT)
+                 for effect in ICON_ORDER}
 
 #: The chip behind a glyph: black at ~72 % alpha (D2). 0.72 * 255 = 183.6.
 CHIP_BG_ALPHA = 184
@@ -104,7 +130,15 @@ def _parse_hex(color, fallback):
     return fallback
 
 
-_BORDER_RGB = _parse_hex(BORDER_COLOR, _BORDER_FALLBACK)
+def border_color(effect):
+    """The hairline colour of `effect`'s chip: its BORDER_COLORS entry, or the
+    default red for an effect the table does not name. Pure; never raises - an
+    unhashable effect (a list, a dict) reads as the default too, so this is
+    safe to call before anything has validated the effect name."""
+    try:
+        return BORDER_COLORS.get(effect, BORDER_COLOR_DEFAULT)
+    except TypeError:
+        return BORDER_COLOR_DEFAULT
 
 
 def _int_or(value, default):
@@ -218,9 +252,10 @@ def _fit_width(icons, icon_px, tile_w):
 
 
 def _chip_pixels(effect, icon_px):
-    """ONE chip's premultiplied BGRA, top-down: the border colour on all four
-    edges at full alpha, the dark chip inside it, and the glyph composited
-    over that. chip * chip * 4 bytes, or b"" when the sheet cannot serve it.
+    """ONE chip's premultiplied BGRA, top-down: this EFFECT'S border colour
+    (border_color) on all four edges at full alpha, the dark chip inside it,
+    and the glyph composited over that. chip * chip * 4 bytes, or b"" when the
+    sheet cannot serve it.
 
     Per interior pixel, with the glyph's straight (r, g, b, a):
         alpha  = a + CHIP_BG_ALPHA * (255 - a) / 255
@@ -232,7 +267,7 @@ def _chip_pixels(effect, icon_px):
     if rgba is None or len(rgba) != icon_px * icon_px * 4:
         return b""
     chip = _chip_size(icon_px)
-    r, g, b = _BORDER_RGB
+    r, g, b = _parse_hex(border_color(effect), _BORDER_FALLBACK)
     buf = bytearray(bytes((b, g, r, 255)) * (chip * chip))
     span = 4 * icon_px
     for y in range(icon_px):
@@ -252,7 +287,11 @@ def _chip_pixels(effect, icon_px):
 #: Composed chips, keyed (effect, icon_px). The sheet carries five effects at
 #: four sizes, so this is bounded at 20 entries and 40,520 bytes (39.6 KB) -
 #: measured; five effects times the sum of (px + 2) ** 2 * 4 over ICON_SIZES.
-#: Every value is deterministic: a chip is the artwork plus two constants.
+#: Every value is deterministic: a chip is the artwork, two constants and
+#: border_color(effect). The hairline is a pure function of `effect`, which is
+#: HALF THE KEY, so no key can ever map to two colours and the cache cannot
+#: hand back a chip of the wrong one. Keyed on the size alone - as it would
+#: have been before the colour was per effect - it could.
 #: Filled on demand rather than at import, so a tile that never shows an icon,
 #: and the Wine build that cannot show one at all, pay nothing.
 _CHIPS = {}
