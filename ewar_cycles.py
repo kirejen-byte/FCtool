@@ -230,6 +230,32 @@ _SIZES = ("small", "medium", "heavy", "capital")
 _NEUTRALIZER_BY_SIZE = {"small": 6000, "medium": 12000, "heavy": 24000, "capital": 48000}
 _NOSFERATU_BY_SIZE = {"small": 2500, "medium": 5000, "heavy": 10000, "capital": 20000}
 
+#: Cycle per FAMILY word, for a jam module the table does not carry -- the two
+#: families whose cycle is uniform across every type in the data: 20000 ms
+#: across all 43 ECM types and 30000 ms across all 11 burst jammers.  A test
+#: pins both against the generated table, so neither can drift.
+#:
+#: This is the same kind of name-borne fact the size-word step rests on, and it
+#: is here for the same reason: without it a jam module CCP adds between
+#: releases falls to the 15 s default, whose window ends halfway through the
+#: real 20 s jam and blinks the icon out while the character is still jammed.
+#:
+#: Tested in THIS order, smallest index winning, because a name carrying both
+#: words is a burst jammer that happens to mention ECM, never the other way
+#: round -- 30000 must answer before the bare ECM rule can offer 20000.
+_FAMILY_ORDER = ("burst jammer", "ecm")
+_FAMILY_CYCLE_MS = {"burst jammer": 30000, "ecm": 20000}
+
+#: A structure burst projector shares a family word with a ship module and
+#: shares nothing else: it cycles on the order of minutes.  "ECM Jammer Burst
+#: Projector" is the one that matters -- the SDE publishes no attribute 73 for
+#: it, so it is absent from the generated table, and letting it inherit a ship
+#: ECM module's 20 s would be a fabricated number dressed as a measured one.
+#: It is excluded from the family-word step and falls to the default instead.
+#: (The projector that DOES publish a duration, Energy Neutralization Burst
+#: Projector at 480 s, is in the table and never reaches this step.)
+_BURST_PROJECTOR = "burst projector"
+
 #: Amount buckets, DELIBERATELY BIASED DOWNWARD (design A1c).  Each threshold
 #: is the top of a size's unbonused GJ band as measured from the dogma blob
 #: (neutralizer attribute 97: 45-60 / 150-195 / 500-650 / 3600-4400;
@@ -246,8 +272,16 @@ _NOSFERATU_BY_SIZE = {"small": 2500, "medium": 5000, "heavy": 10000, "capital": 
 _NEUTRALIZER_BUCKETS = ((195.0, 6000), (650.0, 12000), (4400.0, 24000))
 _NOSFERATU_BUCKETS = ((39.0, 2500), (130.0, 5000), (800.0, 10000))
 
+#: A SNAPSHOT of MODULE_CYCLE_MS, built once at import.  The gamelog writes a
+#: module's name in the SDE's own casing, so this exists only to survive a
+#: client or parser that does not.  Because it is a snapshot, mutating or
+#: monkeypatching MODULE_CYCLE_MS after import has NO effect on lookups -- a
+#: test that wants a different table has to patch this dict too, or reload the
+#: module.
 _CYCLE_BY_LOWER_NAME = {name.lower(): ms for name, ms in MODULE_CYCLE_MS.items()}
+
 _SIZE_RE = re.compile(r"\b(" + "|".join(_SIZES) + r")\b")
+_FAMILY_RE = re.compile(r"\b(" + "|".join(_FAMILY_ORDER) + r")\b")
 
 
 def _as_name(module_name) -> str:
@@ -312,6 +346,21 @@ def _from_size_word(name: str):
     return by_size.get(min(found, key=_SIZES.index))
 
 
+def _from_family_word(name: str):
+    """Step 2b: a jam family whose cycle is uniform across every known type.
+
+    Only the two jam families qualify.  The capacitor-warfare families spread
+    their cycles across four sizes, so for them the size word above is the
+    only name-borne fact, and a bare "Neutralizer" says nothing on its own.
+    """
+    if _BURST_PROJECTOR in name:
+        return None
+    found = _FAMILY_RE.findall(name)
+    if not found:
+        return None
+    return _FAMILY_CYCLE_MS.get(min(found, key=_FAMILY_ORDER.index))
+
+
 def _from_amount(name: str, value):
     """Step 3: bucket the GJ amount, biased toward the smaller module."""
     if value is None:
@@ -336,12 +385,16 @@ def cycle_ms_for(module_name, amount=None) -> int:
 
     ``module_name`` is the module as the gamelog named it; ``amount`` is the
     line's GJ figure, or None for an effect that carries none (a jam).  The
-    four steps are tried in order and the first that answers wins:
+    steps are tried in order and the first that answers wins:
 
     1. an exact :data:`MODULE_CYCLE_MS` hit;
-    2. a size word in the name together with a family word;
+    2. a size word in the name together with a capacitor-warfare family word;
+    2b. a jam family word whose cycle is uniform in the data;
     3. the amount, bucketed downward;
     4. :data:`_DEFAULT_CYCLE_MS`.
+
+    Steps 1, 3 and 4 are design A1c; step 2b was added on the lead's
+    authority after review, on the same reasoning as step 2.
 
     Always returns a positive int.  Never raises -- see the module docstring.
     """
@@ -351,8 +404,13 @@ def cycle_ms_for(module_name, amount=None) -> int:
         if resolved is None:
             resolved = _from_size_word(name)
         if resolved is None:
+            resolved = _from_family_word(name)
+        if resolved is None:
             resolved = _from_amount(name, _as_amount(amount))
-    except Exception:  # pragma: no cover - the tick must survive anything
+    except Exception:
+        # Reachable: an int too large for a float raises OverflowError inside
+        # _as_amount.  Beyond that it is the net that keeps an exception out
+        # of the preview tick, where one would retire the tile.
         resolved = None
     if isinstance(resolved, int) and not isinstance(resolved, bool) and resolved > 0:
         return resolved
