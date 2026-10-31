@@ -61,15 +61,28 @@ if _ROOT not in sys.path:
 from ewar_parse import ICON_ORDER          # noqa: E402  (after the path fix)
 from ewar_icons import ICON_SIZES          # noqa: E402
 
-#: effect -> (type ID, module whose artwork the effect borrows).  The modules
-#: are the plainest representative of each family; the icon stands for the
-#: EFFECT, not for the exact module that applied it.
+#: effect -> (type ID, module whose artwork the effect borrows, sha256 of the
+#: source icon as fetched).  The modules are the plainest representative of
+#: each family; the icon stands for the EFFECT, not for the exact module that
+#: applied it.
+#:
+#: The digest is PINNED and re-checked against every byte this tool reads,
+#: fetched or cached, on every run.  Without that, a substituted cache would be
+#: baked into the sheet AND into NOTICE.txt's digest list, so the notice would
+#: certify art nobody ever verified.  When CCP legitimately reissues an icon
+#: the run refuses and says so; ``--accept-changed`` proceeds and prints the
+#: new digests to paste in here, in the same commit as the new sheet.
 SOURCES = {
-    "jam":        (2567,  "Multispectral ECM II"),
-    "scramble":   (448,   "Warp Scrambler II"),
-    "disruption": (3244,  "Warp Disruptor II"),
-    "neut":       (13003, "Small Energy Neutralizer II"),
-    "nos":        (13001, "Small Energy Nosferatu II"),
+    "jam":        (2567,  "Multispectral ECM II",
+                   "59e5484a6d0511352172510adcf4551a08ea30c50abf1b7b89e9c656db5c65f4"),
+    "scramble":   (448,   "Warp Scrambler II",
+                   "e35414946aeaf1fd46900dad91883cb9f3652c38d54b2817b06754413db9882d"),
+    "disruption": (3244,  "Warp Disruptor II",
+                   "74a5d8ffdae7fec03fb87c8f7835c209fdc424bf3910b223f7d1d39d0be6b4fe"),
+    "neut":       (13003, "Small Energy Neutralizer II",
+                   "fbda2802ea50a2287f40144a3f2f3b5a69572c39e6a28334c41d64da786179ce"),
+    "nos":        (13001, "Small Energy Nosferatu II",
+                   "a926ca99ba8b7c6ca41b7ccec8775ce80ad5f4fe1f0ed68176986c7b76cf28cf"),
 }
 
 IMAGE_HOST = "images.evetech.net"
@@ -152,24 +165,50 @@ def cache_path(type_id: int, cache_dir: str = CACHE_DIR) -> str:
     return os.path.join(cache_dir, "type_%d_%d.png" % (type_id, SOURCE_PX))
 
 
-def fetch_all(cache_dir: str = CACHE_DIR, *, force: bool = False) -> dict[str, str]:
-    """Download every missing source icon into ``cache_dir``.  Returns
-    effect -> sha256 of the cached bytes."""
+def _verify(effect: str, blob: bytes, *, accept_changed: bool) -> str:
+    """The sha256 of ``blob``, after checking it against the pinned digest.
+
+    Runs on EVERY byte the build reads, fetched or cached: a cache is just a
+    directory on disk, and an unverified one would be baked into the sheet and
+    then certified by the digest list in NOTICE.txt."""
+    type_id, name, expected = SOURCES[effect]
+    if not blob.startswith(PNG_SIGNATURE):
+        raise BuildError("the source for %s (type %d) is not a PNG" % (effect, type_id))
+    digest = hashlib.sha256(blob).hexdigest()
+    if digest != expected:
+        if not accept_changed:
+            raise BuildError(
+                "%s (%s, type %d) does not match its pinned digest:\n"
+                "    expected %s\n    got      %s\n"
+                "Either the cache was substituted, or CCP reissued the icon. "
+                "Re-run with --force to re-download; if the new art is what you "
+                "want, --accept-changed proceeds and prints the digests to pin."
+                % (effect, name, type_id, expected, digest))
+        print("  CHANGED  %s: pinned %s, got %s" % (effect, expected, digest))
+    return digest
+
+
+def fetch_all(cache_dir: str = CACHE_DIR, *, force: bool = False,
+              download: bool = True, accept_changed: bool = False) -> dict[str, str]:
+    """Make sure every source icon is in ``cache_dir`` and verified.  Returns
+    effect -> sha256 of the bytes that will be built into the sheet."""
     os.makedirs(cache_dir, exist_ok=True)
     digests = {}
     for effect in ICON_ORDER:
-        type_id, name = SOURCES[effect]
+        type_id, name, _expected = SOURCES[effect]
         path = cache_path(type_id, cache_dir)
-        if force or not os.path.exists(path):
+        if (force or not os.path.exists(path)) and download:
             print("fetching %s (%s, type %d)" % (effect, name, type_id))
             blob = fetch_icon(type_id)
             with open(path, "wb") as fh:
                 fh.write(blob)
         else:
+            if not os.path.exists(path):
+                raise BuildError("missing cached source %s -- run --fetch first" % path)
             with open(path, "rb") as fh:
                 blob = fh.read()
             print("cached   %s (%s, type %d)" % (effect, name, type_id))
-        digests[effect] = hashlib.sha256(blob).hexdigest()
+        digests[effect] = _verify(effect, blob, accept_changed=accept_changed)
     return digests
 
 
@@ -200,7 +239,7 @@ def build_sheet(cache_dir: str = CACHE_DIR):
     width, height = sheet_size()
     sheet = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     for effect in ICON_ORDER:
-        type_id, _name = SOURCES[effect]
+        type_id, _name, _expected = SOURCES[effect]
         path = cache_path(type_id, cache_dir)
         if not os.path.exists(path):
             raise BuildError("missing cached source %s -- run --fetch first" % path)
@@ -286,7 +325,7 @@ def notice_text(digests: dict[str, str]) -> str:
     width, height = sheet_size()
     lines = []
     for effect in ICON_ORDER:
-        type_id, name = SOURCES[effect]
+        type_id, name, _expected = SOURCES[effect]
         lines.append("  %-11s type ID %-6d %s" % (effect, type_id, name))
         digest = digests.get(effect)
         if digest:
@@ -313,17 +352,6 @@ def write_notice(digests: dict[str, str], out_dir: str = ASSET_DIR) -> str:
 
 # ------------------------------------------------------------------- the CLI
 
-def _digests_from_cache(cache_dir: str) -> dict[str, str]:
-    digests = {}
-    for effect in ICON_ORDER:
-        type_id, _name = SOURCES[effect]
-        path = cache_path(type_id, cache_dir)
-        if os.path.exists(path):
-            with open(path, "rb") as fh:
-                digests[effect] = hashlib.sha256(fh.read()).hexdigest()
-    return digests
-
-
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--plan", action="store_true",
@@ -331,6 +359,9 @@ def main(argv=None) -> int:
     ap.add_argument("--fetch", action="store_true", help="download the source icons")
     ap.add_argument("--build", action="store_true", help="write the sheet and the notice")
     ap.add_argument("--force", action="store_true", help="re-download cached sources")
+    ap.add_argument("--accept-changed", action="store_true",
+                    help="proceed when a source no longer matches its pinned "
+                         "digest, and print the new digests to pin")
     ap.add_argument("--cache", default=CACHE_DIR, help="cache directory")
     ap.add_argument("--out", default=ASSET_DIR, help="asset output directory")
     args = ap.parse_args(argv)
@@ -340,15 +371,18 @@ def main(argv=None) -> int:
         print("sheet: %d x %d RGBA, rows %s, columns %s"
               % (width, height, list(ICON_ORDER), list(ICON_SIZES)))
         for effect in ICON_ORDER:
-            type_id, name = SOURCES[effect]
+            type_id, name, _expected = SOURCES[effect]
             print("  %-11s %s  <- %s" % (effect, url_for(type_id), name))
         return 0
 
     do_fetch = args.fetch or not args.build
     do_build = args.build or not args.fetch
     try:
-        digests = (fetch_all(args.cache, force=args.force) if do_fetch
-                   else _digests_from_cache(args.cache))
+        # Verifies every source byte against its pinned digest whether it was
+        # just downloaded or came out of the cache, so NOTICE.txt can never
+        # certify art that nothing checked.
+        digests = fetch_all(args.cache, force=args.force, download=do_fetch,
+                            accept_changed=args.accept_changed)
         if do_build:
             sheet = write_sheet(args.out, args.cache)
             notice = write_notice(digests, args.out)
@@ -357,6 +391,12 @@ def main(argv=None) -> int:
             print("wrote %s (%d bytes)" % (notice, os.path.getsize(notice)))
     except BuildError as exc:
         print("build failed: %s" % exc, file=sys.stderr)
+        return 1
+    except Exception as exc:
+        # A poisoned or truncated cache file reaches the imaging library, which
+        # raises its own types (UnidentifiedImageError, OSError). A dev tool may
+        # fail; it should not fail as a traceback.
+        print("build failed: %s: %s" % (type(exc).__name__, exc), file=sys.stderr)
         return 1
     return 0
 

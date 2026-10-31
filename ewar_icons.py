@@ -115,9 +115,16 @@ def _decode_rgba_png(data):
                 break
         if not seen_ihdr or not idat:
             return None
-        raw = zlib.decompress(b"".join(idat))
         stride = width * _BPP
-        if len(raw) != (stride + 1) * height:
+        wanted = (stride + 1) * height
+        # BOUNDED inflate.  NOTICE.txt invites a third party to drop a
+        # replacement sheet in, so a hostile or merely broken IDAT is a
+        # reachable input, not a theoretical one -- and a 122 KB file whose
+        # IDAT expands 1000:1 peaks at hundreds of MB if the size is only
+        # checked afterwards.  ``decompressobj`` stops at the byte after the
+        # one valid sheet's worth, and anything that long is refused below.
+        raw = zlib.decompressobj().decompress(b"".join(idat), wanted + 1)
+        if len(raw) != wanted:
             return None
         out = bytearray(stride * height)
         prev = bytearray(stride)
@@ -219,5 +226,8 @@ def icon_rgba(effect, px):
     Never raises; the same call always returns the same object."""
     try:
         return _CELLS.get((effect, px))
-    except TypeError:
-        return None                             # an unhashable effect or size
+    except Exception:
+        # Not just TypeError: hashing the key runs the ARGUMENT's ``__hash__``,
+        # and an object whose ``__hash__`` raises ValueError (or anything else)
+        # would otherwise escape into the preview tick and retire the tile.
+        return None
