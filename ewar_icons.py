@@ -34,8 +34,8 @@ missing, corrupt or wrongly encoded sheet makes every call answer None, and the
 popup then draws nothing -- absent icons are a cosmetic loss, a dead tile is
 not.
 
-The whole sheet is a few KB, so it is decoded ONCE at import and every cell is
-kept (about 34 KB in all).  No call touches the filesystem, and there is no
+The whole sheet is about 21 KB, so it is decoded ONCE at import and every cell
+is kept (about 34 KB in all).  No call touches the filesystem, and there is no
 lazy path to get wrong.  The cells are immutable ``bytes``, so handing the same
 object to several callers on several threads is safe.
 """

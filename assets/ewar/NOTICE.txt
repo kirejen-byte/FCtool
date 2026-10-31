@@ -24,23 +24,26 @@ Sources
 
 Each icon was fetched once, at build time, from
 
-    https://images.evetech.net/types/<type ID>/icon?size=64
+    https://images.evetech.net/types/<type ID>/icon?size=256
 
-and was resized to each of the sizes listed under "Layout". Nothing else was
-changed: no recolouring, no cropping, no composition. The dark chip and the red
-border drawn around an icon in the application are composed at paint time and
-are not part of this artwork.
+and was then altered so that it reads at these small sizes. Each icon was
+cropped to fill its cell (centred halfway between the glyph's outline and its
+visual weight, with a 10% margin), resized to each of the sizes listed under
+"Layout", sharpened, and colour-adjusted (saturation +25%, contrast +12%).
+Nothing else was changed and nothing was composed into the art: the dark chip
+and the red border drawn around an icon in the application are composed at
+paint time and are not part of this artwork.
 
-  scramble    type ID 448    Warp Scrambler II
-              sha256  e35414946aeaf1fd46900dad91883cb9f3652c38d54b2817b06754413db9882d
-  disruption  type ID 3244   Warp Disruptor II
-              sha256  74a5d8ffdae7fec03fb87c8f7835c209fdc424bf3910b223f7d1d39d0be6b4fe
-  jam         type ID 2567   Multispectral ECM II
-              sha256  59e5484a6d0511352172510adcf4551a08ea30c50abf1b7b89e9c656db5c65f4
-  neut        type ID 13003  Small Energy Neutralizer II
-              sha256  fbda2802ea50a2287f40144a3f2f3b5a69572c39e6a28334c41d64da786179ce
-  nos         type ID 13001  Small Energy Nosferatu II
-              sha256  a926ca99ba8b7c6ca41b7ccec8775ce80ad5f4fe1f0ed68176986c7b76cf28cf
+  scramble    type ID 447    Warp Scrambler I
+              sha256  6e801038b83ae3950d43e2706cdc1a11c96a9f4f47dd50005b9d18eefeb03757
+  disruption  type ID 3242   Warp Disruptor I
+              sha256  deeb190b45e3c77c643f17706b8795d6bb59cdc51d665f7171cd1df97acfd4ee
+  jam         type ID 1957   Multispectral ECM I
+              sha256  b7447fe7f88fafc0c3a3839456cc380a0c2582f8c425cc207015b7c08eae879d
+  neut        type ID 533    Small Energy Neutralizer I
+              sha256  cd5566052fc5094e3b7dc8dea2779519a5bddcd9521fb812f5e0c7fdaffd284b
+  nos         type ID 530    Small Energy Nosferatu I
+              sha256  aea46934c2148e5df72974760589b1406d2ca5f581e3eef0ec5512d9d7fc24ad
 
 Layout
 ------
@@ -68,4 +71,5 @@ x = SIZE[0] + ... + SIZE[j-1], y = i * 27. Everything outside a cell is
 fully transparent.
 
 To swap the art: write a sheet of exactly these dimensions, in this layout, in
-this format, over ewar_icons.png. No code reads anything else out of the file.
+this format, over ewar_icons.png. No code reads anything else out of the file, and a
+replacement need not be cropped or adjusted the way this one was.
