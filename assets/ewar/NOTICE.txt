@@ -1,0 +1,71 @@
+FCTool EWAR icon sheet - third-party notices
+============================================
+
+The sprite sheet in this folder (ewar_icons.png) is built by
+tools/build_ewar_icons.py from artwork published by CCP hf. on its official
+image server, https://images.evetech.net/ .
+
+(c) CCP hf. All rights reserved.
+
+EVE Online and the EVE logo are the registered trademarks of CCP hf. All
+rights are reserved worldwide. FCTool is a free fan-made tool; CCP hf. is
+not affiliated with it and does not endorse it.
+
+CCP's Developer License Agreement grants the right to use, display and
+distribute CCP's Game Data - which includes the images CCP makes available -
+within an application, and allows CCP to require that material be removed on
+seven days' notice. The art is therefore shipped as a plain asset: it can be
+regenerated, replaced or removed WITHOUT a code change, from the facts below
+alone.
+
+
+Sources
+-------
+
+Each icon was fetched once, at build time, from
+
+    https://images.evetech.net/types/<type ID>/icon?size=64
+
+and was resized to each of the sizes listed under "Layout". Nothing else was
+changed: no recolouring, no cropping, no composition. The dark chip and the red
+border drawn around an icon in the application are composed at paint time and
+are not part of this artwork.
+
+  scramble    type ID 448    Warp Scrambler II
+              sha256  e35414946aeaf1fd46900dad91883cb9f3652c38d54b2817b06754413db9882d
+  disruption  type ID 3244   Warp Disruptor II
+              sha256  74a5d8ffdae7fec03fb87c8f7835c209fdc424bf3910b223f7d1d39d0be6b4fe
+  jam         type ID 2567   Multispectral ECM II
+              sha256  59e5484a6d0511352172510adcf4551a08ea30c50abf1b7b89e9c656db5c65f4
+  neut        type ID 13003  Small Energy Neutralizer II
+              sha256  fbda2802ea50a2287f40144a3f2f3b5a69572c39e6a28334c41d64da786179ce
+  nos         type ID 13001  Small Energy Nosferatu II
+              sha256  a926ca99ba8b7c6ca41b7ccec8775ce80ad5f4fe1f0ed68176986c7b76cf28cf
+
+Layout
+------
+
+The sheet is 80 x 135 pixels, truecolour RGBA (PNG colour type 6, bit
+depth 8), non-interlaced, with STRAIGHT (not premultiplied) alpha.
+
+Rows are the effects, in this order, top to bottom:
+
+  1. scramble
+  2. disruption
+  3. jam
+  4. neut
+  5. nos
+
+Columns are the icon sizes, in this order, left to right:
+
+  1. 14 px
+  2. 18 px
+  3. 21 px
+  4. 27 px
+
+Cell (row i, column j) is the square of side SIZE[j] whose top-left pixel is at
+x = SIZE[0] + ... + SIZE[j-1], y = i * 27. Everything outside a cell is
+fully transparent.
+
+To swap the art: write a sheet of exactly these dimensions, in this layout, in
+this format, over ewar_icons.png. No code reads anything else out of the file.
