@@ -31,18 +31,24 @@ Three things here are load-bearing and look like detail:
    never be stricter than its regex (a gate stricter than its pattern is a
    silent filter -- the rule gamelog_monitor records above its own gate).
 
-3. **Player vs NPC is bracket presence in the attacker segment.**  A player
-   renders as ``Ship [CORP] [ALLY] [Pilot]``; an NPC is a bare name.  That is a
-   far cleaner signal than the damage classifier's weapon/charge heuristics,
-   and the brackets survive tag stripping.
+3. **Player vs NPC is read off the attacker segment, in three cases.**  A
+   player renders as ``Ship [CORP] [ALLY] [Pilot]``; an NPC is a bare name; and
+   a segment carrying no name at all is UNCLASSIFIABLE, which counts as a
+   player.  See :func:`_source_of` -- the third case is the one that is easy to
+   get wrong, and getting it wrong drops the single loudest event this feature
+   exists to surface.
 
-NOTE on ``_TAG_RE``: it is deliberately defined HERE rather than imported from
-``gamelog_monitor``, which owns the identical pattern.  ``gamelog_monitor``
-imports this module (it dispatches the events), so importing it back would be
-a circular import -- and it computes ``app_dir()`` at import time, which would
-make this module do filesystem I/O just to be loaded.  If the two are ever
-unified, the direction must be ``gamelog_monitor`` -> ``ewar_parse``, never the
-reverse.
+NOTE on ``_TAG_RE``: the duplication of ``gamelog_monitor._TAG_RE`` below is
+DELIBERATE and reviewed -- please do not "fix" it by importing that one.
+``gamelog_monitor`` imports THIS module (it dispatches the events), so importing
+it back is a circular import that fails in both directions: that module defines
+its own ``_TAG_RE`` far below its import block, so whichever of the two is
+loaded first, the other gets a half-initialised module.  It also computes
+``app_dir()`` at import time, which does a filesystem write probe -- importing
+it would cost this pure module its purity.  Re-pointing ``gamelog_monitor`` at
+this module instead was considered and REJECTED (2026-10-30): it would put
+three working parsers -- damage, decloak, cyno -- behind a new cross-module
+dependency in order to deduplicate a ten-character regex.  Keep both.
 """
 from __future__ import annotations
 
@@ -126,6 +132,11 @@ _NOS_RE = re.compile(r"energy\s+drained\s+(?P<dir>to|from)(?P<rest>\s.+)$")
 # therefore untouched.
 _SEP_RE = re.compile(r"\s+-(?=\s|$)")
 
+# "Does the attacker segment name anybody at all?"  One word character is
+# enough; a segment with none is a name the client never resolved (see
+# _source_of), not a short one.
+_NAME_CHAR_RE = re.compile(r"\w")
+
 
 def _fields_of(rest: str):
     """Split the text after the effect phrase into ``(attacker, module)``.
@@ -145,16 +156,31 @@ def _fields_of(rest: str):
 
 
 def _source_of(attacker: str) -> str:
-    """``"player"`` when the attacker segment carries a bracket group, else
-    ``"npc"``.  A player renders ``Ship [CORP] [ALLY] [Pilot]``; an NPC is a
-    bare name.  Character, corporation and ship names cannot contain brackets,
-    so presence alone is sufficient.
+    """``"player"`` / ``"npc"`` for one attacker segment.  Three cases, and
+    ONLY the middle one is NPC:
 
-    A BLANK attacker segment (the handful of bomb / off-grid lines described in
-    :func:`_fields_of`) therefore reads ``"npc"`` and is suppressed downstream.
-    That is the quiet direction, chosen on purpose: the whole icon set exists
-    to be trustworthy when empty, and the measured population is 9 lines in
-    2.76 million."""
+    * **no name at all** -> ``"player"``.  An unclassifiable attacker is never
+      quietly downgraded.  This is the same fail-safe direction, and the same
+      reasoning, as ``damage_flash._hit_class``, which matches the exact string
+      ``"npc"`` and treats ``"unknown"`` / ``None`` / ``""`` as a player.
+    * **a bare name** -> ``"npc"``.  That is what an NPC renders as.
+    * **a bracket group** -> ``"player"``.  A player renders
+      ``Ship [CORP] [ALLY] [Pilot]``, and character, corporation and ship names
+      cannot contain brackets, so presence alone is sufficient.
+
+    The first case is not hypothetical and not a tie-break: 9 lines in the
+    2.76-million-line archive render an empty attacker, and they are BOMBS --
+    ``energy neutralized <b><color=..></b> - Void Bomb``, two of them for 632
+    and 773 GJ.  A bomb has no attributable ship at detonation, which is why
+    the field is empty; it is player-sourced all the same.  Reading those as
+    NPC would suppress the icon (owner decision D4) for the loudest single
+    capacitor-warfare event the gamelog contains -- precisely the "see a neut,
+    switch to that client and cap-boost" case the feature was asked for.  The
+    spec's bracket rule separates a bracketed player from a BARE-NAME NPC; it
+    says nothing about an empty field, so this fills the gap rather than
+    reading the rule literally."""
+    if not _NAME_CHAR_RE.search(attacker):
+        return "player"
     return "player" if "[" in attacker else "npc"
 
 
