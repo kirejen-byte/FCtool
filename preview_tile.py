@@ -71,14 +71,23 @@ _MOVE_JITTER = 4          # left-release within this many px still counts as a c
 _CORNER_ZONE = 12         # px hot-zone at each tile corner that arms a resize
 _EWAR_WIDE_TILE_PX = 200  # at/above this tile width the EWAR icons are 18 px,
                           # below it 14 px, both before DPI scaling (spec A4)
-# The share of the body the text band may claim, i.e. preview_band's own cap
-# on its total height. The icon row is clamped to what is left ABOVE that
-# (_ewar_icon_px), so the two sibling popups cannot overlap whatever the band
-# is currently showing - one row, two rows, or a resize away from either.
+# The largest share of the body the BOTTOM TEXT may claim, in either layout:
+# preview_band's own cap on the band's total height, and _bottom_h's safety
+# net on the two strips. The icon row is clamped to what is left ABOVE that
+# (_ewar_icon_px), so the row cannot overlap whatever the bottom text is
+# currently showing - one line, two lines, the band, the strips, or a resize
+# away from any of them. ONE fraction and ONE inequality is what makes the
+# strips case fall out of the band case for free; keep them identical.
 # Duplicated from preview_band on purpose (it is private there, and this
 # module must not reach into it); tests/test_preview_tile.py pins the two
 # equal, so drift fails loudly instead of quietly re-opening the overlap.
+# (The _EWAR_ prefix is historical - the clamp is what needed it named.)
 _EWAR_BAND_RESERVE_FRAC = 0.60
+# A body height larger than this is garbage, not a tile: no monitor is that
+# big, and int(body_h * _EWAR_BAND_RESERVE_FRAC) raises OverflowError on
+# 10 ** 400. The same ceiling preview_band and preview_ewar_band put on the
+# sizes they accept, so a geometry those two will draw is one this will size.
+_EWAR_MAX_BODY_PX = 1 << 20
 # Drag-move coalescing window (ms), Linux/Wine backend ONLY. X11 delivers raw
 # pointer motion far faster than a compositor can redraw, and every per-motion
 # SetWindowPos under Wine expose-repaints each tile the move uncovers (black
@@ -479,6 +488,26 @@ class _RealTileWin32:  # pragma: no cover — mirror _RealOverlayWin32 minus TRA
         self._user32.SetWindowPos(
             hwnd, self.HWND_TOPMOST, 0, 0, 0, 0,
             self.SWP_NOMOVE | self.SWP_NOSIZE | self.SWP_NOACTIVATE)
+
+
+def _ewar_px_or_none(value):
+    """A tile dimension the EWAR clamp will do arithmetic on: a plain int in
+    1.._EWAR_MAX_BODY_PX, else None. Pure; never raises.
+
+    A bool is garbage, a float is garbage (nan and inf with it), and so is
+    10 ** 400 - int(v * 0.60) overflows on it. Same shape, and the same
+    ceiling, as the sizes preview_band and preview_ewar_band accept.
+
+    This exists because the clamp reads a geometry field that nothing upstream
+    bounds: preview_layout.clamp_size floors a configured size to an int but
+    never caps it, and a hand-edited config reaches _body_h directly. The
+    feature's own rule (see set_ewar_icons) is that garbage means NO ICONS,
+    never a tile whose icons are broken for the rest of the session, so every
+    caller here answers "nothing to show" on a None rather than raising into
+    _sync_ewar's fault latch."""
+    if isinstance(value, int) and not isinstance(value, bool):
+        return value if 1 <= value <= _EWAR_MAX_BODY_PX else None
+    return None
 
 
 def _is_x11_backend(dwm) -> bool:
@@ -1591,9 +1620,12 @@ class TileWindow:
         (the window total height stays body_h + STRIP_H), so the letterboxed video
         shrinks by exactly this sum.
 
-        The combined height is capped at ~60% of the body as a safety net so the
-        two bottom lines can never swallow the whole video, even if both request
-        their per-strip 40% cap on a squat tile.
+        The combined height is capped at _EWAR_BAND_RESERVE_FRAC of the body as
+        a safety net so the two bottom lines can never swallow the whole video,
+        even if both request their per-strip 40% cap on a squat tile. That is
+        the SAME fraction the band caps its own height at, which is why the
+        EWAR icon row's clamp (_ewar_icon_px) keeps the row clear of these
+        strips as well as of the band - see the constant.
 
         0 in the BAND layout: the text is drawn over the video by a separate
         window and carves nothing out of the body - which is the whole point
@@ -1604,7 +1636,7 @@ class TileWindow:
         total = (self._bottom_strip_h if self._bottom_visible else 0)
         total += (self._location_strip_h if self._location_visible else 0)
         if self._body_h and self._body_h > 0:
-            total = min(total, int(self._body_h * 0.60))
+            total = min(total, int(self._body_h * _EWAR_BAND_RESERVE_FRAC))
         return total
 
     def _push_thumb_rect(self):
@@ -2535,16 +2567,29 @@ class TileWindow:
         does. Smaller icons, or none, beat two popups contending for the same
         pixels.
 
-        The reserve is the band's cap on its own height, so this holds for
-        whatever the band is showing (the location strip is a user setting, so
-        a two-row band is a setting away, not a hypothesis). The one case it
-        does not cover is a body so small that the band's one-px-per-row floor
-        beats its cap - and there the headroom is already negative, so this
-        answers 0 anyway."""
-        base = 18 if self._w >= _EWAR_WIDE_TILE_PX else 14
+        The reserve is the bottom text's cap on its own height - the same
+        fraction in both layouts - so this holds for whatever that text is
+        showing (the location line is a user setting, so a two-row band is a
+        setting away, not a hypothesis), and it keeps the row clear of the
+        caption strips for free. The one case it does not cover is a body so
+        small that the band's one-px-per-row floor beats its cap - and there
+        the headroom is already negative, so this answers 0 anyway.
+
+        NEVER RAISES, for the same reason set_ewar_icons does not: a geometry
+        field this cannot measure (a float, a bool, 10 ** 400, None, a string
+        - nothing upstream caps _body_h) answers 0, "draw nothing". Raising
+        here would reach _sync_ewar's except and latch this tile's icons off
+        for the whole session, which is exactly the outcome the rule exists to
+        prevent: garbage is no icons, not broken for life."""
+        body_h = _ewar_px_or_none(self._body_h)
+        if body_h is None:
+            return 0
+        width = _ewar_px_or_none(self._w)
+        base = 18 if (width is not None
+                      and width >= _EWAR_WIDE_TILE_PX) else 14
         want = base * (self._px_per_pt() / (96.0 / 72.0))
         px = min(ewar_icons.ICON_SIZES, key=lambda size: (abs(size - want), size))
-        headroom = (self._body_h - int(self._body_h * _EWAR_BAND_RESERVE_FRAC)
+        headroom = (body_h - int(body_h * _EWAR_BAND_RESERVE_FRAC)
                     - preview_ewar_band.BODY_INSET
                     - 2 * preview_ewar_band.CHIP_PAD)
         fits = [size for size in ewar_icons.ICON_SIZES
@@ -2594,7 +2639,15 @@ class TileWindow:
         created while there is nothing to show (no icon, tile hidden or never
         placed), so most tiles never build one at all (spec 10.2)."""
         icons = self._ewar_req
-        visible = (not self._hidden) and self._w > 0 and self._body_h > 0
+        # _body_h goes through the same gate the clamp uses (_ewar_px_or_none):
+        # a bare `self._body_h > 0` RAISES on None or a string, and a raise
+        # here is a permanent fault - the very outcome "garbage is no icons"
+        # exists to prevent. _w keeps its plain comparison deliberately: the
+        # popup has its own, harsher, opinion about a width it refuses (see
+        # the note on the request below), and that behaviour is recorded, not
+        # changed here.
+        visible = ((not self._hidden) and self._w > 0
+                   and _ewar_px_or_none(self._body_h) is not None)
         # BEFORE the lazy create, because _ewar_icon_px answers 0 for a tile
         # with no headroom for even the smallest row: that draws nothing, so
         # it must not build a window either.
