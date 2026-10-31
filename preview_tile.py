@@ -20,6 +20,13 @@ Design (spec §5):
   way; _sync_band() is the one place it tells the band where the tile is.
   set_band_background(False) drops the band's dark background: the normal
   lines are then drawn on the video with a thin black outline.
+- Incoming-EWAR icons (set_ewar_icons, Windows only) are the band's SIBLING:
+  preview_ewar_band's popup, a second SEPARATE window owned by this tile and
+  drawn over the TOP-LEFT of the body where the band sits at the bottom. The
+  two must never overlap, because that is the only thing keeping their z-order
+  from mattering (neither is ever re-stacked), so _ewar_icon_px() sizes the
+  icons to the headroom the band cannot take. _sync_ewar() is the one place
+  the tile tells the popup anything, exactly as _sync_band() is for the band.
 - Placement is ONLY via win32.set_window_pos(GA_ROOT, x, y, w, h) in physical px —
   never Tk geometry (Tk geometry is logical px under PMv2 and would misplace).
 - Mouse model (EVE-O parity): LEFT on the BODY acts on PRESS — activate (Ctrl =
@@ -64,6 +71,14 @@ _MOVE_JITTER = 4          # left-release within this many px still counts as a c
 _CORNER_ZONE = 12         # px hot-zone at each tile corner that arms a resize
 _EWAR_WIDE_TILE_PX = 200  # at/above this tile width the EWAR icons are 18 px,
                           # below it 14 px, both before DPI scaling (spec A4)
+# The share of the body the text band may claim, i.e. preview_band's own cap
+# on its total height. The icon row is clamped to what is left ABOVE that
+# (_ewar_icon_px), so the two sibling popups cannot overlap whatever the band
+# is currently showing - one row, two rows, or a resize away from either.
+# Duplicated from preview_band on purpose (it is private there, and this
+# module must not reach into it); tests/test_preview_tile.py pins the two
+# equal, so drift fails loudly instead of quietly re-opening the overlap.
+_EWAR_BAND_RESERVE_FRAC = 0.60
 # Drag-move coalescing window (ms), Linux/Wine backend ONLY. X11 delivers raw
 # pointer motion far faster than a compositor can redraw, and every per-motion
 # SetWindowPos under Wine expose-repaints each tile the move uncovers (black
@@ -2472,12 +2487,17 @@ class TileWindow:
         and after an EWAR fault, for the rest of this tile's life.
 
         NEVER raises: this is the preview tick, where an exception retires the
-        tile (five failed ticks disable every preview)."""
+        tile (five failed ticks disable every preview). That is why the coercion
+        below catches Exception and not just TypeError - every step of it is a
+        call into the caller's object, and each can raise: the truth test
+        (__bool__), starting the iteration (__iter__), continuing it (a
+        generator that fails after its first yield) and rendering an element
+        (__str__). Anything unforeseen reads as "nothing to show"."""
         if self._x11_backend or self._ewar_off:
             return
         try:
             shown = tuple(str(effect) for effect in icons) if icons else ()
-        except TypeError:                 # not iterable: nothing to show
+        except Exception:                 # see the docstring: ANY of four steps
             shown = ()
         if shown == self._ewar_req:
             return
@@ -2485,20 +2505,51 @@ class TileWindow:
         self._sync_ewar()
 
     def _ewar_icon_px(self) -> int:
-        """The artwork size this tile wants, in PHYSICAL px: 18 on a tile at
-        least _EWAR_WIDE_TILE_PX wide, 14 below that (spec A4), multiplied by
-        the DPI factor and snapped to the nearest size the sheet carries.
+        """The artwork size for this tile, in PHYSICAL px - or 0 for "do not
+        draw the row at all". Always a plain int, and a member of
+        ewar_icons.ICON_SIZES unless it is 0, which is what the popup accepts
+        (it refuses floats and bools).
 
-        The TILE owns this, not the caller: only the tile knows its own width
-        and its Tk scaling. The multiplier is 1.0 at 100 % and 1.5 at 150 %,
-        i.e. Tk's px-per-point over the 96 dpi baseline (_px_per_pt is THE
-        route to that factor) - fixed physical pixels beside a caption that
-        scales would read wrong at 150 %. Ties snap DOWN, and the answer is
-        always a plain int member of ewar_icons.ICON_SIZES, which is what the
-        popup accepts (it refuses floats and bools)."""
+        The TILE owns this, not the caller: only the tile knows its own width,
+        its height and its Tk scaling.
+
+        Step 1, the size the art wants (spec A4): 18 px on a tile at least
+        _EWAR_WIDE_TILE_PX wide, 14 below that, multiplied by the DPI factor
+        and snapped to the nearest size the sheet carries. The multiplier is
+        1.0 at 100 % and 1.5 at 150 %, i.e. Tk's px-per-point over the 96 dpi
+        baseline (_px_per_pt is THE route to that factor) - fixed physical
+        pixels beside a caption that scales would read wrong at 150 %. Ties
+        snap DOWN (reachable at ~114 % and ~133 % DPI, and pinned by a test):
+        on a tile that cannot comfortably hold either, the smaller icon is the
+        safer miss.
+
+        Step 2, the CLAMP, which is not cosmetic. The icon row and the text
+        band are two popups owned by the same tile and NEITHER is ever
+        re-stacked, so their z-order is creation and retop order - which spec
+        10.2 says must never be load-bearing. The only thing that keeps it
+        from being load-bearing is that they do not overlap, and at 150 % on a
+        short tile a 27 px row reaches into the band (MEASURED: 384x68 at
+        150 %, row bottom 34 vs band top 28). So the row is stepped DOWN
+        through ICON_SIZES until it fits the headroom above the band's own
+        reserve, and answers 0 - draw nothing - when not even the smallest
+        does. Smaller icons, or none, beat two popups contending for the same
+        pixels.
+
+        The reserve is the band's cap on its own height, so this holds for
+        whatever the band is showing (the location strip is a user setting, so
+        a two-row band is a setting away, not a hypothesis). The one case it
+        does not cover is a body so small that the band's one-px-per-row floor
+        beats its cap - and there the headroom is already negative, so this
+        answers 0 anyway."""
         base = 18 if self._w >= _EWAR_WIDE_TILE_PX else 14
         want = base * (self._px_per_pt() / (96.0 / 72.0))
-        return min(ewar_icons.ICON_SIZES, key=lambda px: (abs(px - want), px))
+        px = min(ewar_icons.ICON_SIZES, key=lambda size: (abs(size - want), size))
+        headroom = (self._body_h - int(self._body_h * _EWAR_BAND_RESERVE_FRAC)
+                    - preview_ewar_band.BODY_INSET
+                    - 2 * preview_ewar_band.CHIP_PAD)
+        fits = [size for size in ewar_icons.ICON_SIZES
+                if size <= px and size <= headroom]
+        return max(fits) if fits else 0
 
     def _ewar_follow(self, x, y):
         """Called right after EVERY set_window_pos on this tile, with the
@@ -2544,15 +2595,26 @@ class TileWindow:
         placed), so most tiles never build one at all (spec 10.2)."""
         icons = self._ewar_req
         visible = (not self._hidden) and self._w > 0 and self._body_h > 0
+        # BEFORE the lazy create, because _ewar_icon_px answers 0 for a tile
+        # with no headroom for even the smallest row: that draws nothing, so
+        # it must not build a window either.
+        icon_px = self._ewar_icon_px() if (icons and visible) else 0
         if self._ewar is None:
-            if not (icons and visible):
+            if not (icons and visible and icon_px):
                 return True
             factory = self._ewar_factory
             if factory is None:
                 factory = preview_ewar_band.EwarWindow
             self._ewar = factory(self._hwnd)
         x, y = self._placed_pos if self._placed_pos is not None else self._pos
-        icon_px = self._ewar_icon_px()
+        # self._w reaches the popup as the row's width budget. NOTE a seam a
+        # reviewer flagged: EwarWindow.sync answers False for a width it
+        # refuses (a float, a bool, an out-of-range int) where BandWindow
+        # merely hides, and this tile turns any False into a PERMANENT fault -
+        # so a float _w would kill this tile's icons for life while its band
+        # kept working. Not reachable today only because preview_layout floors
+        # every configured size to an int; do not remove that flooring without
+        # dealing with this.
         req = (x, y + STRIP_H, self._w, icons, icon_px, self._alpha, visible)
         if req == self._ewar_synced:
             return True
