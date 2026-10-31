@@ -27,6 +27,9 @@ Design (spec §5):
   from mattering (neither is ever re-stacked), so _ewar_icon_px() sizes the
   icons to the headroom the band cannot take. _sync_ewar() is the one place
   the tile tells the popup anything, exactly as _sync_band() is for the band.
+  The popup is click-through, so it never sees the mouse: the tile hit-tests
+  the cursor against the row it last synced and shows each icon's tooltip
+  itself (_track_ewar_tip).
 - Placement is ONLY via win32.set_window_pos(GA_ROOT, x, y, w, h) in physical px —
   never Tk geometry (Tk geometry is logical px under PMv2 and would misplace).
 - Mouse model (EVE-O parity): LEFT on the BODY acts on PRESS — activate (Ctrl =
@@ -75,8 +78,8 @@ _EWAR_WIDE_TILE_PX = 200  # at/above this tile width the EWAR icons are 18 px,
 # preview_band's own cap on the band's total height, and _bottom_h's safety
 # net on the two strips. The icon row is clamped to what is left ABOVE that
 # (_ewar_icon_px), so the row cannot overlap whatever the bottom text is
-# currently showing - one line, two lines, the band, the strips, or a resize
-# away from any of them. ONE fraction and ONE inequality is what makes the
+# currently showing - in the band, on the strips, or a resize away from
+# either. ONE fraction and ONE inequality is what makes the
 # strips case fall out of the band case for free; keep them identical.
 # Duplicated from preview_band on purpose (it is private there, and this
 # module must not reach into it); tests/test_preview_tile.py pins the two
@@ -510,6 +513,16 @@ def _ewar_px_or_none(value):
     return None
 
 
+def _ewar_tip_map(tips):
+    """{effect: text} from what fc_gui pushes, as plain strings. {} for no text,
+    or for anything that cannot give one: every step here is a call into the
+    caller's object, on the preview tick (see set_ewar_icons). Never raises."""
+    try:
+        return {str(k): str(v) for k, v in tips.items()} if tips else {}
+    except Exception:
+        return {}
+
+
 def _is_x11_backend(dwm) -> bool:
     """True when the `dwm=` seam holds the native X11 (Wine) thumbnail backend
     (x11_thumbs.X11ThumbBackend) rather than the Windows answer.
@@ -652,6 +665,15 @@ class TileWindow:
         # compare and never reaches the popup - the tile's half of the
         # zero-write rule.
         self._ewar_synced = None
+        # The icons' tooltips (see _track_ewar_tip). `_ewar_tip_pt` is the
+        # cursor while a tip is up and None otherwise: the ONE "is a tip up?"
+        # flag. `_ewar_tip_up` is what that tip shows and where, so an unchanged
+        # hover builds nothing.
+        self._ewar_tips = {}         # effect -> text, set_ewar_icons's request
+        self._ewar_tip_pt = None     # (x_root, y_root), None = no tip up
+        self._ewar_tip_up = None     # (text, body x, body y, w, body_h)
+        self._ewar_tip_opening = False  # inside show_tooltip (_track_ewar_tip)
+        self._ewar_tip_next = None   # a hover that arrived meanwhile
 
         self._thumb = None
         self._src_size = (0, 0)
@@ -897,6 +919,13 @@ class TileWindow:
         # ── body (DWM composites the live thumbnail over this) ──────────────
         self._body = tk.Frame(self.top, bg="#000000")
         self._body.pack(fill="both", expand=True, side="top")
+        # ONE attach for the tile's lifetime, as for the implant icon, and with
+        # the same reasons for topmost and place_above. It is on the body
+        # because the icons are not widgets: its text stays "" unless
+        # _track_ewar_tip has the cursor on an icon, so <Enter> alone never
+        # shows anything, and <Leave> and <Destroy> take the tip down for free.
+        ui_helpers.attach_tooltip(self._body, "", topmost=True, place_above=True,
+                                  place_fn=self._place_ewar_tip)
 
         # NO child widget is ever drawn on the body: the DWM compositor draws
         # each tile's live thumbnail OVER any child widget inside the thumbnail
@@ -930,6 +959,15 @@ class TileWindow:
         # so bind on self.top and rely on Tk's toplevel-level crossing events.
         self.top.bind("<Enter>", self._on_enter)
         self.top.bind("<Leave>", self._on_leave)
+        # The EWAR tooltips: AFTER those two, and add="+" on all three, because
+        # a plain bind() replaces what is there. On the toplevel alone, so one
+        # handler sees motion anywhere on the tile, once: a child widget's
+        # bindtags reach it. <Enter> as well as <Motion> because Tk reports the
+        # first move into a window as the Enter and no Motion; running after
+        # _on_enter means a zoom is already on, and its row is what gets tested.
+        self.top.bind("<Motion>", self._on_ewar_hover, add="+")
+        self.top.bind("<Enter>", self._on_ewar_hover, add="+")
+        self.top.bind("<Leave>", self._on_ewar_leave, add="+")
 
     # ── mouse model (EVE-O parity) ──────────────────────────────────────────
     def _bind_mouse(self):
@@ -1448,6 +1486,9 @@ class TileWindow:
     def _on_b3_motion(self, event):
         if self._press_root is None:
             return
+        # Before the lock's early return: the pointer grab suppresses <Leave>,
+        # so a tip would stay up behind a cursor that has gone elsewhere.
+        self._hide_ewar_tip()
         dx = event.x_root - self._press_root[0]
         dy = event.y_root - self._press_root[1]
         if self._mode == "resize":
@@ -1558,6 +1599,32 @@ class TileWindow:
                 y = above_y
             else:
                 y = py + STRIP_H + self._body_h + 4
+            tip.wm_geometry(f"+{x}+{y}")
+            return True
+        except tk.TclError:
+            return False
+
+    def _place_ewar_tip(self, tip):
+        """Position an EWAR icon's tooltip: above the tile, or below all of it
+        when that is off the top of the screen, like _place_implant_tip - so it
+        is never under the cursor, where it would take the tile's <Leave>.
+        Unlike that tip it is measured from the WINDOW (the last sync's origin:
+        a hover zoom on any anchor but "nw" puts the window away from _pos), it
+        starts level with the cursor, and it stays on the virtual screen, because
+        tiles live along the screen's right edge and the module name is the
+        part that would be cut off. Returns True when it placed the tip; False
+        hands the tip to attach_tooltip's own fallback."""
+        try:
+            synced, pt = self._ewar_synced, self._ewar_tip_pt
+            if synced is None or pt is None:
+                return False
+            th = tip.winfo_reqheight()
+            top = synced[1] - STRIP_H
+            y = top - th - 4
+            if y < 0:
+                y = top + STRIP_H + self._body_h + 4
+            right = tip.winfo_vrootx() + tip.winfo_vrootwidth()
+            x = min(pt[0], right - tip.winfo_reqwidth() - 2)
             tip.wm_geometry(f"+{x}+{y}")
             return True
         except tk.TclError:
@@ -1865,6 +1932,7 @@ class TileWindow:
     def _apply_zoom(self):
         if not self._zoom_enabled or self._zoomed or self.in_gesture:
             return
+        self._hide_ewar_tip()     # the next hover tests the zoomed row
         rect = (self._pos[0], self._pos[1], self._w, self._body_h)
         self._prezoom_rect = rect
         zx, zy, zw, zbody = preview_layout.zoom_rect(
@@ -1894,6 +1962,7 @@ class TileWindow:
     def _restore_zoom(self):
         if not self._zoomed or self._prezoom_rect is None:
             return
+        self._hide_ewar_tip()
         x, y, w, body_h = self._prezoom_rect
         self._zoomed = False
         self._prezoom_rect = None
@@ -2511,10 +2580,13 @@ class TileWindow:
                 pass
 
     # -- EWAR icon row over the video (set_ewar_icons) -----------------------
-    def set_ewar_icons(self, icons) -> None:
+    def set_ewar_icons(self, icons, tips=None) -> None:
         """Show these incoming-EWAR effect icons over the TOP-LEFT of the
         video, in the order given (the tracker hands them over in ICON_ORDER);
         () draws nothing. Called for every tile on every ~250 ms compose tick.
+        `tips` maps an effect to its tooltip text; an effect with none has no
+        tooltip. The text never reaches the popup: new text alone repaints
+        nothing, and only rewrites a tip that is up on that icon.
 
         ZERO-WRITE: an unchanged request returns before the popup is touched,
         so the steady state costs nothing at all. A NO-OP on the X11 thumbnail
@@ -2535,10 +2607,14 @@ class TileWindow:
             shown = tuple(str(effect) for effect in icons) if icons else ()
         except Exception:                 # see the docstring: ANY of four steps
             shown = ()
-        if shown == self._ewar_req:
-            return
-        self._ewar_req = shown
-        self._sync_ewar()
+        tips = _ewar_tip_map(tips)
+        reworded = tips != self._ewar_tips
+        self._ewar_tips = tips
+        if shown != self._ewar_req:
+            self._ewar_req = shown
+            self._sync_ewar()             # which re-checks a tip that is up
+        elif reworded and self._ewar_tip_pt is not None:
+            self._track_ewar_tip(*self._ewar_tip_pt)
 
     def _ewar_icon_px(self) -> int:
         """The artwork size for this tile, in PHYSICAL px - or 0 for "do not
@@ -2572,10 +2648,11 @@ class TileWindow:
         pixels.
 
         The reserve is the bottom text's cap on its own height - the same
-        fraction in both layouts - so this holds for whatever that text is
-        showing (the location line is a user setting, so a two-row band is a
-        setting away, not a hypothesis), and it keeps the row clear of the
-        caption strips for free. The one case it does not cover is a body so
+        fraction in both layouts - so the row stays clear of that text whatever
+        it shows, and of the caption strips for free. It does not lean on the
+        text being one line, although today it is: the location strip is
+        retired, and fc_gui always feeds set_location_label(""). The one case
+        it does not cover is a body so
         small that the band's one-px-per-row floor beats its cap - and there
         the headroom is already negative, so this answers 0 anyway.
 
@@ -2631,6 +2708,11 @@ class TileWindow:
             ok, why = False, type(exc).__name__
         if not ok:
             self._ewar_fault(why)
+        elif self._ewar_tip_pt is not None:
+            # The row or the tile changed under a still cursor: a new icon has
+            # pushed the row along (ICON_ORDER, not arrival order), one has
+            # expired, the tile has moved. What is under the cursor may differ.
+            self._track_ewar_tip(*self._ewar_tip_pt)
 
     def _sync_ewar_now(self) -> bool:
         """_sync_ewar's body; may raise (the caller turns that into a fault).
@@ -2698,6 +2780,7 @@ class TileWindow:
             detail = None
         self._ewar_off = True
         self._ewar_req = ()
+        self._hide_ewar_tip()
         self._destroy_ewar()
         try:
             if isinstance(detail, str) and detail:
@@ -2717,6 +2800,97 @@ class TileWindow:
                 ewar.destroy()
             except Exception:
                 pass
+
+    # -- EWAR icon tooltips (owner decision D12) -----------------------------
+    def _on_ewar_hover(self, event):
+        """<Motion> and <Enter> anywhere on the tile. Returns at once on a tile
+        with no icons, which is nearly every tile nearly all the time, and on
+        the X11 backend and a latched tile, whose request is always (). Never
+        steals anything: it adds no grab, returns no "break", and the tip is an
+        override-redirect window that takes no focus."""
+        if self._ewar_tip_pt is None and not self._ewar_req:
+            return
+        self._track_ewar_tip(event.x_root, event.y_root)
+
+    def _on_ewar_leave(self, _event):
+        """<Leave> on the tile or any part of it. A move that stays on the tile
+        re-opens the tip on the next hover; there is no cost in being eager."""
+        self._hide_ewar_tip()
+
+    def _ewar_icon_under(self, x, y):
+        """The effect at root point (x, y), or None. Against _ewar_synced - what
+        the popup was really told, so a zoomed tile, a narrow one and one with
+        no row at all (icon_px 0, or nothing synced) need no case of their own:
+        a hidden tile syncs icon_px 0.
+
+        event.x_root is the right input and it needs no scaling. MEASURED
+        2026-10-31 with real posted WM_MOUSEMOVEs, under Per-Monitor-V2 on a
+        96 dpi desktop: x_root == SetWindowPos x + the body-client px, at tk
+        scaling 1.333 and 2.0 alike, and straight after a raw SetWindowPos Tk
+        had not pumped. Tk takes it from ClientToScreen, so it shares its px
+        with SetWindowPos and with the row, whatever the monitor's DPI (a
+        monitor above 96 dpi was not available to measure)."""
+        synced = self._ewar_synced
+        if synced is None:
+            return None
+        body_x, body_y, w, icons, icon_px = synced[:5]
+        return preview_ewar_band.ewar_icon_at(x - body_x, y - body_y, icons,
+                                              icon_px, w)
+
+    def _track_ewar_tip(self, x, y):
+        """Make the tooltip match a cursor at root point (x, y): the tip of the
+        icon under it, or none. THE one place a tip goes up, from a hover or
+        from a change under a still cursor (the icon row, its text, the tile's
+        place). An unchanged answer touches no Tk, so this is free on the tick.
+
+        No tip opens mid-gesture: the grab has no <Leave> to close it with.
+
+        RE-ENTERED from show_tooltip: Tk holds <Motion> back to its idle queue,
+        and attach_tooltip's _show runs update_idletasks while it builds a tip.
+        Letting that nested hover build a tip of its own orphans the first
+        (nothing records it, so nothing ever closes it), so it is kept and
+        answered once the first is up.
+
+        NEVER raises: set_ewar_icons reaches this from the preview tick. Nothing
+        is logged, either - the text holds a module name from the log."""
+        if self._ewar_tip_opening:
+            self._ewar_tip_next = (x, y)
+            return
+        try:
+            effect = None if self.in_gesture else self._ewar_icon_under(x, y)
+            text = self._ewar_tips.get(effect) if effect else None
+            if not text:
+                self._hide_ewar_tip()
+                return
+            synced = self._ewar_synced
+            up = (text, synced[0], synced[1], self._w, self._body_h)
+            self._ewar_tip_pt = (x, y)
+            if up != self._ewar_tip_up:
+                self._ewar_tip_up = up
+                ui_helpers.update_tooltip(self._body, text)
+                self._ewar_tip_opening = True
+                try:
+                    ui_helpers.show_tooltip(self._body)
+                finally:
+                    self._ewar_tip_opening = False
+                pending, self._ewar_tip_next = self._ewar_tip_next, None
+                if pending is not None:
+                    self._track_ewar_tip(*pending)
+        except Exception:
+            self._hide_ewar_tip()
+
+    def _hide_ewar_tip(self):
+        """Take the tip down, if one is up. Idempotent, and one attribute read
+        when none is. The text goes too: the body's own <Enter> reads it, and a
+        stale copy would open at the wrong moment. Never raises."""
+        if self._ewar_tip_pt is None:
+            return
+        self._ewar_tip_pt = self._ewar_tip_up = None
+        try:
+            ui_helpers.update_tooltip(self._body, "")
+            ui_helpers.hide_tooltip(self._body)
+        except Exception:
+            pass
 
     # ── bottom caption line ('<System> · <ShipType>', below the video) ──────
     def set_bottom_label(self, text, color=None, size=None):
@@ -3116,6 +3290,7 @@ class TileWindow:
         # set_ewar_icons is a no-op once _ewar_off is latched.
         self._ewar_off = True
         self._ewar_req = ()
+        self._hide_ewar_tip()
         self._destroy_ewar()
         self._band_off = True
         self._text_band = False

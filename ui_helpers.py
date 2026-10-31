@@ -899,6 +899,9 @@ def attach_tooltip(widget, text, *, topmost=False, place_above=False,
         except tk.TclError:
             state["tip"] = None
 
+    # The way in for a caller that decides for itself when a tip goes up.
+    widget._tooltip_show = _show
+
     widget.bind("<Enter>", _show, add="+")
     widget.bind("<Leave>", _hide, add="+")
     widget.bind("<Destroy>", _hide, add="+")
@@ -918,6 +921,25 @@ def update_tooltip(widget, text):
     string, which no handler will read) — so a caller need not branch.
     """
     widget._tooltip_text = text
+    return widget
+
+
+def show_tooltip(widget):
+    """Show ``widget``'s tip now, with its current copy, replacing any tip that
+    is up. Never raises; returns ``widget``.
+
+    For a tip whose target is not the whole widget, so ``<Enter>`` says nothing
+    about whether the cursor is on it: an FCPreview tile's EWAR icons are drawn
+    by a click-through popup over one Frame, and only the tile's own hit-test
+    knows which one the cursor is on. Empty copy draws nothing, exactly as on
+    ``<Enter>``, and a widget with no tooltip attached is a silent no-op.
+    """
+    show = getattr(widget, "_tooltip_show", None)
+    if show is not None:
+        try:
+            show()
+        except Exception:
+            pass
     return widget
 
 

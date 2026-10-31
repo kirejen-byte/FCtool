@@ -21360,14 +21360,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # zero-write mirror makes the steady state free. `ident` is the char
         # key for a logged-in pilot and `login:<acct>` / "" otherwise, which is
         # the login test here: this method never receives a client object.
+        # ONE clock reading: both reads prune what has expired by it, and two
+        # could leave a drawn icon with no tooltip.
         set_ewar = getattr(tile, "set_ewar_icons", None)
         if set_ewar is not None:
             _ewar = getattr(self, "_preview_ewar", None)
-            icons = ()
+            icons, tips = (), None
             if (_ewar is not None and ident and not ident.startswith("login:")
                     and FCToolGUI._preview_ewar_on(cfg)):
-                icons = _ewar.icons(ident, time.monotonic())
-            set_ewar(icons)
+                _now = time.monotonic()
+                icons = _ewar.icons(ident, _now)
+                tips = ewar_state.tip_texts(_ewar.icon_modules(ident, _now))
+            set_ewar(icons, tips)
         # BUG B: keep the tile's lock_layout flag in lockstep with config so a
         # live toggle gates drag-moves without respawning the tile.
         set_lock = getattr(tile, "set_lock_layout", None)

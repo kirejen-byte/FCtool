@@ -80,11 +80,21 @@ cannot use.  Two guards are deliberately broader than they look:
 ``cycle_ms_for`` carries the same never-raises contract, for the same reason,
 for module names and amounts.
 
+TOOLTIPS (owner decision D12).  Each hold also remembers the module the most
+recent line named, read back through :meth:`EwarTracker.icon_modules` and worded
+by :func:`tip_texts`.  A line naming no module, as tackle lines never do, leaves
+a live hold's name alone.  Module names arrive verbatim from the log: they are
+not ASCII-safe and must never reach a log line.  :meth:`~EwarTracker.icons` and
+:meth:`~EwarTracker.icon_modules` prune as they read, so the two agree only when
+they are given the SAME ``now``; the tick takes one clock reading for both.
+
 BOUNDED MEMORY.  At most :data:`_MAX_CHARS` character records; seven hold
 entries per record are reachable (one per effect for a player, plus NPC
 scramble and disruption -- the other three NPC effects are never stored),
-within an ``(effect, cls)`` key space of ten.  A record is created only when a
-hold is actually stored, so a dropped line costs no memory at all.  A record
+within an ``(effect, cls)`` key space of ten.  At most one module name per hold,
+capped at :data:`_MODULE_MAX_CHARS`, and pruned with it.  A record is created
+only when a hold is actually stored, so a dropped line costs no memory at all.
+A record
 with no live hold that has seen no stored hold for :data:`_IDLE_RETENTION_S` is
 dropped when the next new character arrives, and the cap behind it evicts a
 record with no live hold before one with (see :meth:`EwarTracker._prune`).
@@ -122,6 +132,51 @@ _MAX_CHARS = 64
 _IDLE_RETENTION_S = 300.0
 
 _EFFECTS = frozenset(ICON_ORDER)
+
+#: A module name longer than this is cut.  The longest real one is under 50
+#: characters; this bounds what a malformed line can make the tracker keep and
+#: the tooltip draw.
+_MODULE_MAX_CHARS = 80
+
+#: What each effect's tooltip says (owner decision D12).
+_TIP_LABELS = {"scramble": "Warp scrambled", "disruption": "Warp disrupted",
+               "jam": "ECM jammed", "neut": "Energy neutralized",
+               "nos": "Energy drained"}
+
+
+def tip_text(effect, module="") -> str:
+    """One icon's tooltip: ``Energy neutralized - Heavy Energy Neutralizer II``,
+    or the effect alone when no module is known.  ``""`` for an effect it has no
+    words for.  Pure; never raises."""
+    try:
+        label = _TIP_LABELS.get(effect, "")
+    except TypeError:                       # an unhashable effect
+        return ""
+    return "%s - %s" % (label, module) if label and module else label
+
+
+def tip_texts(pairs) -> dict:
+    """``{effect: tooltip}`` from :meth:`EwarTracker.icon_modules`'s pairs,
+    leaving out any effect with no words.  Pure; never raises: this runs inside
+    fc_gui's per-tile ``try``, and anything malformed reads as no text at all."""
+    try:
+        texts = {effect: tip_text(effect, module) for effect, module in pairs}
+    except Exception:
+        return {}
+    return {effect: text for effect, text in texts.items() if text}
+
+
+def _module_text(module) -> str:
+    """The module name to keep: an exact, stripped, length-capped ``str``, or
+    ``""`` for anything else.  A ``str`` subclass is normalised exactly as
+    :func:`_as_key` normalises a key, for the same reason."""
+    if not isinstance(module, str):
+        return ""
+    try:
+        text = module if type(module) is str else str.__str__(module)
+        return text.strip()[:_MODULE_MAX_CHARS] if type(text) is str else ""
+    except Exception:
+        return ""
 
 
 def _as_key(char_key):
@@ -209,14 +264,17 @@ class _CharState:
     """One character's holds.
 
     ``holds`` maps ``(effect, cls)`` to the monotonic time the hold ends;
-    ``last_add`` is the idle prune's clock, and is stamped only when a hold is
-    actually stored, so a dropped line cannot keep a record alive.
+    ``modules`` maps the same keys to the module the most recent line named, and
+    never outlives its hold; ``last_add`` is the idle prune's clock, and is
+    stamped only when a hold is actually stored, so a dropped line cannot keep a
+    record alive.
     """
 
-    __slots__ = ("holds", "last_add")
+    __slots__ = ("holds", "modules", "last_add")
 
     def __init__(self, now: float):
         self.holds: dict[tuple[str, str], float] = {}
+        self.modules: dict[tuple[str, str], str] = {}
         self.last_add = now
 
     def live(self, now: float) -> dict[tuple[str, str], float]:
@@ -229,6 +287,7 @@ class _CharState:
         """
         for key in [k for k, until in self.holds.items() if not now < until]:
             del self.holds[key]
+            self.modules.pop(key, None)
         return self.holds
 
 
@@ -269,11 +328,20 @@ class EwarTracker:
             self._prune(stamped)
             record = self._chars[key] = _CharState(stamped)
         record.last_add = stamped
-        previous = record.holds.get((effect, cls))
+        hold = (effect, cls)
+        previous = record.holds.get(hold)
+        if previous is not None and not stamped < previous:
+            # Expired but not yet read: this line starts a NEW hold, which must
+            # not inherit the old one's module.
+            record.modules.pop(hold, None)
         # Refresh EXTENDS only: a shorter module's line must never cut a
-        # longer one's live hold.
+        # longer one's live hold.  The NAME is the most recent line's either
+        # way, so a tip says what just hit, not what lasts longest.
         if previous is None or until > previous:
-            record.holds[(effect, cls)] = until
+            record.holds[hold] = until
+        name = _module_text(module)
+        if name:
+            record.modules[hold] = name
 
     def _prune(self, now: float) -> None:
         """Drop idle records, then enforce the hard cap.
@@ -301,24 +369,29 @@ class EwarTracker:
 
     # --- read ---------------------------------------------------------------
 
-    def _live_holds(self, char_key, now):
-        """The live ``(effect, cls)`` holds for a character, or an empty dict.
+    def _live_record(self, char_key, now):
+        """A character's record with its expired holds pruned, or None.
 
         Reads without creating a record, so the border painter asking about a
         character that has never been touched by EWAR costs nothing.
         """
         key = _as_key(char_key)
         if key is None:
-            return {}
+            return None
         stamped = _finite(now)
         if stamped is None:
             # A `now` we cannot use reads as "nothing live": the silent
             # direction, and unreachable from the tick in any case.
-            return {}
+            return None
         record = self._chars.get(key)
-        if record is None:
-            return {}
-        return record.live(stamped)
+        if record is not None:
+            record.live(stamped)
+        return record
+
+    def _live_holds(self, char_key, now):
+        """The live ``(effect, cls)`` holds for a character, or an empty dict."""
+        record = self._live_record(char_key, now)
+        return record.holds if record is not None else {}
 
     def icons(self, char_key: str, now: float) -> tuple[str, ...]:
         """The effects to draw for this character, in
@@ -328,6 +401,20 @@ class EwarTracker:
         if not live:
             return ()
         return tuple(effect for effect in ICON_ORDER if effect in live)
+
+    def icon_modules(self, char_key: str, now: float) -> tuple[tuple[str, str], ...]:
+        """``(effect, module)`` for every effect :meth:`icons` would draw at this
+        ``now``, in the same order; ``module`` is ``""`` when no line of the live
+        hold named one.  An effect held by both source classes names the
+        player's module first: only tackle can be, and tackle names none."""
+        record = self._live_record(char_key, now)
+        if record is None or not record.holds:
+            return ()
+        live = {effect for effect, _cls in record.holds}
+        modules = record.modules
+        return tuple((effect, modules.get((effect, "player"))
+                      or modules.get((effect, "npc"), ""))
+                     for effect in ICON_ORDER if effect in live)
 
     def red_live(self, char_key: str, now: float) -> bool:
         """True iff a PLAYER-sourced hold is live for this character.

@@ -38,9 +38,10 @@ THE THREE INVARIANTS (a change that breaks any of them is a regression):
      preview. On failure it answers False and records `last_failure`.
 
 Layers, top to bottom of the file:
-  * pure functions - ewar_row_size (how big the row is) and compose_icons
-    (the chips, borders and glyphs as premultiplied BGRA). No window, no
-    ctypes; importable anywhere, Wine included.
+  * pure functions - ewar_row_size (how big the row is), compose_icons (the
+    chips, borders and glyphs as premultiplied BGRA) and ewar_icon_at (which
+    icon a point is on). No window, no ctypes; importable anywhere, Wine
+    included.
   * EwarWindow - one popup for one tile, every Win32 call behind an injectable
     backend (win32=), the preview_band / preview_tile house pattern.
   * _RealEwarWin32 - the ctypes backend, built LAZILY by _real_ewar_win32().
@@ -55,6 +56,10 @@ The ARTWORK comes from ewar_icons.icon_rgba as straight RGBA glyphs; the dark
 chip and its hairline - whose colour is PER EFFECT, see BORDER_COLORS - are
 composed HERE (design A4b), so swapping or withdrawing the art stays an asset
 edit.
+
+The popup never sees the mouse: WS_EX_TRANSPARENT is what keeps it from eating
+tile clicks, so the tooltips (owner decision D12) are the TILE's job. The tile
+hit-tests the cursor with ewar_icon_at, against the row it last asked for here.
 
 Compliance: every call here targets a window THIS process created on THIS
 thread. The owner hwnd is checked before a popup is created. No message, input
@@ -217,6 +222,12 @@ def _chip_size(icon_px):
     return icon_px + 2 * CHIP_PAD
 
 
+def _chip_pitch(icon_px):
+    """Left edge to left edge of two neighbouring chips: the ONE statement of
+    how the row is spaced, for the painter and the hit-test alike."""
+    return _chip_size(icon_px) + ICON_GAP
+
+
 def ewar_row_size(icons, icon_px):
     """(width, height) of the icon row in px, or (0, 0) when there is nothing
     to draw. Pure; never raises.
@@ -227,8 +238,7 @@ def ewar_row_size(icons, icon_px):
     cells = _drawable(icons, icon_px)
     if not cells:
         return (0, 0)
-    chip = _chip_size(icon_px)
-    return (len(cells) * chip + (len(cells) - 1) * ICON_GAP, chip)
+    return (len(cells) * _chip_pitch(icon_px) - ICON_GAP, _chip_size(icon_px))
 
 
 def _fit_width(icons, icon_px, tile_w):
@@ -251,8 +261,50 @@ def _fit_width(icons, icon_px, tile_w):
     room = tile_w - 2 * BODY_INSET
     if room < chip:
         return ()
-    fits = 1 + max(0, (room - chip) // (chip + ICON_GAP))
+    fits = 1 + max(0, (room - chip) // _chip_pitch(icon_px))
     return tuple(icons[:fits])
+
+
+def _fitted_row(icons, icon_px, w):
+    """The effects this request really draws, in order: what EwarWindow paints
+    and what ewar_icon_at answers about, so that a tile too narrow for all five
+    has no target for an icon it did not draw. () for a width _size_or_none
+    refuses, nothing drawable, or a tile too narrow for one chip."""
+    tile_w = _size_or_none(w)
+    wanted = tuple(effect for effect, _rgba in _drawable(icons, icon_px))
+    if tile_w is None or not wanted:
+        return ()
+    return _fit_width(wanted, icon_px, tile_w)
+
+
+def _point_or_none(value):
+    """A coordinate to do arithmetic on: an int, else None. Tk hands over ints,
+    or the string "??" for a field an event does not carry. (A bool needs no
+    case of its own: 0 and 1 are both left of BODY_INSET.)"""
+    return value if isinstance(value, int) else None
+
+
+def ewar_icon_at(x, y, icons, icon_px, w):
+    """The effect whose icon is at (x, y), BODY-relative px, in the row
+    EwarWindow.sync draws for these same (icons, icon_px, w); None off the row.
+    Pure; never raises; None for anything unusable, so icon_px == 0, which is
+    how the tile says "no row", is no target at all.
+
+    The row's whole rectangle answers: a gap between two chips belongs to the
+    chip on its left, so a cursor sliding along the row never falls through
+    between two icons."""
+    x, y = _point_or_none(x), _point_or_none(y)
+    if x is None or y is None:
+        return None
+    kept = _fitted_row(icons, icon_px, w)
+    if not kept:
+        return None
+    row_w, row_h = ewar_row_size(kept, icon_px)
+    x -= BODY_INSET
+    y -= BODY_INSET
+    if not (0 <= x < row_w and 0 <= y < row_h):
+        return None
+    return kept[x // _chip_pitch(icon_px)]
 
 
 def _chip_pixels(effect, icon_px):
@@ -321,7 +373,7 @@ def compose_icons(icons, icon_px):
     if not cells:
         return b""
     chip = _chip_size(icon_px)
-    width = len(cells) * chip + (len(cells) - 1) * ICON_GAP
+    width = len(cells) * _chip_pitch(icon_px) - ICON_GAP
     stride = 4 * width
     out = bytearray(stride * chip)
     left = 0
@@ -333,7 +385,7 @@ def compose_icons(icons, icon_px):
             at = y * stride + 4 * left
             src = y * 4 * chip
             out[at:at + 4 * chip] = part[src:src + 4 * chip]
-        left += chip + ICON_GAP
+        left += _chip_pitch(icon_px)
     return bytes(out)
 
 
@@ -452,7 +504,7 @@ class EwarWindow:
             if _empty_size(w):
                 return self._hide()     # a tile with no area: nothing to show
             return self._failed()       # step "request": a width it refuses
-        kept = _fit_width(wanted, icon_px, tile_w)
+        kept = _fitted_row(wanted, icon_px, tile_w)
         if not kept:
             return self._hide()         # too narrow for one chip
         row_w, row_h = ewar_row_size(kept, icon_px)
