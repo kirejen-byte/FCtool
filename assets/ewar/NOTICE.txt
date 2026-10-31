@@ -15,8 +15,10 @@ CCP's Developer License Agreement grants the right to use, display and
 distribute CCP's Game Data - which includes the images CCP makes available -
 within an application, and allows CCP to require that material be removed on
 seven days' notice. The art is therefore shipped as a plain asset: it can be
-regenerated, replaced or removed WITHOUT a code change, from the facts below
-alone.
+regenerated or replaced WITHOUT a code change, from the facts below alone. It
+can be removed without one at runtime (no sheet draws no icons and raises no
+fault), but FCTool.spec lists both files in datas, so a build also needs those
+two entries dropped.
 
 
 Sources

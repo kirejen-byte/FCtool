@@ -501,13 +501,16 @@ def _ewar_px_or_none(value):
     10 ** 400 - int(v * 0.60) overflows on it. Same shape, and the same
     ceiling, as the sizes preview_band and preview_ewar_band accept.
 
-    This exists because the clamp reads a geometry field that nothing upstream
+    This exists because the clamp reads geometry fields that nothing upstream
     bounds: preview_layout.clamp_size floors a configured size to an int but
-    never caps it, and a hand-edited config reaches _body_h directly. The
-    feature's own rule (see set_ewar_icons) is that garbage means NO ICONS,
-    never a tile whose icons are broken for the rest of the session, so every
-    caller here answers "nothing to show" on a None rather than raising into
-    _sync_ewar's fault latch."""
+    never caps it, and a hand-edited config reaches _w and _body_h directly.
+    The feature's own rule (see set_ewar_icons) is that garbage means NO ICONS,
+    never a tile whose icons are broken for the rest of the session, so no
+    caller raises into _sync_ewar's fault latch on a None. What each answers:
+    _sync_ewar_now treats a None _w or _body_h as "not visible" (no popup is
+    built, a built one is hidden); _ewar_icon_px answers 0 for a None _body_h
+    and, for a None _w, falls back to the narrow 14 px size (a path
+    _sync_ewar_now never reaches, because it has already hidden the tile)."""
     if isinstance(value, int) and not isinstance(value, bool):
         return value if 1 <= value <= _EWAR_MAX_BODY_PX else None
     return None
@@ -2725,14 +2728,14 @@ class TileWindow:
         created while there is nothing to show (no icon, tile hidden or never
         placed), so most tiles never build one at all (spec 10.2)."""
         icons = self._ewar_req
-        # _body_h goes through the same gate the clamp uses (_ewar_px_or_none):
-        # a bare `self._body_h > 0` RAISES on None or a string, and a raise
-        # here is a permanent fault - the very outcome "garbage is no icons"
-        # exists to prevent. _w keeps its plain comparison deliberately: the
-        # popup has its own, harsher, opinion about a width it refuses (see
-        # the note on the request below), and that behaviour is recorded, not
-        # changed here.
-        visible = ((not self._hidden) and self._w > 0
+        # _w and _body_h both go through the same gate the clamp uses
+        # (_ewar_px_or_none): a bare `self._w > 0` RAISES on None or a string,
+        # and a raise here is a permanent fault - the very outcome "garbage is
+        # no icons" exists to prevent. A width the gate refuses (a float, a
+        # bool, an out-of-range int) is therefore no icons too, and never
+        # reaches the popup (see the note on the request below).
+        visible = ((not self._hidden)
+                   and _ewar_px_or_none(self._w) is not None
                    and _ewar_px_or_none(self._body_h) is not None)
         # BEFORE the lazy create, because _ewar_icon_px answers 0 for a tile
         # with no headroom for even the smallest row: that draws nothing, so
@@ -2746,14 +2749,11 @@ class TileWindow:
                 factory = preview_ewar_band.EwarWindow
             self._ewar = factory(self._hwnd)
         x, y = self._placed_pos if self._placed_pos is not None else self._pos
-        # self._w reaches the popup as the row's width budget. NOTE a seam a
-        # reviewer flagged: EwarWindow.sync answers False for a width it
-        # refuses (a float, a bool, an out-of-range int) where BandWindow
-        # merely hides, and this tile turns any False into a PERMANENT fault -
-        # so a float _w would kill this tile's icons for life while its band
-        # kept working. Not reachable today only because preview_layout floors
-        # every configured size to an int; do not remove that flooring without
-        # dealing with this.
+        # self._w reaches the popup as the row's width budget. EwarWindow.sync
+        # answers False for a width it refuses (a float, a bool, an out-of-range
+        # int) where BandWindow merely hides, and this tile turns any False into
+        # a PERMANENT fault. The `visible` gate above is what keeps such a
+        # width from getting here: it accepts only what the popup accepts.
         req = (x, y + STRIP_H, self._w, icons, icon_px, self._alpha, visible)
         if req == self._ewar_synced:
             return True

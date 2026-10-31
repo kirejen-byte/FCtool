@@ -51,7 +51,8 @@ STALE LINES ARE STOPPED BY THE TAILER, NOT HERE (spec 10.3).  Windows expire
 on arrival time, so every line that reaches :meth:`EwarTracker.add` is
 believed.  That is only honest because ``gamelog_monitor`` keeps the EWAR sink
 shut for any read of a file that was not already caught up before it: a
-relaunch, a rotation, a hidden tile, a re-pointed logs folder, a gap in reading.
+relaunch, a rotation, an unchecked character, a re-pointed logs folder, a gap in
+reading.
 
 This module does not re-check, and must not grow a timestamp guard.  The tailer
 KNOWS which reads are history; a guard here can only infer it from log stamps.

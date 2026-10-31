@@ -789,8 +789,10 @@ class GamelogMonitor:
     _DIR_RESCAN_INTERVAL_SECONDS = 60.0
 
     # How long caught-up stays true without a look at the file (spec 10.3).
-    # Staleness equals the gap between looks (3 s of failed reads delivered
-    # lines aged up to 3.2 s, a 5 s stall up to 5.0 s), so past this a read is
+    # Staleness equals the gap between looks. Real cycles run 1.01-1.08 s, so
+    # 3 failed polls (a gap of about 4 s; a 3.0 s outage measured 4.03 s) are
+    # tolerated and a fourth is not (a 4.5 s outage gave a 5.05 s gap and
+    # swallowed 18 lines): the real tolerance is 3 polls. Past this a read is
     # history whatever caused the gap. Kept above an antivirus read blip (the
     # transient failed open _read_listener's retry exists for), which must not
     # swallow a one-shot scramble.
