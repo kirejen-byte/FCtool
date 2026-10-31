@@ -165,6 +165,9 @@ import cycle_roles
 import monitor_pin
 import hotkey_service
 import damage_flash
+# The tiles' incoming-EWAR holds (icon row + the EWAR red border). Pure, with
+# a caller-supplied clock -- the damage_flash shape, deliberately.
+import ewar_state
 import gamelog_monitor
 from gamelog_monitor import GamelogMonitor
 import preview_tile
@@ -1797,6 +1800,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._preview_hotkey_factory = hotkey_service.HotkeyService  # injectable
         # ── Damage flash (Task B6) ──────────────────────────────────────────
         self._preview_damage = damage_flash.DamageFlashTracker()  # rolling-window tracker
+        # ...and its EWAR sibling: per-character incoming-EWAR holds, read by
+        # the tick (the icon row) and by _preview_paint_border (the red).
+        self._preview_ewar = ewar_state.EwarTracker()
+        self._preview_ewar_since = {}           # char key -> red pulse-clock start
         self._preview_gamelog = None           # GamelogMonitor (lazy, native only)
         # Last character set pushed to that monitor (frozenset | None = never
         # pushed / monitor swapped). The tick re-computes the scope every pass
@@ -20627,6 +20634,17 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         "damage_flash_color": damage_flash.PLAYER_COLOR_DEFAULT,
         "damage_flash_npc": True,
         "damage_flash_npc_color": damage_flash.NPC_COLOR_DEFAULT,
+        # EWAR icons (native only): a row of small static module icons over the
+        # TOP-LEFT of each tile's video naming the INCOMING electronic- and
+        # capacitor-warfare effects live on that character, read from that
+        # char's OWN combat Gamelog. Ships ON -- it is an attention router, and
+        # a tile showing nothing has to be trustable as nothing. A player-
+        # sourced effect also reddens the border, gated by THIS key alone
+        # (owner decision D8); NPC cap warfare never draws at all.
+        # NO migration, and adding one would be wrong: _preview_cfg() fills an
+        # absent key on its first read, so a brand-new default needs none (the
+        # marker-gated dance is for CHANGING an existing default later).
+        "ewar_icons": True,
         # ── Decloak alert (native only) ─────────────────────────────────────
         # When one of the user's own chars is decloaked (proximity or Mobile
         # Observatory), read from that char's OWN Gamelog, the tile flashes
@@ -21335,6 +21353,21 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         if set_band is not None:
             set_band(FCToolGUI._preview_text_band_effective(
                 cfg, getattr(self, "_preview_thumb_backend", None)))
+        # EWAR icon row over the video. The tracker answers in ICON_ORDER, and
+        # () is what CLEARS a row that is already drawn -- so the toggle going
+        # off, a tracker-less host, and a LOGIN tile (no character, therefore
+        # no gamelog) all push (), never "leave it alone". The tile's own
+        # zero-write mirror makes the steady state free. `ident` is the char
+        # key for a logged-in pilot and `login:<acct>` / "" otherwise, which is
+        # the login test here: this method never receives a client object.
+        set_ewar = getattr(tile, "set_ewar_icons", None)
+        if set_ewar is not None:
+            _ewar = getattr(self, "_preview_ewar", None)
+            icons = ()
+            if (_ewar is not None and ident and not ident.startswith("login:")
+                    and FCToolGUI._preview_ewar_on(cfg)):
+                icons = _ewar.icons(ident, time.monotonic())
+            set_ewar(icons)
         # BUG B: keep the tile's lock_layout flag in lockstep with config so a
         # live toggle gates drag-moves without respawning the tile.
         set_lock = getattr(tile, "set_lock_layout", None)
@@ -23432,6 +23465,29 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         except Exception:
             log.exception("[preview] damage ingest failed")
 
+    def _preview_on_ewar(self, ev):
+        """Tk-thread ingest of a GamelogMonitor EwarEvent (the tile icon row).
+
+        Mirrors _preview_on_damage, including the key: everything downstream
+        reads the tracker by `client.key`, the LOWERCASED char name, so an
+        event's name is normalised the same way here or no tile would ever
+        find its icons. The monitor's sink is attached UNCONDITIONALLY (see
+        _preview_start_gamelog), so the feature toggle is read here -- that is
+        what lets the checkbox take effect without a restart. The line's own
+        log timestamp rides along: the tracker needs it to tell a replayed
+        file (the tailer re-reads from the top on rotation) from a live line."""
+        try:
+            if not self._preview_ewar_on(self._preview_cfg()):
+                return
+            key = (getattr(ev, "character_name", "") or "").strip().lower()
+            if not key:
+                return
+            self._preview_ewar.add(key, getattr(ev, "hit", None),
+                                   getattr(ev, "timestamp", ""),
+                                   time.monotonic())
+        except Exception:
+            log.exception("[preview] EWAR ingest failed")
+
     # Global cooldown (s) so a burst of simultaneous decloaks / repeated pulses
     # never stacks the "Decloaked" audio cue.
     _PREVIEW_DECLOAK_AUDIO_COOLDOWN_S = 2.0
@@ -23661,15 +23717,29 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             info.external_hwnd = fg      # neither an EVE client nor ours → switch target
         return info
 
+    @staticmethod
+    def _preview_ewar_on(cfg) -> bool:
+        """Is the EWAR icon feature on? The ONE reader of `ewar_icons`, for
+        both the icon row and the border's red: two readers of one key
+        disagreeing about its default is a bug this subsystem has shipped
+        before, so the fallback names _PREVIEW_DEFAULTS instead of a literal.
+        `bool()` so a hand-edited "yes" / 1 / None coerces like every other
+        preview bool rather than raising inside the tick."""
+        return bool(cfg.get("ewar_icons",
+                            FCToolGUI._PREVIEW_DEFAULTS["ewar_icons"]))
+
     def _preview_paint_border(self, tile, hwnd, client, cfg, active_hwnd):
         """Decide and paint ONE tile's border. The single owner of the border
         precedence chain: the tick calls it per shown tile, and
         `_preview_repaint_active` calls it right after a switch (issue 13), so
         the two can never disagree about which source wins.
 
-        Border precedence is fixed + deterministic (2026-09-26):
-          PLAYER damage red > DECLOAK yellow > NPC damage orange >
-          intel flash > active highlight > none.
+        Border precedence is fixed + deterministic (2026-10-30):
+          PLAYER damage red == PLAYER EWAR red > DECLOAK yellow >
+          NPC damage orange > intel flash > active highlight > none.
+        A player's EWAR joins at the SAME rank as his damage (owner decision
+        D5) and NPC EWAR does not enter the chain at all (D4/D9): NPC tackle
+        draws its icon over whatever the damage tracker decided.
         A hostile player's hit is the most urgent signal; a decloak is urgent
         AND short-lived, so it outranks routine NPC damage (ratting orange must
         never mask a decloak). Each flash expires on its own and falls through
@@ -23696,6 +23766,38 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         if cfg.get("damage_flash", True) and not client.is_login:
             dmg_kind, dmg_since = self._preview_damage.flash_state(
                 key, self._preview_layer_hp.get(key), cfg, now)
+        # PLAYER EWAR red (D5): a player's jam / tackle / neut / nos reddens
+        # the tile at the SAME rank as player damage, for the effect's own
+        # window (ewar_state owns that). `red_live` answers for PLAYER-sourced
+        # holds only, so NPC EWAR never reaches the chain (D4/D9/A7).
+        #
+        # This read sits DELIBERATELY OUTSIDE the damage_flash guard above and
+        # is gated by `ewar_icons` ALONE: with damage flash OFF and EWAR ON, a
+        # player neut must still redden the tile (owner decision D8). EWAR is
+        # its own feature with its own switch, and that switch is the one that
+        # governs it. A tidy-up that re-nests this branch inside the guard
+        # above BREAKS D8 -- test_preview_tick.py pins the combination.
+        _ewar = getattr(self, "_preview_ewar", None)
+        ewar_red = (not client.is_login and _ewar is not None
+                    and self._preview_ewar_on(cfg)
+                    and _ewar.red_live(key, now))
+        # ONE pulse clock per character across BOTH red sources, so a tile
+        # already pulsing from damage does not restart its rhythm when a neut
+        # lands (spec 10.1) -- the same reason that clock survives red<->orange
+        # swaps today. The damage tracker owns a clock whenever it reports a
+        # kind, so adopt it; with EWAR alone, seed one here the way the tracker
+        # does (setdefault, so consecutive ticks read the SAME start) and drop
+        # it once neither red source is live, so the next hold starts fresh.
+        _since_map = getattr(self, "_preview_ewar_since", None)
+        if _since_map is None:
+            _since_map = {}                   # bare unit host: no cross-tick clock
+        if dmg_since is not None:
+            _since_map[key] = dmg_since
+        elif not ewar_red:
+            _since_map.pop(key, None)
+        red_since = (dmg_since if dmg_since is not None
+                     else (_since_map.setdefault(key, now) if ewar_red
+                           else None))
         # DECLOAK flash: the window is edge-armed in _preview_on_decloak
         # (until = now + decloak_flash_secs, pulse start seeded then). Here we
         # only read the live window, expire it, and - while live - pulse the
@@ -23725,11 +23827,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                         is not None)
         # Damage colours are normalised to each kind's OWN default (a garbage
         # NPC colour must never read as player red).
-        if dmg_kind == "player":
+        if dmg_kind == "player" or ewar_red:
             peak = normalize_hex_color(cfg.get("damage_flash_color"),
                                        damage_flash.PLAYER_COLOR_DEFAULT)
             tile.set_border(_preview_alert_border(
-                peak, dmg_since, now, _wine_steady))
+                peak, red_since, now, _wine_steady))
         elif decloaking:
             peak = cfg.get("decloak_flash_color", "#ffcc00")
             started = self._preview_decloak_since.get(key, now)
@@ -24141,6 +24243,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 # _ozone_on_cyno_active where a toggle reaches it immediately.
                 on_cyno_active=lambda ev: self._post_ui(
                     self._ozone_on_cyno_active, ev),
+                # Incoming EWAR (the tiles' icon row) rides the same tailing
+                # pass on exactly the same terms as the cyno sink above: the
+                # sink is ALWAYS attached -- a build-time gate would need a
+                # restart to take effect -- and the master toggle lives in
+                # _preview_on_ewar, where it reaches the feature immediately.
+                on_ewar=lambda ev: self._post_ui(self._preview_on_ewar, ev),
                 logs_dir=logs_dir)
             mon.start()
             self._preview_gamelog = mon
@@ -27047,6 +27155,25 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             _tip(sw, sw_tip)
             return var, sw
 
+        # EWAR icons -- the icon row over each tile's video, and (for a hostile
+        # PLAYER's effect) the red border, which this box governs on its own:
+        # it still reddens with "Damage flash" off (owner decision D8).
+        self._preview_ewar_icons_var = tk.BooleanVar(
+            value=FCToolGUI._preview_ewar_on(pcfg))
+        cbew = tk.Checkbutton(
+            rowDmgColor, text="EWAR icons",
+            variable=self._preview_ewar_icons_var,
+            command=self._preview_apply_native_state, font=("Consolas", 10),
+            fg=FG_TEXT, bg=BG_DARK, selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT)
+        cbew.grid(row=0, column=5, padx=(0, 8))
+        w.append(cbew)
+        _tip(cbew, "Show small module icons over a preview when that character "
+                   "is being jammed, pointed, scrambled, neuted or nos'd, read "
+                   "from your own combat logs. A hostile PLAYER's EWAR also "
+                   "pulses the border red (even with 'Damage flash' off); NPC "
+                   "neuts and jams are ignored, NPC tackle still shows.")
+
         self._preview_dmg_color_var, self._preview_dmg_color_swatch = _dmg_swatch(
             1, "Player color", "damage_flash_color",
             damage_flash.PLAYER_COLOR_DEFAULT, "player")
@@ -27815,6 +27942,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         ("_preview_account_slots_var", "account_slots", bool),
         ("_preview_account_slots_auto_var", "account_slots_auto", bool),
         ("_preview_hotkeys_eve_only_var", "hotkeys_eve_only", bool),
+        # "EWAR icons" (Alerts row 3, 2026-10-30). APPENDED, per the anchoring
+        # comment on implant_icon above: the end of this table is what keeps
+        # two concurrent branches' native vars out of each other's way.
+        ("_preview_ewar_icons_var", "ewar_icons", bool),
     )
 
     def _preview_snapshot_native_vars(self):
