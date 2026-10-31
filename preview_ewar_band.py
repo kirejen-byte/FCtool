@@ -63,6 +63,8 @@ or focus function is bound, and nothing draws text (tests pin the census).
 """
 from __future__ import annotations
 
+from types import MappingProxyType
+
 from ewar_icons import ICON_SIZES, icon_rgba
 from ewar_parse import ICON_ORDER
 
@@ -90,9 +92,12 @@ _BORDER_OVERRIDES = {"disruption": "#ffb01f"}
 #: Every effect's hairline, BUILT FROM ICON_ORDER rather than written out, so
 #: it cannot drift from it: a sixth effect added upstream arrives here with the
 #: default red on the same commit, with no edit, no missing key and no
-#: KeyError. Read it through border_color().
-BORDER_COLORS = {effect: _BORDER_OVERRIDES.get(effect, BORDER_COLOR_DEFAULT)
-                 for effect in ICON_ORDER}
+#: KeyError. Read it through border_color(). A read-only view, so that is
+#: structural: the chip cache is warmed from this table, and a runtime
+#: mutation would serve stale chips of the old colour.
+BORDER_COLORS = MappingProxyType(
+    {effect: _BORDER_OVERRIDES.get(effect, BORDER_COLOR_DEFAULT)
+     for effect in ICON_ORDER})
 
 #: The chip behind a glyph: black at ~72 % alpha (D2). 0.72 * 255 = 183.6.
 CHIP_BG_ALPHA = 184
