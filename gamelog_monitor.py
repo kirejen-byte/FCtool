@@ -79,6 +79,14 @@ from app_path import app_dir  # same import chat_monitor uses (chat_monitor.py:5
 
 # Reuse chat_monitor's verified header pattern verbatim (identical log header).
 from chat_monitor import HEADER_LISTENER_PATTERN
+# Incoming-EWAR line parser (pure: no I/O, no Tk, no clock). The dependency is
+# ONE-WAY by design -- ewar_parse imports nothing from here. It keeps its own
+# copy of the tag-stripping regex instead of importing _TAG_RE back, because
+# that name is defined far BELOW this import block (either module would see a
+# half-initialised other) and because this module computes app_dir() at import
+# time, which would cost that pure module its purity. See ewar_parse's module
+# docstring: re-pointing _TAG_RE the other way was considered and rejected.
+from ewar_parse import EwarHit, parse_ewar_line
 
 log = get_logger(__name__)
 
@@ -240,6 +248,21 @@ class CynoActiveEvent:
     timestamp: str          # "YYYY.MM.DD HH:MM:SS" as written in the log
     character_name: str     # from the file's "Listener:" header
     generator_name: str     # e.g. "Covert Cynosural Field Generator I", verbatim
+
+
+@dataclass(frozen=True)
+class EwarEvent:
+    """One INCOMING electronic-/capacitor-warfare line for one tailed character.
+
+    Same WHO + WHEN + WHAT shape as its three siblings above. The timestamp is
+    the line's OWN, as written in the log, and it is load-bearing rather than
+    diagnostic: the tailer reseeds a rotated or truncated file from position
+    zero and REPLAYS it, so the consumer compares log timestamps to each other
+    to tell a live line from a replayed one (a replay that reached the icon
+    tracker would light every icon on a tile at once)."""
+    timestamp: str          # "YYYY.MM.DD HH:MM:SS" as written in the log
+    character_name: str     # from the file's "Listener:" header
+    hit: EwarHit            # effect / player-vs-npc / module / amount
 
 
 def _weapon_of(tail: str) -> str:
@@ -519,13 +542,20 @@ class GamelogMonitor:
     _KNOWN_PLAYERS_CAP = 2048
 
     def __init__(self, on_event, logs_dir=None, state_path=STATE_FILE_PATH,
-                 poll_interval=1.0, on_decloak=None, on_cyno_active=None):
+                 poll_interval=1.0, on_decloak=None, on_cyno_active=None,
+                 on_ewar=None):
         self._on_event = on_event
         self._on_decloak = on_decloak        # optional DecloakEvent sink (parallel of on_event)
         # optional CynoActiveEvent sink ("Watch my ozone"); same shape again.
         # An UNSET callback is the cheap gate: no sink, no parse, so a consumer
         # that does not want these lines pays nothing per line.
         self._on_cyno_active = on_cyno_active
+        # optional EwarEvent sink (the preview tiles' EWAR icon bar); fourth
+        # sink, same deal. An UNSET callback is again the cheap gate -- no sink,
+        # no parse, not even ewar_parse's four substring tests. `on_ewar` is the
+        # LAST keyword on purpose: every existing positional construction of
+        # this monitor keeps working unchanged.
+        self._on_ewar = on_ewar
         self._logs_dir = logs_dir            # resolved lazily (see B6 wiring)
         self._state_path = state_path
         self._poll_interval = poll_interval
@@ -928,8 +958,10 @@ class GamelogMonitor:
         source=classify_damage_source(...)) is emitted. The
         SAME line is also run through parse_decloak_line() (short-circuited on a
         cheap substring); on a hit a DecloakEvent is emitted via on_decloak, and
-        again through parse_cyno_active_line() for on_cyno_active. Both extra
-        parses are skipped entirely when their sink is None.
+        again through parse_cyno_active_line() for on_cyno_active, and again
+        through parse_ewar_line() for on_ewar (which additionally requires a
+        non-empty listener -- see the comment at that call site). All three
+        extra parses are skipped entirely when their sink is None.
 
         The file's `Listener:` is resolved only once there is actually new text
         to attribute (below), so a pass that finds nothing new never opens the
@@ -1021,6 +1053,21 @@ class GamelogMonitor:
                 ev = parse_cyno_active_line(ln, listener)
                 if ev is not None:
                     self._on_cyno_active(ev)
+            # Incoming EWAR (the preview tiles' icon bar); same pass, same
+            # cheap-gate deal -- no sink, no parse at all.
+            #
+            # `and listener` is NOT defensive noise: "" is one of this tailer's
+            # four real listener states (see _listeners above) and ~48% of a
+            # live Gamelogs folder predates the `Listener:` header line. The
+            # consumer keys its per-character icon state on the name, so an
+            # event named "" would smear ONE headerless file's EWAR across
+            # every other headerless character's tile. A nameless event is one
+            # the consumer cannot use, so it is dropped here instead.
+            if self._on_ewar is not None and listener:
+                hit = parse_ewar_line(ln)
+                if hit is not None:
+                    self._on_ewar(EwarEvent(timestamp=_ts_of(ln),
+                                            character_name=listener, hit=hit))
 
         new_pos = read_start + len(raw)              # raw byte length; no *2
         self._positions[path] = new_pos
