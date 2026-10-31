@@ -11,8 +11,20 @@ topping it every tick destroyed in-game FPS.
 
 Where this one sits: the icon row occupies the TOP-LEFT corner of the tile
 BODY, inset BODY_INSET px, sized to the row (owner decision D1). The text band
-covers the BOTTOM of the same body. The two never overlap, which is what lets
-BOTH ride their owner's z-order with no ordering call ever made between them.
+covers the BOTTOM of the same body, so the two do not overlap, and THAT is what
+lets BOTH ride their owner's z-order with no ordering call ever made between
+them (spec 10.2).
+
+THE NON-OVERLAP IS CONDITIONAL ON A SINGLE-ROW BAND, and that condition is not
+enforced anywhere - it is a property of what FCTool ships. Since v6.9.7 the
+location strip is fed "" and the band is therefore ONE row, which clears the
+icon row at every size and body height. A TWO-row band brings them back into
+contact: at Tk scaling 1.5 or more with 27 px icons, tile bodies of roughly 68
+to 79 px overlap by 2 to 6 px (the band grows upward from the bottom until the
+60 % body cap stops it, while the icon row is a fixed 34 px from the top).
+Whoever re-enables the location strip owns that: either keep the icon row and
+the band out of each other's way by height, or accept the overlap deliberately
+- do NOT reach for a re-stack, which would break invariant 1.
 
 THE THREE INVARIANTS (a change that breaks any of them is a regression):
   1. the popup is never re-stacked by our code - the one window-position call
@@ -185,10 +197,18 @@ def _fit_width(icons, icon_px, tile_w):
     """The LEADING icons whose row fits inside `tile_w` with BODY_INSET px of
     margin each side, as a tuple of effect names. () when not even one fits.
 
-    Five simultaneous icons is the ceiling (spec A3) and at 14 px they fit the
-    narrowest tile the preview offers, so this is a belt rather than a layout
-    feature: it exists so an unforeseen combination of a very narrow tile and a
-    very large icon size can never paint past the tile's edge."""
+    Five simultaneous icons is the ceiling (spec A3), and spec A3's arithmetic
+    holds at 14 px: 92 px of row plus both insets inside a 160 px tile. It does
+    NOT hold at every size. Measured against the project's 120 px minimum tile
+    width, where the room is 110 px: all five fit at 14 px, FOUR of five at
+    18 and 21 px, THREE of five at 27 px. So dropping icons is an ordinary
+    outcome on a narrow tile at Tk scaling 1.5 or more, not an unforeseen one.
+
+    It is the TRAILING icons that go, which is why truncating the end is the
+    right rule rather than a shrug: the tuple arrives in ICON_ORDER (spec A2),
+    which is ordered by how much the effect constrains the pilot, so the first
+    icon dropped is nosferatu - the least constraining - and scramble, the most
+    constraining, is the last thing that could ever be dropped."""
     chip = _chip_size(icon_px)
     room = tile_w - 2 * BODY_INSET
     if room < chip:
@@ -230,10 +250,11 @@ def _chip_pixels(effect, icon_px):
 
 
 #: Composed chips, keyed (effect, icon_px). The sheet carries five effects at
-#: four sizes, so this is bounded at 20 entries (about 50 KB) and every value
-#: is deterministic - a chip is the artwork plus two module constants. Filled
-#: on demand rather than at import so a tile that never shows an icon, and the
-#: Wine build that cannot show one at all, pay nothing.
+#: four sizes, so this is bounded at 20 entries and 40,520 bytes (39.6 KB) -
+#: measured; five effects times the sum of (px + 2) ** 2 * 4 over ICON_SIZES.
+#: Every value is deterministic: a chip is the artwork plus two constants.
+#: Filled on demand rather than at import, so a tile that never shows an icon,
+#: and the Wine build that cannot show one at all, pay nothing.
 _CHIPS = {}
 
 
@@ -515,8 +536,8 @@ class _RealEwarWin32:  # pragma: no cover - the one real-Win32 test + live use
 
     Note what is NOT here: no font, no text, no read-back of GDI-drawn bits.
     The chips are composed in Python (compose_icons) and this backend only
-    hands the finished buffer to the compositor, which is why its census is the
-    band's minus every text function."""
+    hands the finished buffer to the compositor. So this census is FIFTEEN
+    names: the band's twenty, minus the five it needs for text."""
 
     WS_POPUP = 0x80000000
     WS_EX_LAYERED = 0x00080000          # painted through UpdateLayeredWindow
