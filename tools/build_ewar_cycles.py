@@ -24,7 +24,7 @@ scripts and the ECM Jammer Burst Projector carry no duration, and the eight
 Abyssal neut/nos types carry no stats at all because theirs are rolled per
 item.  Those eight are exactly why ``ewar_cycles`` keeps a size-word fallback.
 
-Measured on SDE build 3494416 (2026-10-30): 151 entries kept, 13 skipped.
+Measured on SDE build 3494416 (2026-10-30): 162 entries kept, 13 skipped.
 
 OUTPUT: the tool rewrites only the region of ``ewar_cycles.py`` between
 :data:`BEGIN_MARKER` and :data:`END_MARKER`, so the hand-written resolver
@@ -55,12 +55,26 @@ OUT_PATH = os.path.join(ROOT, "ewar_cycles.py")
 DURATION_ATTR = 73
 
 #: A type is in scope when its name contains one of these.  Mirrors the five
-#: detectable effects of the design's section 5.1: ECM covers the jam icon,
-#: the two energy families cover neut and nos, and the burst projector is the
-#: structure module that logs as "Standup Energy Neutralization Burst
-#: Projector".  Tackle is deliberately absent -- it logs once at activation
-#: and gets a flat window (design D3), so its cycle time is never consulted.
-NAME_NEEDLES = ("ECM", "Energy Neutralizer", "Energy Nosferatu", "Neutralization Burst")
+#: detectable effects of the design's section 5.1: ECM and Burst Jammer cover
+#: the jam icon, the two energy families cover neut and nos, and the burst
+#: projector is the structure module that logs as "Standup Energy
+#: Neutralization Burst Projector".  Tackle is deliberately absent -- it logs
+#: once at activation and gets a flat window (design D3), so its cycle time is
+#: never consulted.
+#:
+#: "Burst Jammer" is a needle of its own because the 11 ship burst jammers
+#: carry no "ECM" in their names, yet they jam and log exactly like an ECM
+#: module ("You're jammed by ... - Burst Jammer II").  Without it they fell to
+#: the resolver's 15 s default, which is a window that ends halfway through
+#: their real 30 s cycle -- the icon would blink out mid-jam.
+#:
+#: The needle cannot reach the structure module "ECM Jammer Burst Projector":
+#: that name carries "Jammer Burst", not "Burst Jammer".  It is in scope via
+#: "ECM" and is skipped for having no attribute 73, which is correct -- it is
+#: a different module from a ship burst jammer and the SDE gives it no
+#: duration to bake.
+NAME_NEEDLES = ("ECM", "Burst Jammer", "Energy Neutralizer", "Energy Nosferatu",
+                "Neutralization Burst")
 
 BEGIN_MARKER = "# --- BEGIN GENERATED TABLE: tools/build_ewar_cycles.py ---"
 END_MARKER = "# --- END GENERATED TABLE ---"

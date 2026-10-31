@@ -29,7 +29,7 @@ import re
 # --- BEGIN GENERATED TABLE: tools/build_ewar_cycles.py ---
 # Generated 2026-10-30 by tools/build_ewar_cycles.py from
 # fit_dogma.json.gz (SDE build 3494416, attribute 73) + fit_types.json.
-# 151 modules kept; 13 in-scope types carry no duration and rely on
+# 162 modules kept; 13 in-scope types carry no duration and rely on
 # the size-word fallback below:
 #   Capital Abyssal Energy Neutralizer  (no attribute 73)
 #   Capital Abyssal Energy Nosferatu  (no attribute 73)
@@ -47,6 +47,7 @@ import re
 # DO NOT EDIT THIS REGION BY HAND -- re-run the tool instead.
 MODULE_CYCLE_MS: dict[str, int] = {
     "'Gambler' Ladar ECM": 20000,
+    "'Ghost' Burst Jammer": 30000,
     "'Heist' Radar ECM": 20000,
     "'Marshall' Magnetometric ECM": 20000,
     "'Plunderer' Gravimetric ECM": 20000,
@@ -62,6 +63,8 @@ MODULE_CYCLE_MS: dict[str, int] = {
     'BZ-5 Scoped Gravimetric ECM': 20000,
     "Brokara's Modified Heavy Energy Neutralizer": 24000,
     "Brokara's Modified Heavy Energy Nosferatu": 10000,
+    'Burst Jammer I': 30000,
+    'Burst Jammer II': 30000,
     'CZ-4 Compact Gravimetric ECM': 20000,
     'Capital Energy Neutralizer I': 48000,
     'Capital Energy Neutralizer II': 48000,
@@ -71,6 +74,7 @@ MODULE_CYCLE_MS: dict[str, int] = {
     'Capital Gremlin Compact Energy Neutralizer': 48000,
     'Capital Infectious Scoped Energy Neutralizer': 48000,
     'Capital Knave Scoped Energy Nosferatu': 20000,
+    'Cetus Scoped Burst Jammer': 30000,
     "Chelm's Modified Heavy Energy Neutralizer": 24000,
     "Chelm's Modified Heavy Energy Nosferatu": 10000,
     'Compulsive Scoped Multispectral ECM': 20000,
@@ -102,6 +106,7 @@ MODULE_CYCLE_MS: dict[str, int] = {
     'Dark Blood Medium Energy Nosferatu': 5000,
     'Dark Blood Small Energy Neutralizer': 6000,
     'Dark Blood Small Energy Nosferatu': 2500,
+    'Deluge Enduring Burst Jammer': 30000,
     "Draclira's Modified Heavy Energy Neutralizer": 24000,
     "Draclira's Modified Heavy Energy Nosferatu": 10000,
     'Dread Guristas Multispectral ECM': 20000,
@@ -165,12 +170,14 @@ MODULE_CYCLE_MS: dict[str, int] = {
     "Panola's Modified Radar ECM": 20000,
     'Radar ECM I': 20000,
     'Radar ECM II': 20000,
+    'Rash Compact Burst Jammer': 30000,
     "Raysere's Modified Heavy Energy Neutralizer": 24000,
     "Raysere's Modified Heavy Energy Nosferatu": 10000,
     "Ryhad's Modified Medium Energy Neutralizer": 12000,
     "Ryhad's Modified Medium Energy Nosferatu": 5000,
     "Selynne's Modified Heavy Energy Neutralizer": 24000,
     "Selynne's Modified Heavy Energy Nosferatu": 10000,
+    'Sentient Burst Jammer': 30000,
     'Shade Compact Radar ECM': 20000,
     "Small 'Caltrop' Energy Neutralizer": 6000,
     "Small 'Upir' Energy Nosferatu": 2500,
@@ -194,6 +201,10 @@ MODULE_CYCLE_MS: dict[str, int] = {
     'True Sansha Small Energy Neutralizer': 6000,
     'True Sansha Small Energy Nosferatu': 2500,
     'Umbra Scoped Radar ECM': 20000,
+    "Unit D-34343's Modified Burst Jammer": 30000,
+    "Unit F-435454's Modified Burst Jammer": 30000,
+    "Unit P-343554's Modified Burst Jammer": 30000,
+    "Unit W-634's Modified Burst Jammer": 30000,
     "Vepas' Modified Multispectral ECM": 20000,
     "Vizan's Modified Heavy Energy Neutralizer": 24000,
     "Vizan's Modified Heavy Energy Nosferatu": 10000,
