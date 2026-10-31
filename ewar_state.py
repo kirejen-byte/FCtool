@@ -8,14 +8,15 @@ qualifying line.  :meth:`EwarTracker.icons` is the icon bar's reader and
 the preview tick already has.
 
 WINDOW per hit (design A1) -- ``cycle_ms_for(module, amount) / 1000 * 1.25``,
-clamped to ``[_WINDOW_FLOOR_S, _WINDOW_CEILING_S]`` = 6 s to 30 s.  The pieces
-are each load-bearing:
+clamped to ``[_WINDOW_FLOOR_S, _WINDOW_CEILING_S]`` = 6 s to 30 s, or for a jam
+its exact duration under the same ceiling.  The pieces are each load-bearing:
 
   - the 1.25 multiplier absorbs the 1 s poll interval plus one late or dropped
     line without inventing a second mechanism;
-  - a JAM takes its exact cycle, no multiplier: the margin is for effects whose
-    NEXT line may arrive late, and a jam's end is already known.  A jam line
-    means jammed for one cycle, so ECM is 20 s and a ship burst jammer 30 s;
+  - a JAM takes its exact duration, no multiplier and NO FLOOR: the margin is
+    for effects whose NEXT line may arrive late, and a jam's end is already
+    known, so the icon stays until the timer is up and no longer.  ECM is 20 s,
+    a ship burst jammer 30 s, and an ECM drone 5 s: its jam, not its 20 s cycle;
   - the 30 s CEILING is what tames the Standup Energy Neutralization Burst
     Projector's 480 s cycle -- an eight-minute neut icon is indistinguishable
     from a stuck one, and nothing on a tile may outlive 30 s of silence;
@@ -50,7 +51,7 @@ STALE LINES ARE STOPPED BY THE TAILER, NOT HERE (spec 10.3).  Windows expire
 on arrival time, so every line that reaches :meth:`EwarTracker.add` is
 believed.  That is only honest because ``gamelog_monitor`` keeps the EWAR sink
 shut for any read of a file that was not already caught up before it: a
-relaunch, a rotation, a hidden tile, a re-pointed logs folder.
+relaunch, a rotation, a hidden tile, a re-pointed logs folder, a gap in reading.
 
 This module does not re-check, and must not grow a timestamp guard.  The tailer
 KNOWS which reads are history; a guard here can only infer it from log stamps.
@@ -83,10 +84,10 @@ BOUNDED MEMORY.  At most :data:`_MAX_CHARS` character records; seven hold
 entries per record are reachable (one per effect for a player, plus NPC
 scramble and disruption -- the other three NPC effects are never stored),
 within an ``(effect, cls)`` key space of ten.  A record is created only when a
-hold is actually stored, so a dropped line costs no memory at all.  A record with no live hold that has seen no stored hold for
-:data:`_IDLE_RETENTION_S` is dropped when the next new character arrives, and
-the cap behind it evicts a record with no live hold before one with (see
-:meth:`EwarTracker._prune`).
+hold is actually stored, so a dropped line costs no memory at all.  A record
+with no live hold that has seen no stored hold for :data:`_IDLE_RETENTION_S` is
+dropped when the next new character arrives, and the cap behind it evicts a
+record with no live hold before one with (see :meth:`EwarTracker._prune`).
 
 Threading: every caller is on the Tk thread (ingest via fc_gui's ``_post_ui``,
 reads via the preview tick), so the unlocked mutations here are
@@ -199,9 +200,9 @@ def _window_s_for(effect: str, module, amount) -> float:
     if effect in _TACKLE_EFFECTS:
         return TACKLE_WINDOW_S
     raw = cycle_ms_for(module, amount) / 1000.0
-    if effect != "jam":
-        raw *= _WINDOW_FACTOR
-    return max(_WINDOW_FLOOR_S, min(_WINDOW_CEILING_S, raw))
+    if effect == "jam":
+        return min(_WINDOW_CEILING_S, raw)
+    return max(_WINDOW_FLOOR_S, min(_WINDOW_CEILING_S, raw * _WINDOW_FACTOR))
 
 
 class _CharState:

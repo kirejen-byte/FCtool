@@ -1570,6 +1570,10 @@ class TileWindow:
         if getattr(self, "_hidden", False):
             return
         self._hidden = True
+        # The tick skips a hidden tile, so nothing corrects this request while
+        # the tile is away, and show() places (and syncs) before that tick's
+        # styling runs. Icons still live come back with that styling.
+        self._ewar_req = ()
         # An owned popup is NOT hidden with its owner: say so (visible=False)
         # BEFORE the withdraw, so no frame ever shows the band or the EWAR
         # icon row without its tile.

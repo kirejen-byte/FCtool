@@ -6,18 +6,22 @@ wrong for capacitor warfare: a small neutralizer cycles in 6 s and a capital
 one in 48 s, so one number either blinks out mid-cycle or lingers for four
 cycles after the module stopped.
 
-Every incoming capacitor-warfare and ECM line in the gamelog names its module,
-so the cycle is a NAME lookup rather than an inference from the GJ amount.
-That matters beyond accuracy: hulls such as Curse, Armageddon and Sentinel
-bonus neutralizer AMOUNT and never DURATION, so a bonused medium neutralizer
-hits for heavy-neutralizer numbers while still cycling at 12 s.  A name lookup
-is simply right where an amount-derived guess doubles the window.
+Every incoming capacitor-warfare and ECM line from a player names its module,
+so the cycle is a NAME lookup rather than an inference from the GJ amount.  (An
+NPC's line repeats the NPC's ship name instead, which is harmless: ewar_state
+drops those effects before asking for a window.)  That matters beyond accuracy:
+hulls such as Curse, Armageddon and Sentinel bonus neutralizer AMOUNT and never
+DURATION, so a bonused medium neutralizer hits for heavy-neutralizer numbers
+while still cycling at 12 s.  A name lookup is simply right where an
+amount-derived guess doubles the window.
 
 :data:`MODULE_CYCLE_MS` is baked in as a literal by
 ``tools/build_ewar_cycles.py`` from the repository's ``fit_dogma.json.gz``
-(attribute 73, duration).  It is NOT read from that blob at runtime: the blob
-is megabytes unpacked and this module sits on the preview tick.  Importing
-this module opens no file, starts no thread and touches no Tk.
+(attribute 73, duration, and attribute 2822, ecmJamDuration).  An ECM drone's
+entry is therefore its 5 s jam, not its 20 s cycle: the jam is what an icon
+shows.  It is NOT read from that blob at runtime: the blob is megabytes
+unpacked and this module sits on the preview tick.  Importing this module
+opens no file, starts no thread and touches no Tk.
 
 :func:`cycle_ms_for` is reached from that tick, where an escaping exception
 retires a tile.  It therefore NEVER raises and NEVER returns a non-positive
@@ -27,9 +31,9 @@ import math
 import re
 
 # --- BEGIN GENERATED TABLE: tools/build_ewar_cycles.py ---
-# Generated 2026-10-30 by tools/build_ewar_cycles.py from
-# fit_dogma.json.gz (SDE build 3494416, attribute 73) + fit_types.json.
-# 162 modules kept; 13 in-scope types carry no duration and rely on
+# Generated 2026-10-31 by tools/build_ewar_cycles.py from
+# fit_dogma.json.gz (SDE build 3494416, attributes 73 and 2822) + fit_types.json.
+# 168 modules kept; 13 in-scope types carry no duration and rely on
 # the size-word fallback below:
 #   Capital Abyssal Energy Neutralizer  (no attribute 73)
 #   Capital Abyssal Energy Nosferatu  (no attribute 73)
@@ -128,6 +132,8 @@ MODULE_CYCLE_MS: dict[str, int] = {
     'Heavy Gremlin Compact Energy Neutralizer': 24000,
     'Heavy Infectious Scoped Energy Neutralizer': 24000,
     'Heavy Knave Scoped Energy Nosferatu': 10000,
+    'Hornet EC-300': 5000,
+    'Humboldt EC-900-I': 5000,
     'Hypnos Scoped Magnetometric ECM': 20000,
     'Imperial Navy Heavy Energy Neutralizer': 24000,
     'Imperial Navy Heavy Energy Nosferatu': 10000,
@@ -137,6 +143,7 @@ MODULE_CYCLE_MS: dict[str, int] = {
     'Imperial Navy Small Energy Nosferatu': 2500,
     'Induced Compact Multispectral ECM': 20000,
     'Initiated Enduring Multispectral ECM': 20000,
+    'Inshore EC-300-I': 5000,
     "Kaikka's Modified Multispectral ECM": 20000,
     'Ladar ECM I': 20000,
     'Ladar ECM II': 20000,
@@ -164,6 +171,7 @@ MODULE_CYCLE_MS: dict[str, int] = {
     'Morpheus Enduring Magnetometric ECM': 20000,
     'Multispectral ECM I': 20000,
     'Multispectral ECM II': 20000,
+    'Nertic EC-600-I': 5000,
     "Panola's Modified Gravimetric ECM": 20000,
     "Panola's Modified Ladar ECM": 20000,
     "Panola's Modified Magnetometric ECM": 20000,
@@ -206,8 +214,10 @@ MODULE_CYCLE_MS: dict[str, int] = {
     "Unit P-343554's Modified Burst Jammer": 30000,
     "Unit W-634's Modified Burst Jammer": 30000,
     "Vepas' Modified Multispectral ECM": 20000,
+    'Vespa EC-600': 5000,
     "Vizan's Modified Heavy Energy Neutralizer": 24000,
     "Vizan's Modified Heavy Energy Nosferatu": 10000,
+    'Wasp EC-900': 5000,
 }
 # --- END GENERATED TABLE ---
 
@@ -255,6 +265,14 @@ _FAMILY_CYCLE_MS = {"burst jammer": 30000, "ecm": 20000}
 #: (The projector that DOES publish a duration, Energy Neutralization Burst
 #: Projector at 480 s, is in the table and never reaches this step.)
 _BURST_PROJECTOR = "burst projector"
+
+#: The designation every ECM drone carries ("Hornet EC-300", "Humboldt
+#: EC-900-I"), matched against the lower-cased name, and the 5000 ms all six in
+#: the data jam for.  A test pins that against the generated table.  Without
+#: it a drone CCP adds between releases holds its icon for the 15 s default,
+#: three times the jam.
+_EC_DRONE_RE = re.compile(r"\bec-\d+")
+_EC_DRONE_JAM_MS = 5000
 
 #: Amount buckets, DELIBERATELY BIASED DOWNWARD (design A1c).  Each threshold
 #: is the top of a size's unbonused GJ band as measured from the dogma blob
@@ -349,16 +367,24 @@ def _from_size_word(name: str):
 def _from_family_word(name: str):
     """Step 2b: a jam family whose cycle is uniform across every known type.
 
-    Only the two jam families qualify.  The capacitor-warfare families spread
-    their cycles across four sizes, so for them the size word above is the
-    only name-borne fact, and a bare "Neutralizer" says nothing on its own.
+    Only the jam families qualify.  The capacitor-warfare families spread their
+    cycles across four sizes, so for them the size word above is the only
+    name-borne fact, and a bare "Neutralizer" says nothing on its own.
+
+    The ECM drone designation is asked LAST and only of a name no other family
+    claims, so it adds an answer and changes none: a burst jammer, an ECM
+    module, a structure projector or a capacitor-warfare name that happens to
+    carry "EC-300" resolves exactly as it would without it.
     """
     if _BURST_PROJECTOR in name:
         return None
     found = _FAMILY_RE.findall(name)
-    if not found:
-        return None
-    return _FAMILY_CYCLE_MS.get(min(found, key=_FAMILY_ORDER.index))
+    if found:
+        return _FAMILY_CYCLE_MS.get(min(found, key=_FAMILY_ORDER.index))
+    if (_family_table(name, True, True) is None
+            and _EC_DRONE_RE.search(name)):
+        return _EC_DRONE_JAM_MS
+    return None
 
 
 def _from_amount(name: str, value):
@@ -389,7 +415,8 @@ def cycle_ms_for(module_name, amount=None) -> int:
 
     1. an exact :data:`MODULE_CYCLE_MS` hit;
     2. a size word in the name together with a capacitor-warfare family word;
-    2b. a jam family word whose cycle is uniform in the data;
+    2b. a jam family word whose cycle is uniform in the data, or an ECM
+        drone's ``EC-nnn`` designation;
     3. the amount, bucketed downward;
     4. :data:`_DEFAULT_CYCLE_MS`.
 

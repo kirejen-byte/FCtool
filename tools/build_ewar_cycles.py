@@ -13,18 +13,25 @@ Inputs, both tracked in the repository root:
   ``fit_dogma.json.gz``  gzipped JSON; ``types`` maps a type-id string to a
                          dict whose ``a`` key is a FLAT list
                          ``[attr_id, value, attr_id, value, ...]``.
-                         **Attribute 73 is the module's duration in ms.**
+                         **Attribute 73 is the module's duration in ms;
+                         attribute 2822, ``ecmJamDuration``, a jam's in ms.**
   ``fit_types.json``     maps a type-id string to a dict whose ``n`` key is
                          the type name -- the name the gamelog writes after
                          the final " - " of a combat line.
 
-FILTER: every type whose name contains one of :data:`NAME_NEEDLES`, that has
+FILTER: every type carrying attribute 2822, whatever its name, at that value;
+and every other type whose name contains one of :data:`NAME_NEEDLES`, that has
 an attribute-73 value.  Types without one are skipped and reported: ECM
 scripts and the ECM Jammer Burst Projector carry no duration, and the eight
 Abyssal neut/nos types carry no stats at all because theirs are rolled per
 item.  Those eight are exactly why ``ewar_cycles`` keeps a size-word fallback.
 
-Measured on SDE build 3494416 (2026-10-30): 162 entries kept, 13 skipped.
+Attribute 2822 is the six ECM drones, which carry no attribute 73 at all.  They
+fire every 20 s and jam for 5 s, and what an icon has to show is the jam, so
+that is the number baked.  It would win over an attribute 73 for the same
+reason, though no type carries both today.
+
+Measured on SDE build 3494416 (2026-10-31): 168 entries kept, 13 skipped.
 
 OUTPUT: the tool rewrites only the region of ``ewar_cycles.py`` between
 :data:`BEGIN_MARKER` and :data:`END_MARKER`, so the hand-written resolver
@@ -54,6 +61,9 @@ OUT_PATH = os.path.join(ROOT, "ewar_cycles.py")
 #: Attribute id of ``duration`` -- a module's cycle time, in milliseconds.
 DURATION_ATTR = 73
 
+#: Attribute id of ``ecmJamDuration`` -- how long a jam lasts, in milliseconds.
+JAM_DURATION_ATTR = 2822
+
 #: A type is in scope when its name contains one of these.  Mirrors the five
 #: detectable effects of the design's section 5.1: ECM and Burst Jammer cover
 #: the jam icon, the two energy families cover neut and nos, and the burst
@@ -73,6 +83,8 @@ DURATION_ATTR = 73
 #: "ECM" and is skipped for having no attribute 73, which is correct -- it is
 #: a different module from a ship burst jammer and the SDE gives it no
 #: duration to bake.
+#:
+#: ECM drones need no needle: they are found by attribute 2822, see collect().
 NAME_NEEDLES = ("ECM", "Burst Jammer", "Energy Neutralizer", "Energy Nosferatu",
                 "Neutralization Burst")
 
@@ -92,13 +104,13 @@ def load_inputs(dogma_path: str = DOGMA_PATH, types_path: str = TYPES_PATH):
     return dogma, types
 
 
-def duration_ms(type_entry) -> int | None:
-    """Pull attribute 73 out of a dogma type entry's FLAT ``a`` list."""
+def _attr_ms(type_entry, attr_id: int) -> int | None:
+    """Pull one attribute out of a dogma type entry's FLAT ``a`` list."""
     if not isinstance(type_entry, dict):
         return None
     flat = type_entry.get("a") or []
     for i in range(0, len(flat) - 1, 2):
-        if flat[i] == DURATION_ATTR:
+        if flat[i] == attr_id:
             value = flat[i + 1]
             try:
                 ms = int(round(float(value)))
@@ -108,21 +120,34 @@ def duration_ms(type_entry) -> int | None:
     return None
 
 
+def duration_ms(type_entry) -> int | None:
+    """A dogma type entry's attribute 73, the module's cycle time."""
+    return _attr_ms(type_entry, DURATION_ATTR)
+
+
+def jam_duration_ms(type_entry) -> int | None:
+    """A dogma type entry's attribute 2822, how long its jam lasts."""
+    return _attr_ms(type_entry, JAM_DURATION_ATTR)
+
+
 def collect(dogma, types):
     """Return ``(table, skipped)``.
 
-    ``table`` maps module name -> cycle ms, sorted by name; ``skipped`` lists
-    ``(name, reason)`` for in-scope types that carry no usable duration.
+    ``table`` maps module name -> cycle ms, or jam ms for a type that publishes
+    one, sorted by name; ``skipped`` lists ``(name, reason)`` for in-scope types
+    that carry no usable duration.
     """
     dogma_types = dogma.get("types") or {}
     table: dict[str, int] = {}
     skipped: list[tuple[str, str]] = []
     for type_id, info in types.items():
         name = (info or {}).get("n") or ""
-        if not any(needle in name for needle in NAME_NEEDLES):
-            continue
         entry = dogma_types.get(type_id)
-        ms = duration_ms(entry)
+        ms = jam_duration_ms(entry)
+        if ms is None:
+            if not any(needle in name for needle in NAME_NEEDLES):
+                continue
+            ms = duration_ms(entry)
         if ms is None:
             skipped.append((name, "no dogma entry" if entry is None else "no attribute 73"))
             continue
@@ -141,7 +166,7 @@ def render_block(table, skipped, sde_build) -> str:
     today = datetime.date.today().isoformat()
     lines = [BEGIN_MARKER]
     lines.append("# Generated %s by tools/build_ewar_cycles.py from" % today)
-    lines.append("# fit_dogma.json.gz (SDE build %s, attribute 73) + fit_types.json." % sde_build)
+    lines.append("# fit_dogma.json.gz (SDE build %s, attributes 73 and 2822) + fit_types.json." % sde_build)
     lines.append("# %d modules kept; %d in-scope types carry no duration and rely on" % (len(table), len(skipped)))
     lines.append("# the size-word fallback below:")
     for name, reason in skipped:

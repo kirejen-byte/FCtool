@@ -15,16 +15,15 @@ covers the BOTTOM of the same body, so the two do not overlap, and THAT is what
 lets BOTH ride their owner's z-order with no ordering call ever made between
 them (spec 10.2).
 
-THE NON-OVERLAP IS CONDITIONAL ON A SINGLE-ROW BAND, and that condition is not
-enforced anywhere - it is a property of what FCTool ships. Since v6.9.7 the
-location strip is fed "" and the band is therefore ONE row, which clears the
-icon row at every size and body height. A TWO-row band brings them back into
-contact: at Tk scaling 1.5 or more with 27 px icons, tile bodies of roughly 68
-to 79 px overlap by 2 to 6 px (the band grows upward from the bottom until the
-60 % body cap stops it, while the icon row is a fixed 34 px from the top).
-Whoever re-enables the location strip owns that: either keep the icon row and
-the band out of each other's way by height, or accept the overlap deliberately
-- do NOT reach for a re-stack, which would break invariant 1.
+THE NON-OVERLAP IS ENFORCED BY THE TILE, not here: TileWindow._ewar_icon_px
+clamps the icon size to the headroom above the 60 % of the body the bottom text
+may claim, stepping down through ICON_SIZES and answering 0, no row at all, when
+not even the smallest fits. That holds for a band of any row count. It costs a
+short tile at Tk scaling 1.5 or more its largest icons: with 27 px icons and a
+two-row band, bodies of roughly 68 to 79 px overlapped by 2 to 6 px before the
+clamp. sync() itself draws the size it is handed and checks nothing, so a caller
+that goes round the clamp loses the guarantee. Fix an overlap there - do NOT
+reach for a re-stack, which would break invariant 1.
 
 THE THREE INVARIANTS (a change that breaks any of them is a regression):
   1. the popup is never re-stacked by our code - the one window-position call
@@ -359,8 +358,10 @@ class EwarWindow:
         nothing changed                      -> nothing
 
     The mirror key holds the icon tuple, the icon size AND the row rectangle,
-    so a tile moving to a 150 % monitor - same icons, bigger icon_px - repaints
-    instead of keeping stale pixels.
+    so the same icons at a new icon_px repaint instead of keeping stale pixels.
+    That is a resize: the tile picks the size from its width and body height.
+    A monitor change is not, because nothing sets Tk scaling at runtime and a
+    tile caches it for life, so a tile dragged to a 150 % monitor keeps its size.
 
     Mirrors latch only AFTER the backend call succeeded (the tile setters'
     rule), so a failed call is simply retried by the next sync. Nothing here

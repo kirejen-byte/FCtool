@@ -27200,7 +27200,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                    "those effects; the icons need the Windows preview backend, "
                    "so on Linux you get the border only. NPC neuts and jams "
                    "are ignored (ratting would light every tile); NPC tackle "
-                   "still shows.")
+                   "still shows. Tackle is logged once, so a scramble or "
+                   "disruption icon clears after 30 s even if the point is "
+                   "still on.")
 
         # ── Alerts ▸ row 4 (native): Gamelogs source ─────────────────────────
         # Damage flash AND decloak both read EVE's combat Gamelogs, so a

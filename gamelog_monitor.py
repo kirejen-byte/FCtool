@@ -589,16 +589,22 @@ class GamelogMonitor:
         # to EOF at the last look. A line is news only if its file was ALREADY
         # here before the read that delivered it; a read from any other path
         # is history, so the EWAR sink stays shut for it and the path joins
-        # once that read has consumed the file. Membership is earned at exactly
-        # two places (seed_file at a real EOF, poll_file after a read) and lost
-        # when the tailer loses its place or stops reading: a rotation, an
-        # untracked file, a re-pointed folder. So it FAILS CLOSED: any route
-        # nobody thought of reads as history. The cost is that a first read can
-        # swallow up to one poll of fresh lines, which is the right way round
-        # for a tile that must never show a fight that is over.
+        # once that read has consumed the file. Membership is earned at three
+        # places, each through _mark_caught_up: seed_file at a real EOF, and
+        # poll_file after a read and when it finds nothing to read. It is lost
+        # when the tailer loses its place or stops looking: a rotation, an
+        # untracked file, a re-pointed folder, or a gap between looks past
+        # _CAUGHT_UP_MAX_GAP_SECONDS, whatever caused it. So it FAILS CLOSED:
+        # any route nobody thought of reads as history. The cost is that a
+        # first read can swallow up to one poll of fresh lines, which is the
+        # right way round for a tile that must never show a fight that is over.
         # Poll-thread state, except that set_logs_dir clears it from the Tk
-        # thread with its neighbours above.
+        # thread, before its neighbours above (see there).
         self._caught_up: set[str] = set()
+        # path -> time.monotonic() of the last look that left it caught up. Set
+        # only by _mark_caught_up, so a failed stat or open is not a look. An
+        # entry a removal leaves behind is harmless: joining stamps it anew.
+        self._last_look: dict[str, float] = {}
         # New-file discovery gate (see discover_files) — mirrors chat_monitor's
         # `_last_dir_mtime` gate verbatim: re-globbing the Gamelogs directory is
         # O(files-in-dir) and, like Chatlogs, it accumulates files indefinitely
@@ -655,11 +661,16 @@ class GamelogMonitor:
         if new == self._logs_dir:
             return
         self._logs_dir = new
+        # The cut-off FIRST: the poll thread keeps running through this method,
+        # and a read landing just after _positions.clear() starts from byte 0.
+        # Were its path still in the set, the whole file would arrive as news
+        # (forced: 400 of 400 old lines).
+        self._caught_up.clear()
+        self._last_look.clear()
         self._positions.clear()
         self._fingerprints.clear()
         self._buffers.clear()
         self._listeners.clear()
-        self._caught_up.clear()
         # _known_players is deliberately NOT cleared: player names are not
         # path-scoped, and it is poll-thread-owned (this runs on the Tk thread).
         self._last_dir_mtime = None
@@ -755,6 +766,12 @@ class GamelogMonitor:
         except OSError:
             return False
 
+    def _mark_caught_up(self, path) -> None:
+        """This file has been read to EOF, as of now: the ONE way into the set,
+        so a member always has a last look to expire from (see poll_file)."""
+        self._last_look[path] = time.monotonic()
+        self._caught_up.add(path)
+
     def _is_tracked(self, listener: str) -> bool:
         if self._tracked is None:
             return True
@@ -770,6 +787,14 @@ class GamelogMonitor:
     # _DIR_RESCAN_INTERVAL_SECONDS. 60s bounds worst-case new-file discovery
     # latency while cutting the per-second glob by ~60x on a long session.
     _DIR_RESCAN_INTERVAL_SECONDS = 60.0
+
+    # How long caught-up stays true without a look at the file (spec 10.3).
+    # Staleness equals the gap between looks (3 s of failed reads delivered
+    # lines aged up to 3.2 s, a 5 s stall up to 5.0 s), so past this a read is
+    # history whatever caused the gap. Kept above an antivirus read blip (the
+    # transient failed open _read_listener's retry exists for), which must not
+    # swallow a one-shot scramble.
+    _CAUGHT_UP_MAX_GAP_SECONDS = 5.0
 
     # Live tail window (PERF PV2). A file whose last write is older than this
     # cannot be one a client still holds open — EVE opens a NEW Gamelog per
@@ -951,7 +976,7 @@ class GamelogMonitor:
         # The discard matters when the path is already in the set: the poll
         # thread can add it back just after set_logs_dir cleared the set.
         if eager and self._at_eof(path, resume):
-            self._caught_up.add(path)
+            self._mark_caught_up(path)
         else:
             self._caught_up.discard(path)
 
@@ -1031,6 +1056,13 @@ class GamelogMonitor:
         the deferred→resolved promotion always happens on discover_files' gated
         scan instead. Keep the call — it makes poll_file correct standalone.
         """
+        # Caught-up is only true as of the last look (spec 10.3). No look on
+        # record expires as well, so that fails closed too.
+        if path in self._caught_up:
+            looked = self._last_look.get(path)
+            if (looked is None or time.monotonic() - looked
+                    > self._CAUGHT_UP_MAX_GAP_SECONDS):
+                self._caught_up.discard(path)
         read_start = self._positions.get(path, 0)
         fingerprint = self._fingerprints.get(path, b"")
         try:
@@ -1042,6 +1074,7 @@ class GamelogMonitor:
         # the `& ~1` alignment): a shrunk file OR a changed tail fingerprint means
         # the file was replaced/rewritten — reseed from 0.
         rotated = False
+        check_failed = False
         if size < read_start:
             rotated = True
         if not rotated and fingerprint and read_start >= len(fingerprint) \
@@ -1052,6 +1085,7 @@ class GamelogMonitor:
                     tail_sample = f.read(len(fingerprint))
             except OSError:
                 tail_sample = b""
+                check_failed = True
             if tail_sample and tail_sample != fingerprint:
                 rotated = True
         if rotated:
@@ -1066,7 +1100,8 @@ class GamelogMonitor:
 
         if size <= read_start:
             self._positions[path] = read_start
-            self._caught_up.add(path)                # nothing left unread
+            if not check_failed:                     # a failed open is no look
+                self._mark_caught_up(path)           # nothing left unread
             return
 
         try:
@@ -1147,7 +1182,7 @@ class GamelogMonitor:
 
         new_pos = read_start + len(raw)              # raw byte length; no *2
         self._positions[path] = new_pos
-        self._caught_up.add(path)                    # the file is consumed
+        self._mark_caught_up(path)                   # the file is consumed
         # Record a tail fingerprint of what we just consumed (up to 64 bytes) so
         # a truncate-then-rewrite with unchanged size is still caught next poll.
         fp_len = min(64, len(raw))
