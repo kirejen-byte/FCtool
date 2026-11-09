@@ -15,6 +15,14 @@ Reuses the verified repo infrastructure (design §4.1, §8):
 * ``X-Pages`` auto-pagination (like ``ESIAuth.get_assets``).
 * ``If-None-Match`` / 304 ETag replay for the region-orders and contracts-list
   pulls (a 304 costs a token but no error budget and returns the cached body).
+  ESI ETags are PER PAGE (measured: page 1 can stay 304 while page 2 changes),
+  so every page is cached and revalidated with its OWN ETag - a page-1 304
+  never vouches for the rest of the book.
+* Order-pull honesty: the order pulls (``structure_orders`` / ``region_orders``)
+  retry a failed page ONCE (transport error / 5xx / bad body - never a 4xx,
+  which would spend error budget) and, if the walk still ends short, record
+  ``"orders_incomplete"`` in ``last_incomplete`` so the scanner marks the
+  snapshot degraded instead of passing a partial book off as complete.
 * ``X-ESI-Error-Limit-Remain`` / ``Retry-After`` capture (the ``_CAPTURED_HEADERS``
   set mirrored from ``fleet_esi``) so the worker can back off before tripping the
   error budget. ``error_limited`` exposes whether the last response left the
@@ -78,9 +86,9 @@ class AuthMarketAdapter:
     for unauthenticated GETs (defaults to the auth's session).
 
     All list pulls auto-paginate on ``X-Pages``. Region-orders and
-    contracts-list responses are ETag-cached in memory (per-path). Contract-item
-    ETags are handled by the scanner's persistent cache; this adapter simply
-    fetches when asked.
+    contracts-list responses are ETag-cached in memory, per cache key AND per
+    page (each page keeps its own ETag + body). Contract-item ETags are handled
+    by the scanner's persistent cache; this adapter simply fetches when asked.
     """
 
     # Advertises that the list methods accept an optional ``progress`` callback
@@ -96,7 +104,9 @@ class AuthMarketAdapter:
         # unauthenticated endpoints; fall back to the auth's session if none.
         self._public = public_session or getattr(auth, "_session", None)
         self.last_headers: dict = {}
-        self._etags: dict[str, tuple] = {}  # path -> (etag, list-of-pages-body)
+        # cache key -> {"pages": {page_no: (etag, page_body)}, "total": n}.
+        # Only pages that landed with an ETag are stored; a failed page never is.
+        self._etags: dict[str, dict] = {}
         # Scope/access degradation record. A 403 on an AUTHED route adds a tag
         # here (e.g. "structure_market" / "corp_contracts") IN ADDITION to the
         # degrade-by-design empty return, so the scanner can mark the resulting
@@ -104,6 +114,14 @@ class AuthMarketAdapter:
         # genuinely bare market. The scanner clears this at the start of every
         # ``scan_market`` pass (duck-typed) so it only reflects the current scan.
         self.last_forbidden: set[str] = set()
+        # Incomplete-pull record. An ORDER pull (``structure_orders`` /
+        # ``region_orders``) whose page walk ended short - a page still failing
+        # after its one retry, the error-limit floor, a 404/410/420 mid-walk -
+        # adds ``"orders_incomplete"`` here, so the scanner can mark the snapshot
+        # degraded (a partial book != the whole market) instead of items on the
+        # lost pages reading as absent. Cleared by the scanner at the start of
+        # every ``scan_market`` pass (duck-typed), like ``last_forbidden``.
+        self.last_incomplete: set[str] = set()
         # Contract-items disposition (for the scanner's negative cache) is NOT
         # stashed on the adapter: ``contract_items`` / ``corp_contract_items``
         # RETURN it as ``(items, status)``. Returning it per call — rather than
@@ -169,9 +187,74 @@ class AuthMarketAdapter:
         self._capture(resp)
         return resp
 
+    # Per-page failure kinds that earn ONE immediate retry on a tagged (order)
+    # pull. Everything else is never retried: a 420/429/other 4xx retry spends
+    # ESI error budget, and a 403/404/410 will not change on a second ask.
+    _RETRYABLE_KINDS = frozenset({"transport", "server", "bad_body"})
+
+    def _page_attempt(self, url, *, authed: bool, params, headers=None,
+                      conditional: bool = False):
+        """One rate-limited page GET, classified. Returns ``(kind, resp, body)``:
+
+        "ok" (``body`` is the page's list), "not_modified" (a 304 - only when
+        ``conditional``, i.e. an If-None-Match was possible), "transport" (no
+        response), "forbidden" (403), "dead" (404/410), "server" (5xx),
+        "client" (420 / 429 / any other non-OK), "bad_body" (unparseable JSON or
+        a non-list body). The check order mirrors the historical inline code, so
+        an untagged caller classifies every response exactly as before."""
+        resp = self._get_page(url, authed=authed, params=params, headers=headers)
+        if resp is None:
+            return "transport", None, None
+        code = resp.status_code
+        if code == 403:
+            return "forbidden", resp, None
+        if conditional and code == 304:
+            return "not_modified", resp, None
+        if code in (404, 410):
+            return "dead", resp, None
+        if not getattr(resp, "ok", False):
+            kind = "server" if isinstance(code, int) and code >= 500 else "client"
+            return kind, resp, None
+        try:
+            body = resp.json()
+        except ValueError:
+            return "bad_body", resp, None
+        if not isinstance(body, list):
+            return "bad_body", resp, None
+        return "ok", resp, body
+
+    def _fetch_page(self, url, *, authed: bool, params, headers=None,
+                    conditional: bool = False, retry: bool = False):
+        """``_page_attempt`` plus, when ``retry``, ONE immediate retry (through
+        the same rate-limited GET) for a ``_RETRYABLE_KINDS`` failure."""
+        kind, resp, body = self._page_attempt(
+            url, authed=authed, params=params, headers=headers,
+            conditional=conditional)
+        if retry and kind in self._RETRYABLE_KINDS:
+            log.info("[market-esi] page %s of %s failed (%s), retrying once",
+                     (params or {}).get("page"), url, kind)
+            kind, resp, body = self._page_attempt(
+                url, authed=authed, params=params, headers=headers,
+                conditional=conditional)
+        return kind, resp, body
+
+    def _mark_incomplete(self, tag: str, path: str, page: int, why: str) -> None:
+        """Record an order pull that ended short (see ``last_incomplete``)."""
+        log.warning("[market-esi] %s ended short at page %d (%s); marked %s",
+                    path, page, why, tag)
+        self.last_incomplete.add(tag)
+
+    @staticmethod
+    def _x_pages(resp, fallback: int) -> int:
+        """The response's ``X-Pages`` total, or ``fallback`` when absent/garbage."""
+        try:
+            return int((getattr(resp, "headers", {}) or {}).get("x-pages", fallback))
+        except (TypeError, ValueError):
+            return fallback
+
     def _paginate(
         self, path, *, authed: bool, params=None, forbidden_tag: str | None = None,
-        progress=None, stage: str = "page",
+        progress=None, stage: str = "page", incomplete_tag: str | None = None,
     ) -> list[dict]:
         """Auto-paginate a list endpoint on ``X-Pages``, returning the concatenated
         items. Thin wrapper over ``_paginate_status`` for the callers that don't
@@ -182,13 +265,13 @@ class AuthMarketAdapter:
         disposition off a shared attribute."""
         items, _status = self._paginate_status(
             path, authed=authed, params=params, forbidden_tag=forbidden_tag,
-            progress=progress, stage=stage,
+            progress=progress, stage=stage, incomplete_tag=incomplete_tag,
         )
         return items
 
     def _paginate_status(
         self, path, *, authed: bool, params=None, forbidden_tag: str | None = None,
-        progress=None, stage: str = "page",
+        progress=None, stage: str = "page", incomplete_tag: str | None = None,
     ) -> "tuple[list[dict], str]":
         """Pagination core. Returns ``(items, status)`` where ``status`` classifies
         the pull for the contract-items negative cache: "ok" (a response, even an
@@ -205,6 +288,14 @@ class AuthMarketAdapter:
         so the caller can distinguish "forbidden" (scope/access) from "genuinely
         empty" — the 403 is still degraded to ``[]`` (no raise).
 
+        ``incomplete_tag`` (ORDER pulls only) turns on order-pull honesty: a page
+        failing with a transport error / 5xx / bad body is retried ONCE, and a
+        walk that still stops before the last page for any reason but a 403
+        (failed page, error-limit floor, 404/410/420 mid-walk) records the tag in
+        ``last_incomplete`` - it returns the pages it got. Without a tag (the
+        parallel contract-items path) there is no retry and no shared-state write:
+        behaviour is exactly the historical one.
+
         ``progress`` (optional) is fed ``{"stage": stage, "page": i, "pages": n}``
         after each successful page so the GUI can show a real per-page bar during
         a many-page pull (e.g. a large structure order book)."""
@@ -215,111 +306,134 @@ class AuthMarketAdapter:
         # optimistic "ok", downgraded on the terminal error branch reached below.
         # A LOCAL variable (not a shared attribute) — see the class docstring.
         status = "ok"
+        short = None  # why the walk stopped before the last page (None = it didn't)
         while True:
             page_params = dict(params or {})
             page_params["page"] = page
-            resp = self._get_page(url, authed=authed, params=page_params)
-            if resp is None:
-                # Transport error (timeout / connection reset) — retry next scan.
-                status = "transient"
-                break
-            if resp.status_code == 403:
+            kind, resp, items = self._fetch_page(
+                url, authed=authed, params=page_params, retry=bool(incomplete_tag))
+            if kind == "forbidden":
                 log.info("[market-esi] 403 (scope/access) for %s", path)
                 if forbidden_tag:
                     self.last_forbidden.add(forbidden_tag)
                 return out, "forbidden"
-            if resp.status_code in (404, 410):
-                # Gone: a deleted/expired contract (or missing resource). Permanent
-                # — the contract-items caller tombstones it so it never re-fetches.
-                status = "dead"
+            if kind != "ok":
+                if kind == "dead":
+                    # Gone: a deleted/expired contract (or missing resource).
+                    # Permanent - the contract-items caller tombstones it.
+                    status = "dead"
+                elif kind != "bad_body":
+                    # Transport error / 5xx / 420 error-limit / other non-OK -
+                    # transient, retry next scan. (A bad body keeps "ok".)
+                    status = "transient"
+                short = kind
                 break
-            if not getattr(resp, "ok", False):
-                # 5xx / 420 error-limit / other non-OK — transient, retry next scan.
-                status = "transient"
-                break
-            try:
-                items = resp.json()
-            except ValueError:
-                break
-            if isinstance(items, list):
-                out.extend(items)
-            else:
-                break
-            try:
-                total = int(resp.headers.get("x-pages", 1))
-            except (TypeError, ValueError):
-                total = 1
+            out.extend(items)
+            total = self._x_pages(resp, 1)
             _emit_progress(progress, {"stage": stage, "page": page, "pages": total})
             if page >= total:
                 break
             if self.error_limited:
                 log.warning("[market-esi] error-limit floor hit paginating %s", path)
+                short = "error_limit"
+                page += 1
                 break
             page += 1
+        if short and incomplete_tag:
+            self._mark_incomplete(incomplete_tag, path, page, short)
         return out, status
 
     def _paginate_etag(
         self, path, *, authed: bool, params=None, progress=None, stage: str = "page",
-        cache_key: str | None = None,
+        cache_key: str | None = None, incomplete_tag: str | None = None,
     ) -> list[dict]:
-        """Like ``_paginate`` but sends ``If-None-Match`` from the in-memory ETag
-        cache and replays the cached body on a 304 (first page's ETag gates the
-        whole result). Used for the region-orders and contracts-list pulls where
-        a 304 is common and cheap.
+        """Like ``_paginate`` but conditional PER PAGE: every page is requested
+        with ``If-None-Match`` set to THAT page's cached ETag (when one is
+        cached); a 304 replays that page's cached body, a 200 replaces it. ESI
+        ETags are per page - measured: across a cache refresh page 1 stayed 304
+        while page 2 changed - so a page-1 304 never vouches for later pages.
+        Used for the region-orders and contracts-list pulls where a 304 is common
+        and cheap.
 
-        ``cache_key`` (optional) is the key under which the ETag + body are
-        stored; it defaults to ``path``. A per-``type_id`` region-orders query
-        passes a key that folds in the type so the many targeted queries against
-        ONE region each get their OWN ETag (one per ``(region, type)``) instead of
-        clobbering a single region-wide entry.
+        The page total comes from page 1's ``X-Pages`` (a 304 carries it too),
+        falling back to the cached total, then 1. After the pull, cached pages
+        above the new total are dropped. Only a page that LANDED with an ETag is
+        cached - a failed page never is, so a partial pull is refetched next
+        time instead of being replayed.
+
+        A 403 on page 1 -> ``[]``. A failed or unfetched page falls back to its
+        previously cached body when one exists (stale beats missing).
+        ``incomplete_tag`` (ORDER pulls only) adds the one-retry rule and the
+        ``last_incomplete`` record exactly as in ``_paginate_status``; without it
+        there is no retry and nothing is recorded.
+
+        ``cache_key`` (optional) is the key under which the per-page ETags +
+        bodies are stored; it defaults to ``path``. A per-``type_id``
+        region-orders query passes a key that folds in the type so the many
+        targeted queries against ONE region each get their OWN entry (one per
+        ``(region, type)``) instead of clobbering a single region-wide entry.
 
         ``progress`` (optional) is fed ``{"stage": stage, "page": i, "pages": n}``
-        per page; a 304 (whole list served from the ETag cache) reports one page
-        of one so the GUI still sees the stage tick over."""
+        once per page obtained (fetched or replayed from a 304), so a fully
+        cached one-page pull still ticks page 1 of 1."""
         url = f"{ESI_BASE}{path}"
         key = cache_key or path
-        cached = self._etags.get(key)
-        headers = {"If-None-Match": cached[0]} if cached else None
-        # Probe page 1 with the conditional header.
-        first = self._get_page(
-            url, authed=authed, params={**(params or {}), "page": 1}, headers=headers
-        )
-        if first is None:
-            return cached[1] if cached else []
-        if first.status_code == 304 and cached is not None:
-            _emit_progress(progress, {"stage": stage, "page": 1, "pages": 1})
-            return cached[1]
-        if first.status_code == 403:
-            return []
-        if not getattr(first, "ok", False):
-            return cached[1] if cached else []
-        try:
-            body = first.json()
-        except ValueError:
-            return cached[1] if cached else []
-        out: list[dict] = list(body) if isinstance(body, list) else []
-        etag = (getattr(first, "headers", {}) or {}).get("ETag")
-        try:
-            total = int(first.headers.get("x-pages", 1))
-        except (TypeError, ValueError):
-            total = 1
-        _emit_progress(progress, {"stage": stage, "page": 1, "pages": total})
-        # Remaining pages fetched unconditionally (ETag is for the first page).
-        for page in range(2, total + 1):
-            if self.error_limited:
+        entry = self._etags.get(key) or {}
+        cached_pages: dict = dict(entry.get("pages") or {})
+        cached_total = entry.get("total")
+        pages = dict(cached_pages)  # the per-page cache this pull leaves behind
+        out: list[dict] = []
+        total = None  # known once page 1 lands
+        page = 1
+        short = None  # why the walk stopped before the last page (None = it didn't)
+        while True:
+            if page > 1 and self.error_limited:
+                log.warning("[market-esi] error-limit floor hit paginating %s", path)
+                short = "error_limit"
                 break
-            resp = self._get_page(url, authed=authed, params={**(params or {}), "page": page})
-            if resp is None or not getattr(resp, "ok", False):
+            prev = cached_pages.get(page)
+            headers = {"If-None-Match": prev[0]} if prev else None
+            kind, resp, body = self._fetch_page(
+                url, authed=authed, params={**(params or {}), "page": page},
+                headers=headers, conditional=True, retry=bool(incomplete_tag),
+            )
+            if kind == "not_modified" and prev is None:
+                kind = "client"  # a 304 for a page we never cached: nothing to replay
+            if kind == "forbidden" and page == 1:
+                return []
+            if kind not in ("ok", "not_modified"):
+                short = kind
                 break
-            try:
-                more = resp.json()
-            except ValueError:
-                break
-            if isinstance(more, list):
-                out.extend(more)
+            if page == 1:
+                total = self._x_pages(resp, cached_total or 1)
+            if kind == "not_modified":
+                body = prev[1]
+            else:
+                etag = (getattr(resp, "headers", {}) or {}).get("ETag")
+                if etag:
+                    pages[page] = (etag, body)
+                else:
+                    pages.pop(page, None)  # no validator: never replay an old body
+            out.extend(body)
             _emit_progress(progress, {"stage": stage, "page": page, "pages": total})
-        if etag:
-            self._etags[key] = (etag, out)
+            if page >= total:
+                break
+            page += 1
+        if total is None:  # page 1 never landed: the cached shape is all we know
+            total = cached_total or 0
+        if short:
+            # Stale beats missing: pad every page this walk did not obtain with its
+            # last good cached body. The tag (below) marks the result either way.
+            for p in range(page, total + 1):
+                if p in cached_pages:
+                    out.extend(cached_pages[p][1])
+            if incomplete_tag and short != "forbidden":
+                self._mark_incomplete(incomplete_tag, path, page, short)
+        pages = {p: v for p, v in pages.items() if p <= total}
+        if pages:
+            self._etags[key] = {"pages": pages, "total": total}
+        else:
+            self._etags.pop(key, None)
         return out
 
     # ── MarketEsiAdapter protocol ─────────────────────────────────────────────
@@ -334,8 +448,9 @@ class AuthMarketAdapter:
 
         The ETag cache key folds in ``order_type`` and (when set) ``type_id`` so a
         targeted scan's many per-type queries against one region each keep their
-        OWN conditional-request ETag — one per ``(region, type)`` — rather than
-        clobbering a single region-wide entry."""
+        OWN per-page conditional-request ETags (one entry per ``(region, type)``)
+        rather than clobbering a single region-wide entry. A walk that ends
+        short records ``"orders_incomplete"`` in ``last_incomplete``."""
         params: dict = {"order_type": order_type}
         cache_key = f"/markets/{region_id}/orders/|{order_type}"
         if type_id is not None:
@@ -344,6 +459,7 @@ class AuthMarketAdapter:
         return self._paginate_etag(
             f"/markets/{region_id}/orders/", authed=False, params=params,
             progress=progress, stage="orders", cache_key=cache_key,
+            incomplete_tag="orders_incomplete",
         )
 
     def structure_orders(self, structure_id: int, *, progress=None) -> list[dict]:
@@ -351,10 +467,12 @@ class AuthMarketAdapter:
         ``esi-markets.structure_markets.v1`` + docking access). 403 → [] and a
         ``"structure_market"`` entry in ``last_forbidden`` (forbidden != empty).
         ``progress`` (optional) receives per-page ``{"stage": "orders", ...}``
-        dicts — the structure book is the many-page first-scan cost."""
+        dicts - the structure book is the many-page first-scan cost. A walk that
+        ends short records ``"orders_incomplete"`` in ``last_incomplete``."""
         return self._paginate(
             f"/markets/structures/{structure_id}/", authed=True,
             forbidden_tag="structure_market", progress=progress, stage="orders",
+            incomplete_tag="orders_incomplete",
         )
 
     def public_contracts(self, region_id: int, *, progress=None) -> list[dict]:

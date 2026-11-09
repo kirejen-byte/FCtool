@@ -39509,13 +39509,16 @@ $bmp.Dispose()
         """Inline ' · '-joined human text for any degraded reason surfaced in the
         resting market status line, or '' when none apply.
 
-        Currently maps only the contract-phase ESI error-limit abort
-        (``contract_error_limit``); ``structure_market`` is intentionally absent —
-        it drives its own dedicated re-auth banner rather than this line. Reads
-        ``_market_degraded_reasons`` (getattr-guarded for a bare test host)."""
+        Currently maps the contract-phase ESI error-limit abort
+        (``contract_error_limit``) and an order book that came back short of
+        pages or types (``orders_incomplete``); ``structure_market`` is
+        intentionally absent - it drives its own dedicated re-auth banner rather
+        than this line. Reads ``_market_degraded_reasons`` (getattr-guarded for a
+        bare test host)."""
         reasons = getattr(self, "_market_degraded_reasons", None) or []
         labels = {
             "contract_error_limit": "⚠ contract scan stopped early (ESI error limit)",
+            "orders_incomplete": "⚠ order book incomplete (ESI error) — rescan",
         }
         return " · ".join(labels[r] for r in reasons if r in labels)
 

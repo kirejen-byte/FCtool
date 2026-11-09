@@ -593,6 +593,11 @@ class MarketScanner:
         # (set/cleared there). None outside a scan → the cache helpers fall back
         # to their direct per-call disk read-modify-write. See _ContractCacheSession.
         self._session: "_ContractCacheSession | None" = None
+        # Per-``scan_market``-pass flag: an order pull failed in a way the
+        # scanner itself swallowed (a per-type region query, or the whole pull),
+        # so the snapshot is missing orders. Reset at every pass start; folded
+        # into ``degraded`` as "orders_incomplete" by ``_degraded_reasons``.
+        self._orders_incomplete = False
 
     # ── Market depth scan ─────────────────────────────────────────────────────
 
@@ -676,12 +681,19 @@ class MarketScanner:
         fb = getattr(self._adapter, "last_forbidden", None)
         if isinstance(fb, set):
             fb.clear()
+        # Same for the incomplete-pull record (an order walk that ended short),
+        # plus the scanner's own per-pass flag for failures it swallows itself.
+        inc = getattr(self._adapter, "last_incomplete", None)
+        if isinstance(inc, set):
+            inc.clear()
+        self._orders_incomplete = False
 
         _emit_progress(progress, {"stage": "market", "status": "orders_start"})
         try:
             raw = self._pull_orders(source, progress, tid_set)
         except Exception:
             log.exception("[market] order pull failed for source %s", source)
+            self._orders_incomplete = True
             raw = []
         raw = raw or []
         _emit_progress(
@@ -757,8 +769,10 @@ class MarketScanner:
         cost that many small (usually one-page) requests instead of paging an
         entire busy region's order book. Each per-type query is ETag-cached
         independently by the adapter (one ETag per ``(region, type)``), so a
-        re-scan replays cheap 304s. A per-type failure is swallowed (that type
-        simply shows as absent) so one bad type can't abort the whole pass.
+        re-scan replays cheap 304s. A per-type failure is swallowed so one bad
+        type can't abort the whole pass - but it sets the per-pass
+        ``_orders_incomplete`` flag, so the snapshot is marked degraded
+        ("orders_incomplete") instead of that type silently reading as absent.
 
         Progress ticks once per type as ``{"stage": "orders", "page": i,
         "pages": N}`` — reusing the existing per-page status slot so the GUI shows
@@ -775,6 +789,7 @@ class MarketScanner:
             except Exception:
                 log.exception(
                     "[market] region per-type order pull failed (type %s)", tid)
+                self._orders_incomplete = True
                 chunk = []
             if chunk:
                 orders.extend(chunk)
@@ -793,11 +808,22 @@ class MarketScanner:
           reports ``has_market_structure_scope() == False`` is degraded even
           before/without a network 403 (missing scope means the pull can only
           come back forbidden-empty). Reached via the adapter's ``_auth``.
+
+        Plus "orders_incomplete" - the order book is missing pages or types -
+        when the adapter's ``last_incomplete`` carries it (a page walk ended
+        short) or the scanner's own per-pass ``_orders_incomplete`` flag is set
+        (a per-type region query or the whole pull raised and was swallowed).
+        This is NOT a structure-access problem: the GUI's structure gate keys on
+        "structure_market" only.
         """
         reasons: set[str] = set()
         fb = getattr(self._adapter, "last_forbidden", None)
         if isinstance(fb, (set, frozenset, list, tuple)):
             reasons.update(str(x) for x in fb)
+        inc = getattr(self._adapter, "last_incomplete", None)
+        if (isinstance(inc, (set, frozenset, list, tuple)) and "orders_incomplete" in inc) \
+                or getattr(self, "_orders_incomplete", False):
+            reasons.add("orders_incomplete")
         if source is not None and source.kind == "structure":
             auth = getattr(self._adapter, "_auth", None)
             checker = getattr(auth, "has_market_structure_scope", None)
