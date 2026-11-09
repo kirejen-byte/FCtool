@@ -428,16 +428,23 @@ class AuthMarketAdapter:
         if total is None:  # page 1 never landed: the cached shape is all we know
             total = cached_total or 0
         if short:
-            # Stale beats missing ONLY when page 1 never landed: the whole cached
-            # book is then one consistent (old) snapshot. A mid-walk failure is
-            # never padded - pages are not sorted by id, so a stale cached page
-            # can repeat rows a fresh page already returned and double-count.
+            # Stale beats missing ONLY when page 1 never landed. The cache only
+            # ever holds pages confirmed by ONE pull (see ``keep`` below), so a
+            # page-1-failure replay is a consistent - possibly partial - old
+            # snapshot. A mid-walk failure is never padded - pages are not sorted
+            # by id, so a stale cached page can repeat rows a fresh page already
+            # returned and double-count.
             for p in (range(page, total + 1) if page == 1 else ()):
                 if p in cached_pages:
                     out.extend(cached_pages[p][1])
             if incomplete_tag:
                 self._mark_incomplete(incomplete_tag, path, page, short)
-        pages = {p: v for p, v in pages.items() if p <= total}
+        # Keep only pages THIS pull confirmed. After a short walk past page 1,
+        # pages from page on are older than pages 1..page-1 and mixing them would
+        # replay duplicates on a later page-1 failure; drop them. (A page-1
+        # failure leaves the old cache, itself one pull's pages, untouched.)
+        keep = page - 1 if (short and page > 1) else total
+        pages = {p: v for p, v in pages.items() if p <= keep}
         if pages:
             self._etags[key] = {"pages": pages, "total": total}
         else:

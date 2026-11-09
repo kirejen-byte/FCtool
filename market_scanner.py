@@ -788,8 +788,13 @@ class MarketScanner:
         for i, tid in enumerate(tids, start=1):
             # Stop at the ESI error-limit floor (duck-typed: fakes without the
             # attribute never stop): every further query risks a 420. The types
-            # not queried make the snapshot incomplete, so flag it.
-            if getattr(self._adapter, "error_limited", False) is True:
+            # not queried make the snapshot incomplete, so flag it. Checked only
+            # from the second type on (i > 1): ``error_limited`` reads the
+            # adapter's LAST response, and the adapter outlives scans, so before
+            # this scan's first request it may be a minutes-old reading from an
+            # earlier scan - trusting it would skip every type. Same rule as the
+            # adapter's ``page > 1`` check in ``_paginate_etag``.
+            if i > 1 and getattr(self._adapter, "error_limited", False) is True:
                 log.warning(
                     "[market] error-limit floor hit: %d of %d per-type region "
                     "queries skipped", total - i + 1, total)
