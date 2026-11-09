@@ -773,6 +773,9 @@ class MarketScanner:
         type can't abort the whole pass - but it sets the per-pass
         ``_orders_incomplete`` flag, so the snapshot is marked degraded
         ("orders_incomplete") instead of that type silently reading as absent.
+        The loop also stops (and sets the same flag) once the adapter reports
+        the ESI error-limit floor (``error_limited``), instead of hammering on
+        into a 420.
 
         Progress ticks once per type as ``{"stage": "orders", "page": i,
         "pages": N}`` — reusing the existing per-page status slot so the GUI shows
@@ -783,6 +786,15 @@ class MarketScanner:
         total = len(tids)
         orders: list[dict] = []
         for i, tid in enumerate(tids, start=1):
+            # Stop at the ESI error-limit floor (duck-typed: fakes without the
+            # attribute never stop): every further query risks a 420. The types
+            # not queried make the snapshot incomplete, so flag it.
+            if getattr(self._adapter, "error_limited", False) is True:
+                log.warning(
+                    "[market] error-limit floor hit: %d of %d per-type region "
+                    "queries skipped", total - i + 1, total)
+                self._orders_incomplete = True
+                break
             try:
                 chunk = self._adapter.region_orders(
                     region_id, type_id=tid, order_type="sell")

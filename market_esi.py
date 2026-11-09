@@ -19,8 +19,9 @@ Reuses the verified repo infrastructure (design §4.1, §8):
   so every page is cached and revalidated with its OWN ETag - a page-1 304
   never vouches for the rest of the book.
 * Order-pull honesty: the order pulls (``structure_orders`` / ``region_orders``)
-  retry a failed page ONCE (transport error / 5xx / bad body - never a 4xx,
-  which would spend error budget) and, if the walk still ends short, record
+  retry a failed page ONCE (transport error / 5xx / bad body - never a 4xx;
+  and no retry at all once the error-limit floor is reached, since any error
+  response spends ESI error budget) and, if the walk still ends short, record
   ``"orders_incomplete"`` in ``last_incomplete`` so the scanner marks the
   snapshot degraded instead of passing a partial book off as complete.
 * ``X-ESI-Error-Limit-Remain`` / ``Retry-After`` capture (the ``_CAPTURED_HEADERS``
@@ -188,8 +189,10 @@ class AuthMarketAdapter:
         return resp
 
     # Per-page failure kinds that earn ONE immediate retry on a tagged (order)
-    # pull. Everything else is never retried: a 420/429/other 4xx retry spends
-    # ESI error budget, and a 403/404/410 will not change on a second ask.
+    # pull. Everything else is never retried: a 420/429 says back off, and a
+    # 403/404/410 will not change on a second ask. Any error response (5xx
+    # included) can spend ESI error budget, so the retry is skipped once the
+    # error-limit floor is reached (``error_limited``).
     _RETRYABLE_KINDS = frozenset({"transport", "server", "bad_body"})
 
     def _page_attempt(self, url, *, authed: bool, params, headers=None,
@@ -226,11 +229,12 @@ class AuthMarketAdapter:
     def _fetch_page(self, url, *, authed: bool, params, headers=None,
                     conditional: bool = False, retry: bool = False):
         """``_page_attempt`` plus, when ``retry``, ONE immediate retry (through
-        the same rate-limited GET) for a ``_RETRYABLE_KINDS`` failure."""
+        the same rate-limited GET) for a ``_RETRYABLE_KINDS`` failure - unless
+        the error-limit floor has been reached."""
         kind, resp, body = self._page_attempt(
             url, authed=authed, params=params, headers=headers,
             conditional=conditional)
-        if retry and kind in self._RETRYABLE_KINDS:
+        if retry and kind in self._RETRYABLE_KINDS and not self.error_limited:
             log.info("[market-esi] page %s of %s failed (%s), retrying once",
                      (params or {}).get("page"), url, kind)
             kind, resp, body = self._page_attempt(
@@ -361,11 +365,13 @@ class AuthMarketAdapter:
         cached - a failed page never is, so a partial pull is refetched next
         time instead of being replayed.
 
-        A 403 on page 1 -> ``[]``. A failed or unfetched page falls back to its
-        previously cached body when one exists (stale beats missing).
-        ``incomplete_tag`` (ORDER pulls only) adds the one-retry rule and the
-        ``last_incomplete`` record exactly as in ``_paginate_status``; without it
-        there is no retry and nothing is recorded.
+        A 403 on page 1 -> ``[]``. When page 1 itself fails, the whole cached
+        book is returned (stale beats missing). A failure after page 1 returns
+        ONLY the pages obtained: pages are not sorted by id, so padding with a
+        stale cached page could repeat rows a fresh page already returned.
+        ``incomplete_tag`` (ORDER pulls only) adds the one-retry rule and records
+        the tag in ``last_incomplete`` for ANY short walk (a mid-walk 403
+        included); without it there is no retry and nothing is recorded.
 
         ``cache_key`` (optional) is the key under which the per-page ETags +
         bodies are stored; it defaults to ``path``. A per-``type_id``
@@ -422,12 +428,14 @@ class AuthMarketAdapter:
         if total is None:  # page 1 never landed: the cached shape is all we know
             total = cached_total or 0
         if short:
-            # Stale beats missing: pad every page this walk did not obtain with its
-            # last good cached body. The tag (below) marks the result either way.
-            for p in range(page, total + 1):
+            # Stale beats missing ONLY when page 1 never landed: the whole cached
+            # book is then one consistent (old) snapshot. A mid-walk failure is
+            # never padded - pages are not sorted by id, so a stale cached page
+            # can repeat rows a fresh page already returned and double-count.
+            for p in (range(page, total + 1) if page == 1 else ()):
                 if p in cached_pages:
                     out.extend(cached_pages[p][1])
-            if incomplete_tag and short != "forbidden":
+            if incomplete_tag:
                 self._mark_incomplete(incomplete_tag, path, page, short)
         pages = {p: v for p, v in pages.items() if p <= total}
         if pages:
