@@ -687,6 +687,14 @@ class MarketScanner:
         if isinstance(inc, set):
             inc.clear()
         self._orders_incomplete = False
+        # And forget the previous scan's rate/error-limit reading: the adapter
+        # outlives scans, and ``error_limited`` reads ``last_headers`` (refreshed
+        # only when a RESPONSE arrives). A stale low reading would suppress this
+        # scan's first retry and stop the per-type loop after a single transport
+        # error. No reading = unknown, never "limited".
+        lh = getattr(self._adapter, "last_headers", None)
+        if isinstance(lh, dict):
+            lh.clear()
 
         _emit_progress(progress, {"stage": "market", "status": "orders_start"})
         try:
@@ -788,12 +796,13 @@ class MarketScanner:
         for i, tid in enumerate(tids, start=1):
             # Stop at the ESI error-limit floor (duck-typed: fakes without the
             # attribute never stop): every further query risks a 420. The types
-            # not queried make the snapshot incomplete, so flag it. Checked only
-            # from the second type on (i > 1): ``error_limited`` reads the
-            # adapter's LAST response, and the adapter outlives scans, so before
-            # this scan's first request it may be a minutes-old reading from an
-            # earlier scan - trusting it would skip every type. Same rule as the
-            # adapter's ``page > 1`` check in ``_paginate_etag``.
+            # not queried make the snapshot incomplete, so flag it.
+            # ``error_limited`` reads the adapter's LAST response, and the
+            # adapter outlives scans. The primary guard against a minutes-old
+            # reading from an earlier scan is ``scan_market`` clearing
+            # ``last_headers`` at pass start; checking only from the second type
+            # on (i > 1) is belt-and-braces, the same rule as the adapter's
+            # ``page > 1`` check in ``_paginate_etag``.
             if i > 1 and getattr(self._adapter, "error_limited", False) is True:
                 log.warning(
                     "[market] error-limit floor hit: %d of %d per-type region "
