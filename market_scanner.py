@@ -395,7 +395,7 @@ class ComponentAvailability:
     component: Component
     market_qty: int  # units on market (from MarketSnapshot)
     best_price: float | None
-    completable: int  # market_qty // per_fit_qty (fits this component alone supports)
+    completable: int  # market_qty // the fit's TOTAL need for this type (summed across BoM rows of the same type)
     on_market: bool
 
 
@@ -408,7 +408,7 @@ class DoctrineAvailability:
     completable_fits: int  # min(completable) over the FULL BoM = binding constraint
     binding_type_id: int | None  # component that limits completable_fits (may be cargo/ammo/drone)
     binding_name: str | None
-    breadth_pct: float  # % of ALL BoM components (full fit) with on_market == True
+    breadth_pct: float  # % of BoM components (full fit, types with need > 0) that are on the market
     # Depth split for the birds-eye view:
     market_hulls: int  # hull units on the local market
     contract_matches: int  # count of similar contracts (from ContractScan)
@@ -894,11 +894,20 @@ class MarketScanner:
     ) -> DoctrineAvailability:
         bom = fit_bom(fit.parsed, self._catalog)
         comps: list[ComponentAvailability] = []
+        # The same type_id can sit on several BoM rows (a module fitted AND a
+        # spare in cargo; drones in the bay AND in cargo). One unit of market
+        # stock can only serve one of them, so divide by the type's TOTAL need.
+        need_by_type: dict[int, int] = {}
+        for c in bom:
+            # max(0, ...): parse_dna accepts negative quantities, gap_list skips them.
+            need_by_type[c.type_id] = (
+                need_by_type.get(c.type_id, 0) + max(0, c.per_fit_qty))
         for c in bom:
             td = snap.get(c.type_id)
             market_qty = td.sell_qty if td else 0
             best = td.best_sell if td else None
-            completable = market_qty // c.per_fit_qty if c.per_fit_qty > 0 else 0
+            need = need_by_type[c.type_id]
+            completable = market_qty // need if need > 0 else 0
             comps.append(
                 ComponentAvailability(
                     component=c,
@@ -916,7 +925,9 @@ class MarketScanner:
         # seedable as its scarcest cargo/ammo/drone line — the binding component
         # below may be a cargo item. (Contract >=95% matching keeps the fitted
         # subset; see ``_CONTRACT_MATCH_ROLES``.)
-        scored = comps
+        # Types whose total need is 0 (malformed ``;0`` / ``;-N`` rows) need
+        # nothing, exactly as gap_list treats them, so they never score.
+        scored = [ca for ca in comps if need_by_type[ca.component.type_id] > 0]
         if scored:
             binding = min(scored, key=lambda ca: ca.completable)
             completable_fits = binding.completable
