@@ -395,7 +395,7 @@ class ComponentAvailability:
     component: Component
     market_qty: int  # units on market (from MarketSnapshot)
     best_price: float | None
-    completable: int  # market_qty // per_fit_qty (fits this component alone supports)
+    completable: int  # market_qty // the fit's TOTAL need for this type (summed across BoM rows of the same type)
     on_market: bool
 
 
@@ -894,11 +894,18 @@ class MarketScanner:
     ) -> DoctrineAvailability:
         bom = fit_bom(fit.parsed, self._catalog)
         comps: list[ComponentAvailability] = []
+        # The same type_id can sit on several BoM rows (a module fitted AND a
+        # spare in cargo; drones in the bay AND in cargo). One unit of market
+        # stock can only serve one of them, so divide by the type's TOTAL need.
+        need_by_type: dict[int, int] = {}
+        for c in bom:
+            need_by_type[c.type_id] = need_by_type.get(c.type_id, 0) + c.per_fit_qty
         for c in bom:
             td = snap.get(c.type_id)
             market_qty = td.sell_qty if td else 0
             best = td.best_sell if td else None
-            completable = market_qty // c.per_fit_qty if c.per_fit_qty > 0 else 0
+            need = need_by_type[c.type_id]
+            completable = market_qty // need if need > 0 else 0
             comps.append(
                 ComponentAvailability(
                     component=c,

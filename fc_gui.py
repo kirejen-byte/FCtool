@@ -12652,13 +12652,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                                  fg=colour, bg=BG_PANEL, anchor=tk.W)
             avail_lbl.pack(anchor=tk.W, pady=(1, 0))
             menu_targets.append(avail_lbl)
-            binding = getattr(avail, "binding_name", None)
-            if binding and getattr(avail, "completable_fits", 0) >= 0:
-                self._tip_widget(
-                    avail_lbl,
-                    f"bottleneck for market seeding: {binding}"
-                    f" (limits you to {avail.completable_fits} complete fits "
-                    f"from local stock)")
+            tip = FCToolGUI._market_bottleneck_tip(avail)
+            if tip:
+                self._tip_widget(avail_lbl, tip)
 
         # Per-fit seed-target editor (inline, always shown — the target is a
         # persistent config that colours the availability line above and drives
@@ -40404,6 +40400,30 @@ $bmp.Dispose()
         else:
             colour = FG_YELLOW
         return (text, colour)
+
+    @staticmethod
+    def _market_bottleneck_tip(avail):
+        """Pure formatter for the Doctrine-tab bottleneck tooltip, or None when
+        there is no bottleneck to name. Shows market stock vs the fit's per-fit
+        need (summed over BoM rows of the binding type) so "1 on market, 2 per
+        fit -> 0 fits" is self-explaining."""
+        name = getattr(avail, "binding_name", None)
+        n = getattr(avail, "completable_fits", 0)
+        if not name or n < 0:
+            return None
+        word = "fit" if n == 1 else "fits"
+        tail = f"(limits you to {n} complete {word} from local stock)"
+        btid = getattr(avail, "binding_type_id", None)
+        rows = []
+        if btid is not None:
+            rows = [r for r in (getattr(avail, "components", None) or [])
+                    if getattr(getattr(r, "component", None), "type_id", None) == btid]
+        if not rows:
+            return f"bottleneck for market seeding: {name} {tail}"
+        need = sum(getattr(r.component, "per_fit_qty", 0) for r in rows)
+        qty = getattr(rows[0], "market_qty", 0) or 0
+        stock = f"{qty} on market" if qty > 0 else "none on the staging market"
+        return f"bottleneck for market seeding: {name} — {stock}, {need} per fit {tail}"
 
     def _market_doctrine_avail_map(self, doctrine):
         """fit_id -> DoctrineAvailability for a doctrine, from the current
