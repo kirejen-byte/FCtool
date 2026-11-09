@@ -899,7 +899,9 @@ class MarketScanner:
         # stock can only serve one of them, so divide by the type's TOTAL need.
         need_by_type: dict[int, int] = {}
         for c in bom:
-            need_by_type[c.type_id] = need_by_type.get(c.type_id, 0) + c.per_fit_qty
+            # max(0, ...): parse_dna accepts negative quantities, gap_list skips them.
+            need_by_type[c.type_id] = (
+                need_by_type.get(c.type_id, 0) + max(0, c.per_fit_qty))
         for c in bom:
             td = snap.get(c.type_id)
             market_qty = td.sell_qty if td else 0

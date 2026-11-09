@@ -40408,8 +40408,8 @@ $bmp.Dispose()
         need (summed over BoM rows of the binding type) so "1 on market, 2 per
         fit -> 0 fits" is self-explaining."""
         name = getattr(avail, "binding_name", None)
-        n = getattr(avail, "completable_fits", 0)
-        if not name or n < 0:
+        n = getattr(avail, "completable_fits", None)
+        if not name or not isinstance(n, int) or isinstance(n, bool) or n < 0:
             return None
         word = "fit" if n == 1 else "fits"
         tail = f"(limits you to {n} complete {word} from local stock)"
