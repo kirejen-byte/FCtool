@@ -925,7 +925,9 @@ class MarketScanner:
         # seedable as its scarcest cargo/ammo/drone line — the binding component
         # below may be a cargo item. (Contract >=95% matching keeps the fitted
         # subset; see ``_CONTRACT_MATCH_ROLES``.)
-        scored = comps
+        # Types whose total need is 0 (malformed ``;0`` / ``;-N`` rows) need
+        # nothing, exactly as gap_list treats them, so they never score.
+        scored = [ca for ca in comps if need_by_type[ca.component.type_id] > 0]
         if scored:
             binding = min(scored, key=lambda ca: ca.completable)
             completable_fits = binding.completable

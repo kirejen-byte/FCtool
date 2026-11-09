@@ -40420,7 +40420,7 @@ $bmp.Dispose()
                     if getattr(getattr(r, "component", None), "type_id", None) == btid]
         if not rows:
             return f"bottleneck for market seeding: {name} {tail}"
-        need = sum(getattr(r.component, "per_fit_qty", 0) for r in rows)
+        need = sum(max(0, getattr(r.component, "per_fit_qty", 0) or 0) for r in rows)
         qty = getattr(rows[0], "market_qty", 0) or 0
         stock = f"{qty} on market" if qty > 0 else "none on the staging market"
         return f"bottleneck for market seeding: {name} — {stock}, {need} per fit {tail}"
