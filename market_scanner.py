@@ -408,7 +408,7 @@ class DoctrineAvailability:
     completable_fits: int  # min(completable) over the FULL BoM = binding constraint
     binding_type_id: int | None  # component that limits completable_fits (may be cargo/ammo/drone)
     binding_name: str | None
-    breadth_pct: float  # % of ALL BoM components (full fit) with on_market == True
+    breadth_pct: float  # % of BoM components (full fit, types with need > 0) that are on the market
     # Depth split for the birds-eye view:
     market_hulls: int  # hull units on the local market
     contract_matches: int  # count of similar contracts (from ContractScan)

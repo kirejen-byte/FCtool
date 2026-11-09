@@ -12553,9 +12553,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             legend.pack(anchor=tk.W, padx=12, pady=(6, 0))
             self._tip_widget(
                 legend,
-                "breadth% = share of hull+modules+subsystems on the local "
-                "market. N = fits you could source: M complete fits from market "
-                "stock + C matching contracts. Click ⟳ Market to refresh.")
+                "breadth% = share of the fit's full bill of materials (hull, "
+                "modules, subsystems, ammo, drones, cargo) on the local market. "
+                "N = fits you could source: M complete fits from market stock + "
+                "C matching contracts. Hover a fit's market line to see its "
+                "bottleneck item, how many are on the market and how many each "
+                "fit needs. Click ⟳ Market to refresh.")
 
         # Members grouped by tag (canonical order).
         links_range = self._doctrine_links_range(doctrine)
