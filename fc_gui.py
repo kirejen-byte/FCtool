@@ -6833,7 +6833,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._range_result_label.pack()
 
         self._range_detail_label = tk.Label(
-            self._range_result_frame, text="Enter two systems and click Check",
+            self._range_result_frame, text="Enter two systems and click Check Jump Range",
             font=("Consolas", 11), fg=FG_DIM, bg=BG_DARK, justify=tk.LEFT
         )
         self._range_detail_label.pack(pady=5)
@@ -7110,7 +7110,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._wh_result_label.pack()
 
         self._wh_detail_label = tk.Label(
-            self._wh_result_frame, text="Enter origin and destination, then click Find WH Shortcut",
+            self._wh_result_frame, text="Enter origin and destination, then click Find Route",
             font=("Consolas", 10), fg=FG_DIM, bg=BG_DARK, justify=tk.LEFT
         )
         self._wh_detail_label.pack(pady=3)
