@@ -38344,10 +38344,6 @@ $bmp.Dispose()
                                 f"**{len(r)-1} jumps**")
                 except Exception:
                     pass
-            try:
-                report.has_cyno_beacon = self._check_cyno_beacon(report.system_id)
-            except Exception:
-                pass
         # Read the thread-safe plain mirror (updated on the main thread by a Var
         # write-trace); the worker must never touch the Tk Var directly (Class B
         # fix). getattr keeps the original AttributeError tolerance.
