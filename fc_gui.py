@@ -221,7 +221,8 @@ import jump_range
 # arrives through injected providers — see _open_market_gaps_dialog.
 import market_gap_dialog
 from app_io import atomic_write_json, decode_bom_text, read_bytes_retrying
-from app_log import get_logger
+from app_log import (get_logger, install_exception_hooks,
+                     install_tk_exception_hook, log_uncaught)
 from rate_limiter import rate_limit
 from esi_constants import ESI_BASE, ESI_HEADERS
 # Staging-list helpers: pure, shared with the group-configuration items (which
@@ -1294,6 +1295,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
     def __init__(self):
         _apply_dpi_awareness(_read_overlay_dpi_pref())
         self.root = tk.Tk()
+        install_tk_exception_hook(self.root)
         self.root.title("FCTool - Fleet Commander Assistant")
         self.root.geometry("1200x900")
         self.root.configure(bg=BG_DARK)
@@ -2094,6 +2096,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 else:
                     fn(*a)
             except Exception as exc:
+                log_uncaught(type(exc), exc, exc.__traceback__, "[UI-Q] dispatcher")
                 print(f"[UI-Q] {exc}")
         self.root.after(DRAIN_MS, self._drain_ui_q)
 
@@ -40873,11 +40876,13 @@ def main():
     # with a newer build's flags must still start.
     app = None
     code = 0
+    install_exception_hooks()
     try:
         app = FCToolGUI()
         app.run()
     except Exception:
         code = 1
+        log.exception("[boot] uncaught exception in main")
         try:
             import traceback
             traceback.print_exc()
