@@ -108,6 +108,14 @@ ATTR = {
     "armorExplosiveDamageResonance": 268,
     "armorKineticDamageResonance": 269,
     "armorThermalDamageResonance": 270,
+    # The SHIP's own hull resonances (all 0.67 on a base hull).  974-977 below
+    # exist only on MODULES (damage controls, Bastion, the Emergency Hull
+    # Energizer): effects 2302 / 6658 multiply them onto these.
+    "shipHullEmDamageResonance": 113,
+    "shipHullThermalDamageResonance": 110,
+    "shipHullKineticDamageResonance": 109,
+    "shipHullExplosiveDamageResonance": 111,
+    # a MODULE's hull resonance multipliers (never read off a ship)
     "hullEmDamageResonance": 974,
     "hullExplosiveDamageResonance": 975,
     "hullKineticDamageResonance": 976,
@@ -187,9 +195,9 @@ LAYER_SPECS = (
       ATTR["armorKineticDamageResonance"],
       ATTR["armorExplosiveDamageResonance"])),
     ("hull", ATTR["hp"],
-     (ATTR["hullEmDamageResonance"], ATTR["hullThermalDamageResonance"],
-      ATTR["hullKineticDamageResonance"],
-      ATTR["hullExplosiveDamageResonance"])),
+     (ATTR["shipHullEmDamageResonance"], ATTR["shipHullThermalDamageResonance"],
+      ATTR["shipHullKineticDamageResonance"],
+      ATTR["shipHullExplosiveDamageResonance"])),
 )
 
 #: Every resonance attribute, as a flat set -- a hardener/membrane/damage
@@ -203,6 +211,11 @@ RESONANCE_ATTRS = frozenset(
 #: is tested against the module's BASE attributes -- what its type declares --
 #: never against a modified value, which every hull would incidentally have.
 TANK_ATTRS = frozenset(RESONANCE_ATTRS | {
+    # a module's hull resonances (974-977): no ship carries them and no module
+    # carries 113/111/109/110, so they must be listed on their own or the
+    # Emergency Hull Energizer would stop counting as tank gear.
+    ATTR["hullEmDamageResonance"], ATTR["hullExplosiveDamageResonance"],
+    ATTR["hullKineticDamageResonance"], ATTR["hullThermalDamageResonance"],
     ATTR["capacityBonus"], ATTR["shieldCapacityBonus"],
     ATTR["shieldCapacityMultiplier"], ATTR["armorHpBonus"],
     ATTR["armorHPBonusAdd"], ATTR["armorHPMultiplier"],
