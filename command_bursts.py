@@ -109,6 +109,7 @@ HULL_BURST_BONUS: dict[int, frozenset[str]] = {
     37482: frozenset({SHIELD, INFORMATION}),   # Stork
     37483: frozenset({ARMOR, SKIRMISH}),       # Magus
     37480: frozenset({SHIELD, SKIRMISH}),      # Bifrost
+    52254: frozenset({SKIRMISH, INFORMATION}), # Draugur
     # Strategic Cruisers — bonus is subsystem-conditional (see T3C_HULL_IDS)
     29986: frozenset({ARMOR, INFORMATION, SKIRMISH}),   # Legion
     29984: frozenset({SHIELD, INFORMATION, SKIRMISH}),  # Tengu
