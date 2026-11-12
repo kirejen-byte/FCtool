@@ -582,6 +582,9 @@ class CynoChecker:
             datetime.now(timezone.utc) - timedelta(days=self.lookback_days)
         )
 
+        # A zKill block applies to the run that hit it, not to later checks on
+        # this shared checker (the flag used to latch for the whole session).
+        self.fetcher.zkill_blocked = False
         _emit(f"Scanning losses for character {character_id} ...")
         qualifying: list[dict] = []
         partial = False
