@@ -1546,6 +1546,11 @@ class MapTab:
         # suppressed as a "duplicate" of a frame nobody ever saw, leaving the
         # canvas black until the first input (measured, Task 18).
         self._applied_sig: tuple | None = None
+        # Sig of the crisp request most recently ENQUEUED and not since
+        # superseded by a gesture request / worker shutdown: an identical request
+        # is not sent again (the 16 ms tick re-requests after force_dirty +
+        # _request_crisp, and an idle worker would render both). See _request_crisp.
+        self._last_crisp_sig: tuple | None = None
         self._visible = False
         self._tick_scheduled = False
         self._tick_after_id: str | None = None   # pending _tick after() id (cancel on hide)
@@ -4116,6 +4121,7 @@ class MapTab:
         # would otherwise never be applied (its result is discarded) and
         # _gesture_inflight would then wedge the next glide.
         self._gesture_inflight = False
+        self._last_crisp_sig = None        # a crisp in the dying queue is lost
         worker = self._worker
         if worker is None:
             return
@@ -4280,6 +4286,8 @@ class MapTab:
         is what lets the analyzer see WHICH sub-stage a given spike landed in (probe:
         the stall lands on overlay or itemconfig far more often than PhotoImage)."""
         self._gesture_inflight = False
+        if not self._visible:
+            self._last_crisp_sig = None  # a dropped frame must not block its re-request
         if not self._visible or not self.state.is_current(generation):
             return                       # dropped -> _applied_sig stays unrecorded
         tele = self._tele
@@ -4382,9 +4390,8 @@ class MapTab:
     def _request_crisp(self) -> None:
         if self.renderer is None:
             return
-        self._req_q.put({
+        req = {
             "kind": "crisp",
-            "generation": self.state.next_generation(),
             "camera": self.state.camera.to_dict(),
             "vw": self.state.vw, "vh": self.state.vh,
             "bloom": bool(self._bloom_var.get()),
@@ -4403,7 +4410,18 @@ class MapTab:
             # the layer is off / no badges (byte-identical to pre-infra output).
             # Joins _request_sig; the renderer draws it as per-system count chips.
             "infra": self._infra_request_value(),
-        })
+        }
+        # De-dupe at request time: an identical request is already pending / just
+        # sent for the current generation, so a second one would only make an idle
+        # worker render the same frame twice (the first lands stale and is dropped).
+        sig = _request_sig(req)
+        if sig == self._last_crisp_sig:
+            return
+        self._last_crisp_sig = sig
+        # Bump the generation ONLY for a request that is really sent: a
+        # suppressed duplicate must not make the pending one look stale.
+        req["generation"] = self.state.next_generation()
+        self._req_q.put(req)
 
     def _request_gesture_frame(self) -> None:
         """Enqueue a WORKER-served gesture (quick) frame for the LIVE camera
@@ -4422,6 +4440,7 @@ class MapTab:
             return
         gen = self.state.next_generation()
         self._applied_sig = None
+        self._last_crisp_sig = None        # this bump invalidates any pending crisp
         self._gesture_inflight = True
         self._req_q.put({
             "kind": "gesture",
