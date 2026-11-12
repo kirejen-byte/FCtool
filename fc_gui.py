@@ -2226,6 +2226,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         """Resolve all ansiblex pairs from config into ID strings."""
         pairs = self.config.get("ansiblex_connections", [])
         if not pairs:
+            # The last manual pair was deleted: drop the stale routing caches.
+            self._ansiblex_connections = []
+            self._ansiblex_id_pairs = {}
             return
         resolved = []
         id_pairs = {}
@@ -2261,6 +2264,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         """Resolve Ansiblex system name pairs to ID pairs in background."""
         pairs = self.config.get("ansiblex_connections", [])
         if not pairs:
+            self._ansiblex_connections = []
+            self._ansiblex_id_pairs = {}
             return
 
         def resolve():
