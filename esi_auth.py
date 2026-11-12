@@ -1207,6 +1207,7 @@ class ESIAuth:
         from jump_range import get_system_info
         from zkill_monitor import resolve_name
 
+        self._prime_character_names(members)
         result = {}
         for m in members:
             char_id = m.get("character_id")
@@ -1220,6 +1221,28 @@ class ESIAuth:
                 ship_name = resolve_name(ship_type_id, "type") if ship_type_id else ""
                 result[char_name] = (sys_name, region_name, ship_name)
         return result
+
+    @staticmethod
+    def _prime_character_names(members) -> None:
+        """Bulk-resolve the not-yet-cached fleet character names (up to 1,000 ids
+        per ``POST /universe/names/``) so ``resolve_name`` finds them cached
+        instead of doing one serial GET per pilot. A failed or odd bulk answer
+        is silently skipped: the per-member path then resolves as before."""
+        try:
+            from zkill_monitor import is_name_cached, prime_names
+            ids = sorted({m["character_id"] for m in members
+                          if m.get("character_id") and m.get("solar_system_id")
+                          and not is_name_cached(m["character_id"], "character")})
+            for i in range(0, len(ids), 1000):
+                data = ESIAuth.esi_post_public("/universe/names/", ids[i:i + 1000])
+                if isinstance(data, list):
+                    prime_names((row["category"], row["id"], row["name"])
+                                for row in data
+                                if isinstance(row, dict)
+                                and row.get("category") == "character"
+                                and row.get("id") and row.get("name"))
+        except Exception:
+            log.exception("[ESI] fleet name prime failed")
 
     def _get_region_name(self, sys_info: dict) -> str:
         """Resolve system info -> constellation -> region name.

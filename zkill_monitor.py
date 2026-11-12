@@ -158,6 +158,19 @@ _NAME_NEG_TTL = 300  # seconds a transient-failure fallback is trusted
 _region_cache: dict[int, int] = {}
 
 
+def is_name_cached(entity_id: int, category: str) -> bool:
+    """True when ``resolve_name`` would answer from the permanent cache."""
+    return (category, entity_id) in _name_cache
+
+
+def prime_names(entries) -> None:
+    """Seed the permanent name cache from ``(category, id, name)`` rows (a bulk
+    resolve elsewhere), so the per-id ``resolve_name`` path hits the cache."""
+    for category, entity_id, name in entries:
+        if name:
+            _name_cache[(category, entity_id)] = name
+
+
 def resolve_name(entity_id: int, category: str = "solar_system") -> str:
     """Resolve an EVE entity ID to a name.
 
