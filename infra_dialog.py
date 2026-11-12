@@ -15,6 +15,7 @@ scanner's progress/done callbacks, which the host marshals through ``_post_ui``
 before calling ``push_scan_progress`` / ``push_scan_done`` / ``set_scan_status``
 here — so this module makes no thread-safety assumptions of its own.
 """
+import contextlib
 import logging
 import tkinter as tk
 from tkinter import ttk, messagebox
@@ -591,14 +592,31 @@ class InfraManagerDialog(tk.Toplevel):
                 f"Mark {count} structure{'s' if count != 1 else ''} dead?",
                 parent=self):
             return
-        for k in keys:
-            try:
-                self.store.set_status(k, "dead")
-            except Exception as exc:
-                log.warning("infra store.set_status failed: %s", exc)
+        with self._store_batch():
+            for k in keys:
+                try:
+                    self.store.set_status(k, "dead")
+                except Exception as exc:
+                    log.warning("infra store.set_status failed: %s", exc)
         self._on_changed()
         self._reload_tree()
         self._set_status(f"Marked {len(keys)} dead.")
+
+    @contextlib.contextmanager
+    def _store_batch(self):
+        """One whole-file store write for a bulk action instead of one per row.
+        Uses the store's ``deferred_save()`` when it has one (a duck-typed store
+        without it keeps today's per-row saves). The batch's exit flush can
+        raise: log it, so the Tk callback still refreshes the tree."""
+        batch = getattr(self.store, "deferred_save", None)
+        if batch is None:
+            yield
+            return
+        try:
+            with batch():
+                yield
+        except Exception as exc:
+            log.warning("infra store batched save failed: %s", exc)
 
     def _on_mark_alive(self):
         """Undo a dead mark (the reaper's or the owner's). Reversible and
@@ -607,11 +625,12 @@ class InfraManagerDialog(tk.Toplevel):
         if not keys:
             self._set_status("Select rows to mark alive.")
             return
-        for k in keys:
-            try:
-                self.store.set_status(k, "alive")
-            except Exception as exc:
-                log.warning("infra store.set_status failed: %s", exc)
+        with self._store_batch():
+            for k in keys:
+                try:
+                    self.store.set_status(k, "alive")
+                except Exception as exc:
+                    log.warning("infra store.set_status failed: %s", exc)
         self._on_changed()
         self._reload_tree()
         self._set_status(f"Marked {len(keys)} alive.")
@@ -630,11 +649,12 @@ class InfraManagerDialog(tk.Toplevel):
             return
         target = not all(
             (self._entries_by_key.get(k) or {}).get("reinforced") for k in keys)
-        for k in keys:
-            try:
-                self.store.set_reinforced(k, target)
-            except Exception as exc:
-                log.warning("infra store.set_reinforced failed: %s", exc)
+        with self._store_batch():
+            for k in keys:
+                try:
+                    self.store.set_reinforced(k, target)
+                except Exception as exc:
+                    log.warning("infra store.set_reinforced failed: %s", exc)
         self._on_changed()
         self._reload_tree()
         self._set_status("{v} {n} structure{s} reinforced.".format(
