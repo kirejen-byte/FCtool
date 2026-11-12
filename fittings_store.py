@@ -63,7 +63,7 @@ from uuid import uuid4
 
 import fit_dna
 import fleet_guidance
-from app_io import atomic_write_json
+from app_io import atomic_write_json, read_bytes_retrying
 from app_log import get_logger
 from fit_models import (
     DEFAULT_TAGS,
@@ -1027,8 +1027,9 @@ class FittingsStore:
                 self.load_data(None)
                 return
             try:
-                with open(self.path, encoding="utf-8") as f:
-                    data = json.load(f)
+                # A refused open (AV / OneDrive hold) is retried before the
+                # library is called unreadable; decoding is strict UTF-8 as before.
+                data = json.loads(read_bytes_retrying(self.path).decode("utf-8"))
             except (OSError, json.JSONDecodeError, UnicodeDecodeError):
                 # The file exists but is unreadable (corrupt JSON, locked, perms).
                 # Copy it aside BEFORE degrading to an empty store, otherwise the
