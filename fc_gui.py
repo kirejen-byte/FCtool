@@ -1346,6 +1346,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # by Var write-traces wired when the widgets are created in _build_ui.
         self._intel_fusion_enabled = threading.Event()
         self._intel_min_reported = 0
+        # Plain-int mirror of the zKill display Min Pilots spinbox, read by the
+        # zKill poll thread (ZKillMonitor display_min_pilots); see
+        # _mirror_zkill_min_pilots.
+        self._zkill_min_pilots = 1
         # Second-stage intel dedupe state (see INTEL_SKEW_WINDOW_S and
         # _intel_is_skew_duplicate): dedupe key -> the log stamp, as a float, of
         # the sighting that was DELIVERED. Written only from the intel poll
@@ -5037,6 +5041,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         except (TypeError, ValueError):
             _min0 = 25
         self._zkill_min_pilots_var = tk.StringVar(value=str(_min0))
+        self._zkill_min_pilots_var.trace_add(
+            "write", self._mirror_zkill_min_pilots)
+        self._mirror_zkill_min_pilots()
         self._zkill_min_pilots_spin = tk.Spinbox(
             top, from_=1, to=500, textvariable=self._zkill_min_pilots_var,
             font=("Consolas", 10), width=4, bg=BG_ENTRY, fg=FG_WHITE,
@@ -33240,6 +33247,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 # Raw per-killmail seam (poll thread; every subscriber is an
                 # internally-locked, Tk-free engine method). See _killmail_hook.
                 on_killmail=self._killmail_hook(),
+                display_min_pilots=lambda: self._zkill_min_pilots,
                 watch_all=True,
                 friendly_ids=set(self._standings_cache.friendly_ids),
             )
@@ -37656,6 +37664,15 @@ $bmp.Dispose()
             self._intel_min_reported = int(self._intel_min_reported_var.get())
         except (ValueError, AttributeError):
             self._intel_min_reported = 0
+
+    def _mirror_zkill_min_pilots(self, *_):
+        """Main-thread Var-trace: mirror the zKill display Min Pilots spinbox
+        into a plain int the poll thread may read (same value the display gate
+        in _show_zkill_alert uses; garbage falls back to 1 like that gate)."""
+        try:
+            self._zkill_min_pilots = int(self._zkill_min_pilots_var.get())
+        except (ValueError, AttributeError):
+            self._zkill_min_pilots = 1
 
     def _toggle_intel_fusion(self):
         """Show or hide the merged Intelligence Fusion stream panel.

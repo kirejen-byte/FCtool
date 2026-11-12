@@ -569,7 +569,8 @@ class ZKillMonitor:
                  on_alert: Callable[[KillAlert], None] | None = None,
                  watch_all: bool = False,
                  friendly_ids: set[int] | None = None,
-                 on_killmail: Callable[[dict], None] | None = None):
+                 on_killmail: Callable[[dict], None] | None = None,
+                 *, display_min_pilots: Callable[[], int] | None = None):
         self.watch_regions = set(watch_regions or [])
         self.watch_alliances = set(watch_alliances or [])
         self.watch_systems = set(watch_systems or [])
@@ -577,6 +578,10 @@ class ZKillMonitor:
         self.min_kill_value = min_kill_value_millions
         self.min_pilots = min_pilots_involved
         self.on_alert = on_alert
+        # Optional, poll-thread-safe callable returning the consumer's DISPLAY
+        # minimum-pilots threshold. None = inactive (the plain growth/expiry
+        # mute only). See _process_kill's existing-fight branch.
+        self._display_min_pilots = display_min_pilots
         # RAW per-killmail seam: called with EVERY filter-passing killmail, in
         # the normalized {"killmail": ..., "zkb": ...} shape, BEFORE engagement
         # aggregation. Distinct from `on_alert`, which only fires when the
@@ -728,6 +733,7 @@ class ZKillMonitor:
                 self._alerted_systems[alert.system_id] = {
                     "time": alert.timestamp,
                     "pilots": alert.pilots_on_field,
+                    "caps": bool(alert.capitals_involved),
                 }
                 self.on_alert(alert)
             else:
@@ -738,8 +744,36 @@ class ZKillMonitor:
                     self._alerted_systems[alert.system_id] = {
                         "time": alert.timestamp,
                         "pilots": alert.pilots_on_field,
+                        "caps": bool(alert.capitals_involved),
                     }
                     self.on_alert(alert)
+                elif self._is_crossing_or_cap_escalation(alert, prev):
+                    # The first alert the consumer's display filter lets
+                    # through (or a capitals escalation): deliver it once as a
+                    # FIRST alert and re-base the record on it.
+                    self._alerted_systems[alert.system_id] = {
+                        "time": alert.timestamp,
+                        "pilots": alert.pilots_on_field,
+                        "caps": bool(alert.capitals_involved),
+                    }
+                    self.on_alert(alert)
+
+    def _is_crossing_or_cap_escalation(self, alert, prev: dict) -> bool:
+        """True when a muted existing-fight alert must still be delivered.
+
+        (1) the previous record was below the display threshold and this alert
+        is at or above it; (2) capitals were not involved before and are now.
+        A None callable disables both rules; a raising/garbage one disables (1).
+        """
+        if self._display_min_pilots is None:
+            return False  # feature inactive: the plain growth/expiry mute
+        if alert.capitals_involved and not prev.get("caps"):
+            return True
+        try:
+            thr = int(self._display_min_pilots())
+        except Exception:
+            return False
+        return prev["pilots"] < thr <= alert.pilots_on_field
 
     def _get_current_sequence(self) -> int | None:
         """Fetch the current sequence number from R2Z2."""
