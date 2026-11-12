@@ -174,8 +174,9 @@ def is_failed_pull(snap) -> bool:
 def keep_previous_snapshot(snap, previous) -> bool:
     """True when a failed order pull must NOT replace ``previous`` (the last good
     snapshot of the SAME source). A first-ever scan (no previous) applies as
-    before. One rule for the disk store and both GUI apply sites."""
-    if previous is None or not is_failed_pull(snap):
+    before. One rule for the disk store and both GUI apply sites. ``previous is
+    snap`` (the partial apply already installed it) is never "keep"."""
+    if previous is None or previous is snap or not is_failed_pull(snap):
         return False
     return getattr(previous, "source_id", None) == getattr(snap, "source_id", None)
 
@@ -745,7 +746,8 @@ class MarketScanner:
         # snapshot of this source: keep it on disk (the return value and the
         # "orders_incomplete" warning are unchanged; the GUI guards its own
         # in-memory apply with the same rule). First scan ever: store as before.
-        if keep_previous_snapshot(snap, self.load_snapshot(source.source_id)):
+        if is_failed_pull(snap) and keep_previous_snapshot(
+                snap, self.load_snapshot(source.source_id)):
             log.warning("[market] order pull failed; keeping the last good "
                         "snapshot for source %s", source.source_id)
         else:
@@ -756,7 +758,9 @@ class MarketScanner:
         # the (separate, ~100x slower) contract scan even starts — the caller
         # renders contract-derived figures as pending until scan_contracts lands.
         # Carries the snap itself (not just counts) so no second fetch is needed;
-        # emitted after store so a consumer and the disk cache never disagree.
+        # emitted after the store step. When a failed pull kept the old disk
+        # snapshot the emit still carries the failed one; the GUI applies the
+        # same keep rule to its in-memory copy, so the two stay consistent.
         _emit_progress(
             progress, {"stage": "market", "status": "orders_ready", "snapshot": snap}
         )
