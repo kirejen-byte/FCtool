@@ -2225,6 +2225,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
     def _resolve_ansiblex_sync(self):
         """Resolve all ansiblex pairs from config into ID strings."""
         pairs = self.config.get("ansiblex_connections", [])
+        # Same generation guard as _resolve_ansiblex_async: a save that lands
+        # while this (possibly start-up) resolver is mid-flight wins.
+        gen = getattr(self, "_ansiblex_resolve_gen", 0)
         if not pairs:
             # The last manual pair was deleted: drop the stale routing caches.
             self._ansiblex_connections = []
@@ -2240,6 +2243,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     resolved.append(f"{id1}|{id2}")
                     id_pairs[(id1, id2)] = (pair[0], pair[1])
                     id_pairs[(id2, id1)] = (pair[1], pair[0])
+        if gen != getattr(self, "_ansiblex_resolve_gen", 0):
+            return          # superseded by a newer save
         self._ansiblex_connections = resolved
         self._ansiblex_id_pairs = id_pairs
         # Clear route cache so new ansiblex connections take effect
