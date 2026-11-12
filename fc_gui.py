@@ -220,7 +220,7 @@ import jump_range
 # removal). Self-contained: tkinter + ui_theme/ui_helpers only, everything else
 # arrives through injected providers — see _open_market_gaps_dialog.
 import market_gap_dialog
-from app_io import atomic_write_json
+from app_io import atomic_write_json, decode_bom_text, read_bytes_retrying
 from app_log import get_logger
 from rate_limiter import rate_limit
 from esi_constants import ESI_BASE, ESI_HEADERS
@@ -309,8 +309,8 @@ def _read_overlay_dpi_pref() -> str:
     """Best-effort read of config['overlay']['dpi_awareness'] BEFORE the Tk root
     (and self.config) exist. Returns 'auto' when the file/key is absent."""
     try:
-        with open(CONFIG_PATH, "r") as f:
-            cfg = json.load(f)
+        with open(CONFIG_PATH, "rb") as f:
+            cfg = json.loads(decode_bom_text(f.read()))
         return (cfg.get("overlay", {}) or {}).get("dpi_awareness", "auto")
     except Exception:
         return "auto"
@@ -2465,8 +2465,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
     def _load_config(self) -> dict:
         if os.path.exists(CONFIG_PATH):
             try:
-                with open(CONFIG_PATH, "r") as f:
-                    cfg = json.load(f)
+                # A refused open is retried first (an AV / OneDrive hold), and a
+                # BOM / UTF-16 file decodes: neither is "corrupt".
+                cfg = json.loads(decode_bom_text(read_bytes_retrying(CONFIG_PATH)))
             except (OSError, json.JSONDecodeError, UnicodeDecodeError) as e:
                 # An existing config.json that is corrupt/unreadable would
                 # otherwise crash startup — and in the frozen windowed exe the

@@ -15,10 +15,16 @@ never a truncated mix.
 The helper RAISES on any failure (e.g. a value that cannot be serialized,
 or an I/O error), cleaning up the temp file first. Callers are expected to
 catch and log; the original file on disk is left untouched on failure.
+
+The read side: :func:`read_bytes_retrying` retries a refused open (the same
+transient lock) before a caller gives up on a file, and :func:`decode_bom_text`
+decodes a hand-edited file saved with a BOM or as UTF-16.
 """
 
+import codecs
 import itertools
 import json
+import locale
 import os
 import time
 
@@ -42,6 +48,50 @@ def _replace_with_retry(tmp: str, path: str) -> None:
             if attempt < _REPLACE_ATTEMPTS - 1:
                 time.sleep(_REPLACE_BACKOFF_S * (attempt + 1))
     raise last
+
+
+# The READ side has the same hazard: an open can be refused for a moment by the
+# same OneDrive / antivirus hold. A caller that treats a failed read as "corrupt"
+# or "empty" would then save defaults over the user's real file, so a refused
+# open is retried first. 3 x 0.15 s = 0.3 s of waiting at most, and only when the
+# read keeps failing (some callers hold a lock, some run on the Tk thread).
+READ_ATTEMPTS = 3
+READ_DELAY_S = 0.15
+
+
+def _sleep(seconds):
+    """The read retry's wait (a seam: tests replace it and never wait)."""
+    time.sleep(seconds)
+
+
+def read_bytes_retrying(path, *, attempts=READ_ATTEMPTS, delay=READ_DELAY_S):
+    """Return the bytes of ``path``. An ``OSError`` on open or read is retried,
+    ``attempts`` tries in all, ``delay`` seconds apart; the last one is re-raised.
+    A read that works the first time is one open and no wait."""
+    attempts = max(1, int(attempts))
+    for attempt in range(attempts):
+        try:
+            with open(path, "rb") as fh:
+                return fh.read()
+        except OSError:
+            if attempt >= attempts - 1:
+                raise
+            _sleep(delay)
+
+
+def decode_bom_text(raw):
+    """Decode a hand-editable text file: a UTF-8 or UTF-16 byte-order mark is
+    honoured and dropped; else UTF-8; else the locale encoding a plain ``open()``
+    used. Raises ``UnicodeDecodeError`` when none of them fits. ASCII (every file
+    the app writes itself, ``ensure_ascii=True``) decodes the same in all of them."""
+    if raw.startswith(codecs.BOM_UTF8):
+        return raw[len(codecs.BOM_UTF8):].decode("utf-8")
+    if raw.startswith((codecs.BOM_UTF16_LE, codecs.BOM_UTF16_BE)):
+        return raw.decode("utf-16")
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        return raw.decode(locale.getpreferredencoding(False))
 
 
 # A process-wide monotonic counter: combined with the pid it makes every temp
