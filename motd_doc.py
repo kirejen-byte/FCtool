@@ -51,6 +51,7 @@ from typing import Callable
 from motd_builder import (
     LINE_BREAK,
     _escape,
+    _normalize_links,
     _ordered_tags,
     channel_text,
     char_link,
@@ -978,6 +979,10 @@ def from_parsed_motd(raw_markup: str) -> Doc:
     (:func:`_strip_envelope`) -- :func:`resolve` adds it back -- so importing a
     MOTD this tool rendered and rendering it again is a fixed point.
     """
+    # A client-edited MOTD read back via ESI carries ``<a href=..>`` anchors;
+    # normalise them to the ``<url=..>`` form so the links become pills.
+    if raw_markup:
+        raw_markup = _normalize_links(raw_markup)
     return _runs_from_markup(_strip_envelope(raw_markup))
 
 
