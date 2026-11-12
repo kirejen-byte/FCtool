@@ -6590,7 +6590,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._intel_new_btn = None
         self._intel_resolver = None
         # Cyno-beacon TTL memo (system_id -> (has_beacon, monotonic_expiry)).
-        # Touched only from the intel poll thread via _check_cyno_beacon, so no
+        # Kept for the cyno-beacon check (``_check_cyno_beacon`` has no production
+        # caller now); if it is revived it must run on a single thread, so no
         # lock is needed. Spares the per-line ESI search + structure GETs when
         # the same system is named repeatedly during a spike.
         self._cyno_beacon_cache: dict[int, tuple[bool, float]] = {}

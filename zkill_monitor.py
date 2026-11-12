@@ -750,13 +750,29 @@ class ZKillMonitor:
                 elif self._is_crossing_or_cap_escalation(alert, prev):
                     # The first alert the consumer's display filter lets
                     # through (or a capitals escalation): deliver it once as a
-                    # FIRST alert and re-base the record on it.
+                    # FIRST alert and re-base the record on it. A capitals
+                    # escalation of a fight the user already saw (previous
+                    # record at or above the display threshold) reads as an
+                    # update.
+                    if (alert.capitals_involved and not prev.get("caps")
+                            and self._prev_was_displayed(prev)):
+                        alert.is_update = True
                     self._alerted_systems[alert.system_id] = {
                         "time": alert.timestamp,
                         "pilots": alert.pilots_on_field,
                         "caps": bool(alert.capitals_involved),
                     }
                     self.on_alert(alert)
+
+    def _prev_was_displayed(self, prev: dict) -> bool:
+        """True when the previous record was already at or above the display
+        threshold (the user saw that fight). False if the threshold is unavailable."""
+        if self._display_min_pilots is None:
+            return False
+        try:
+            return prev["pilots"] >= int(self._display_min_pilots())
+        except Exception:
+            return False
 
     def _is_crossing_or_cap_escalation(self, alert, prev: dict) -> bool:
         """True when a muted existing-fight alert must still be delivered.
