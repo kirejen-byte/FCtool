@@ -328,6 +328,12 @@ REPORTABLE_CATEGORIES = frozenset({
     fit_sim.CATEGORY_CHARGE, fit_sim.CATEGORY_DRONE,
 })
 
+#: Fighters (SDE category 87).  The parser puts them in CARGO and the engine
+#: does not simulate them, so a fighter stack in the cargo is reported and
+#: makes the result ``partial`` -- keyed on the stack's own category, never on
+#: the hull group (a carrier list would miss Command Carriers, group 5120).
+CATEGORY_FIGHTER = 87
+
 #: Cache bound for :func:`simulate` (spec 5.4).
 CACHE_SIZE = 512
 
@@ -493,7 +499,8 @@ class FitStats:
     #: ``(type_id, reason code)`` for every ``unmodeled`` line, in the SAME
     #: order -- the machine-readable twin of the human strings, so a formatter
     #: can re-resolve a name without re-running the simulation.  Reason codes:
-    #: ``unknown_type``, ``corrupt_row``, ``subsystem``, ``no_charge``,
+    #: ``unknown_type``, ``corrupt_row``, ``subsystem``, ``fighter`` (a
+    #: fighter type found in the cargo, one entry per type), ``no_charge``,
     #: ``no_ammo_candidate`` (a weapon the ammo policy found nothing for),
     #: ``special_effect:<id>``, ``effect:<id>``, ``unknown_buff:<id>`` (type id
     #: 0 -- a buff id is not a type id), ``links_unavailable`` (also type id 0
@@ -510,7 +517,8 @@ class FitStats:
     sde_build: int = 0
     #: True when something the engine could not model would have moved a
     #: number: a weapon, charge, drone or tank module, an unfitted charge, a
-    #: vanished fitted type, or one of SPECIAL_STAT_EFFECTS.
+    #: vanished fitted type, a T3 subsystem, fighters in the cargo, or one of
+    #: SPECIAL_STAT_EFFECTS.
     partial: bool = False
     #: DPS and volley with EVERYTHING counted, drones included, whatever the
     #: drone rule decided.  ``dps_total`` is these minus the drones when
@@ -1322,6 +1330,24 @@ def _build_fit(parsed: ParsedFit):
     return fit
 
 
+def _fighter_type_ids(parsed: ParsedFit) -> tuple:
+    """Distinct fighter type ids among the fit's cargo stacks, first-seen
+    order.  A type the table does not carry cannot be called a fighter, so it
+    is skipped (cargo is not fitted -- it never was a gap)."""
+    found: list = []
+    for stack in parsed.cargo or ():
+        type_id = stack.type_id
+        if type_id in found:
+            continue
+        try:
+            category = dogma_data.type_category(type_id)
+        except (KeyError, TypeError, ValueError):
+            continue
+        if category == CATEGORY_FIGHTER:
+            found.append(int(type_id))
+    return tuple(found)
+
+
 def _group_dps(fit, weapon_type_id: int) -> float:
     """The DPS ONE weapon group contributes to an evaluated fit.
 
@@ -1604,8 +1630,10 @@ def _unmodeled_entries(fit, name):
             report(f"{name(key[1])}: corrupt table row", key[1], "corrupt_row")
             partial = True
         elif kind == "subsystem":
+            # A T3 subsystem's slot, damage and tank bonuses are all missing.
             report(f"{name(key[1])}: subsystem not simulated", key[1],
                    "subsystem")
+            partial = True
         elif kind == "buff":
             # A buff id is not a type id, so there is nothing to re-resolve.
             report(f"unknown warfare buff {key[1]}", 0,
@@ -1656,7 +1684,8 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
            ammo_assumed: Sequence[tuple] = (),
            ammo_unavailable: Sequence[int] = (),
            ammo_unloadable: Sequence[tuple] = (),
-           ammo_note: str = "") -> FitStats:
+           ammo_note: str = "",
+           fighters: Sequence[int] = ()) -> FitStats:
     """Read DPS / volley / range / EHP off an ALREADY EVALUATED fit.
 
     ``fit`` must have been through :func:`fit_sim.evaluate` -- this function
@@ -1672,6 +1701,10 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
     be.  The default says ``as_fitted``, which is the truth for every caller
     that evaluated a fit itself.  ``ammo_note`` joins :attr:`FitStats.notes` --
     a diagnostic ("the charge you named is not in this table"), not a gap.
+
+    ``fighters`` names the fighter types in the fit's cargo (the evaluated fit
+    carries no cargo, so :func:`simulate` finds them on the parsed fit); each
+    is reported (reason ``fighter``) and makes the result ``partial``.
 
     ``disciplines`` is what was ACTUALLY applied; ``links_unavailable`` names
     the disciplines that were asked for and could not be modelled (the tier's
@@ -1689,6 +1722,13 @@ def derive(fit, profile: DamageProfile = OMNI, *, links: str = TIER_NONE,
     dps_drone, drone_volley, drone_rows = _drone_stats(fit, name)
 
     lines, items, notes, partial = _unmodeled_entries(fit, name)
+    if fighters:
+        # Fighters ride in cargo and are not simulated: a carrier's DPS is
+        # missing from the headline, so say so rather than show a quiet 0.
+        lines += [f"{name(type_id)}: fighter not simulated"
+                  for type_id in fighters]
+        items += [(int(type_id), "fighter") for type_id in fighters]
+        partial = True
     if not fit.converged:
         # Rule 8 cut the fixed-point loop short, so every number below is the
         # best MAX_PASSES could do rather than a settled value. That is a
@@ -1975,7 +2015,8 @@ def simulate(parsed: ParsedFit, *, name_of: Callable[[int], str] | None,
                    links_unavailable=unavailable, name_of=name_of,
                    ammo=ammo, ammo_assumed=ammo_assumed,
                    ammo_unavailable=ammo_unavailable,
-                   ammo_unloadable=ammo_unloadable, ammo_note=ammo_note)
+                   ammo_unloadable=ammo_unloadable, ammo_note=ammo_note,
+                   fighters=_fighter_type_ids(parsed))
 
     with _cache_lock:
         # A ``clear_cache`` that landed WHILE this was computing means the
