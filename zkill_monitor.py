@@ -327,6 +327,9 @@ class EngagementTracker:
         self.friendly_ids = set(friendly_ids or [])
         # system_id -> list of (timestamp, kill_data)
         self._kills: dict[int, list[tuple[datetime, dict]]] = {}
+        # Last time systems whose kills have ALL aged out of the window were
+        # dropped from ``_kills`` (see add_kill); None until the first sweep.
+        self._last_sweep: datetime | None = None
 
     def set_friendly_ids(self, ids):
         """Replace the friendly corp/alliance id set (e.g. on standings refresh)."""
@@ -364,6 +367,15 @@ class EngagementTracker:
         self._kills[system_id] = [
             (ts, kd) for ts, kd in self._kills[system_id] if ts > cutoff
         ]
+        # Opportunistic sweep (no timer / thread): a system whose newest kill is
+        # outside the window contributes nothing to any alert, but add_kill only
+        # prunes the system it is adding to, so under watch_all every quiet
+        # system would keep its last killmail for the life of the process.
+        if self._last_sweep is None or now - self._last_sweep >= self.window:
+            self._last_sweep = now
+            for sid in [s for s, kills in self._kills.items()
+                        if s != system_id and (not kills or kills[-1][0] <= cutoff)]:
+                del self._kills[sid]
 
         # Count unique pilots involved across all kills in this system
         pilots = set()
