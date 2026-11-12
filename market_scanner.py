@@ -1682,6 +1682,7 @@ class MarketScanner:
             except Exception:
                 log.exception("[market] cache mutate failed")
                 return
+            self._prune_expired_contract_items(data)
             parent = os.path.dirname(self._cache_path)
             if parent and not os.path.isdir(parent):
                 try:
@@ -1692,6 +1693,22 @@ class MarketScanner:
                 atomic_write_json(self._cache_path, data, indent=None)
             except Exception:
                 log.exception("[market] failed to write cache: %s", self._cache_path)
+
+    @staticmethod
+    def _prune_expired_contract_items(data: dict) -> None:
+        """Drop ``contract_items`` entries past their TTL (the SAME rule the
+        readers apply: 1 h populated, the longer one for ok-empty). No reader
+        serves an expired entry or uses its etag, so removing them is invisible;
+        DEAD tombstones (served forever) and non-dict entries are left alone."""
+        items = data.get("contract_items")
+        if not isinstance(items, dict):
+            return
+        for key in [k for k, e in items.items()
+                    if isinstance(e, dict) and not e.get("dead")
+                    and _age_seconds(e.get("fetched_at")) > (
+                        CACHE_TTL_CONTRACT_ITEMS_EMPTY if e.get("empty")
+                        else CACHE_TTL_CONTRACT_ITEMS)]:
+            del items[key]
 
     def _store_snapshot(self, snap: MarketSnapshot) -> None:
         if not snap.source_id:
