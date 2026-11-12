@@ -1876,6 +1876,34 @@ class ESIAuth:
         data = self.esi_get(f"/alliances/{alliance_id}/contacts/")
         return data if isinstance(data, list) else []
 
+    # Status-aware twins of the three contact getters above, for the one caller
+    # that must tell "the list is empty" from "ESI did not answer"
+    # (StandingsCache.refresh). Each returns (rows, 200) for a list body and
+    # (None, status) otherwise; a malformed 200 body, a missing character and
+    # the no-token / request-raised path all report status 0 ("could not ask").
+    # The ids are required: the caller already knows them.
+
+    def _contacts_ex(self, path: str) -> tuple:
+        if not self._character_id:
+            return None, 0
+        data, status, _hdrs = self.esi_get_ex(path)
+        if status == 200:
+            return (data, 200) if isinstance(data, list) else (None, 0)
+        return None, status
+
+    def get_personal_contacts_ex(self) -> tuple:
+        """Like get_personal_contacts, but returns (rows_or_None, status)."""
+        return self._contacts_ex(f"/characters/{self._character_id}/contacts/")
+
+    def get_corp_contacts_ex(self, corp_id: int) -> tuple:
+        """Like get_corp_contacts(corp_id), but returns (rows_or_None, status)."""
+        return self._contacts_ex(f"/corporations/{corp_id}/contacts/")
+
+    def get_alliance_contacts_ex(self, alliance_id: int) -> tuple:
+        """Like get_alliance_contacts(alliance_id), but returns
+        (rows_or_None, status)."""
+        return self._contacts_ex(f"/alliances/{alliance_id}/contacts/")
+
     def is_fleet_boss(self) -> bool:
         """True iff the authed character is the fleet boss (can read members)."""
         return self.is_boss(self.get_fleet_info(), self._character_id)

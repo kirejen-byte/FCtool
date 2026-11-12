@@ -68,7 +68,7 @@ from intel_paste import (
     detect_and_parse,
 )
 from intel_session import IntelSession
-from standings_cache import StandingsCache
+from standings_cache import StandingsCache, StandingsRefreshError
 import intel_analyzer
 # Tagged chat-channel registry (Settings > Channels). Pure/Tk-free: it owns the
 # config["channels"] block, the Intel-tagged view Intelligence Fusion tracks and
@@ -37507,7 +37507,7 @@ $bmp.Dispose()
         """Spawn a daemon thread that refreshes standings if an auth becomes available.
 
         Retries every 30s for up to 5 minutes so authentication completed after
-        startup still triggers the refresh.
+        startup, or a refresh that failed (StandingsRefreshError), still lands.
         """
         import threading
         import time
@@ -37518,6 +37518,9 @@ $bmp.Dispose()
                 if auth is not None:
                     try:
                         self._standings_cache.refresh(auth)
+                    except StandingsRefreshError:
+                        time.sleep(30)    # nothing saved: retry in the loop
+                        continue
                     except Exception:
                         return
                     # Push the refreshed friendly set into the live monitor.

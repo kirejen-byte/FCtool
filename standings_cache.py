@@ -42,7 +42,15 @@ BUCKET_ENEMIES = "enemies"
 
 
 class StandingsRefreshError(RuntimeError):
-    """refresh() could not establish the owner's own corp/alliance affiliations."""
+    """refresh() could not establish the owner's own corp/alliance affiliations,
+    or a contact pull did not answer. Nothing was mutated or saved."""
+
+
+# Contact-pull statuses that mean "this list cannot be known" rather than "the
+# pull failed": 403 = the token lacks the scope, 404 = no such list. Both read
+# as an empty list and the refresh completes (today's behaviour for a user
+# without the corp/alliance contact scopes).
+_CONTACT_STATUS_EMPTY = (403, 404)
 
 
 def _coerce_id(value) -> int | None:
@@ -294,8 +302,10 @@ class StandingsCache:
         Raises:
             StandingsRefreshError: the owner's own corp/alliance could not be
                 established (no character id, the /characters/{id}/ GET failed
-                or returned something malformed). Nothing is mutated and
-                nothing is saved in that case -- see the guard below.
+                or returned something malformed), or -- on an auth with the
+                status-aware ``get_*_contacts_ex`` fetchers -- a contact pull
+                did not answer (see ``_status_rows``). Nothing is mutated and
+                nothing is saved in either case.
         """
         friendly: set[int] = set()
         hostile: set[int] = set()
@@ -351,24 +361,30 @@ class StandingsCache:
         # instead of three. A character with no alliance simply omits the
         # alliance getter (today's get_alliance_contacts returns an empty list
         # for that case, so the contribution is identical).
-        getters: list = [("get_personal_contacts", auth.get_personal_contacts)]
-        getters.append(
-            ("get_corp_contacts",
-             lambda cid=own_corp_id: auth.get_corp_contacts(cid))
-        )
+        pulls: list = [("get_personal_contacts", ())]
+        pulls.append(("get_corp_contacts", (own_corp_id,)))
         if own_alliance_id:
-            getters.append(
-                ("get_alliance_contacts",
-                 lambda aid=own_alliance_id: auth.get_alliance_contacts(aid))
-            )
+            pulls.append(("get_alliance_contacts", (own_alliance_id,)))
         # else: character has no alliance -> skip the call entirely.
 
-        for name, getter in getters:
-            try:
-                rows = getter() or []
-            except (OSError, ValueError, RuntimeError) as exc:
-                print(f"[standings_cache] {name} failed: {exc}", file=sys.stderr)
-                rows = []
+        for name, args in pulls:
+            # Status-aware path (the real ESIAuth): a pull that did not answer
+            # must not be read as "no contacts" -- that would stamp a blue-less
+            # cache fresh for 24h and every blue on the lost list would read as
+            # hostile. Abort like the own-corp guard above, before anything is
+            # mutated. 403 (scope not granted) and 404 are a legitimate "cannot
+            # know": that list contributes nothing and the refresh completes.
+            # Auths without the _ex methods keep the legacy path below.
+            ex = getattr(auth, f"{name}_ex", None)
+            if callable(ex):
+                rows = self._status_rows(name, ex, args, own_char_id)
+            else:
+                try:
+                    rows = getattr(auth, name)(*args) or []
+                except (OSError, ValueError, RuntimeError) as exc:
+                    print(f"[standings_cache] {name} failed: {exc}",
+                          file=sys.stderr)
+                    rows = []
             for row in rows:
                 cid = row.get("contact_id")
                 standing = row.get("standing", 0)
@@ -399,6 +415,31 @@ class StandingsCache:
         self.fetched_at = datetime.now(timezone.utc)
         self.source_character_id = own_char_id
         self.save()
+
+    @staticmethod
+    def _status_rows(name, ex, args, own_char_id) -> list:
+        """Rows from one status-aware contact pull, or StandingsRefreshError.
+
+        200 with a list = the rows; 403 / 404 = an empty list; anything else
+        (status 0 = no response / no token, 5xx, 420, 429, a malformed body,
+        the fetcher raising) is a failed pull that aborts the refresh."""
+        try:
+            rows, status = ex(*args)
+        except Exception as exc:
+            rows, status = None, f"error {exc!r}"
+        if status == 200 and isinstance(rows, list):
+            return rows
+        if status in _CONTACT_STATUS_EMPTY:
+            return []
+        log.warning(
+            "standings refresh aborted: %s did not answer (status %s) for "
+            "character_id=%r; cache left untouched",
+            name, status, own_char_id,
+        )
+        raise StandingsRefreshError(
+            f"{name} did not answer (ESI status {status}); "
+            "standings left unchanged"
+        )
 
     def age_string(self) -> str:
         if self.fetched_at is None:
