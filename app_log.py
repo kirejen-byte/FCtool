@@ -127,7 +127,10 @@ def log_uncaught(exc_type, exc, tb, source: str = "") -> bool:
 def _wrap_sys_hook(prev):
     def _fctool_excepthook(exc_type, exc, tb):
         log_uncaught(exc_type, exc, tb, "main thread")
-        prev(exc_type, exc, tb)
+        try:
+            prev(exc_type, exc, tb)
+        except Exception:
+            pass
     _fctool_excepthook._fctool_hook = True
     return _fctool_excepthook
 
@@ -140,7 +143,10 @@ def _wrap_thread_hook(prev):
                          f"thread {name}")
         except Exception:
             pass
-        prev(args)
+        try:
+            prev(args)
+        except Exception:
+            pass
     _fctool_threading_excepthook._fctool_hook = True
     return _fctool_threading_excepthook
 
@@ -162,11 +168,17 @@ def install_tk_exception_hook(root) -> None:
     to the root's own ``report_callback_exception`` (the default stderr print)."""
     try:
         prev = root.report_callback_exception
+        if getattr(prev, "_fctool_hook", False):
+            return
 
         def _fctool_report_callback_exception(exc_type, exc, tb):
             log_uncaught(exc_type, exc, tb, "Tk callback")
-            prev(exc_type, exc, tb)
+            try:
+                prev(exc_type, exc, tb)
+            except Exception:
+                pass
 
+        _fctool_report_callback_exception._fctool_hook = True
         root.report_callback_exception = _fctool_report_callback_exception
     except Exception:
         pass
