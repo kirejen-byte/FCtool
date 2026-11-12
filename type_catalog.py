@@ -218,14 +218,18 @@ class TypeCatalog:
         Also seeds self._cache_snapshot with the raw parsed dict so later
         writes (see _write_cache_entries) start from exactly what's on disk
         without a second read."""
-        data = self._ingest_file(self._cache_path)
+        data = self._ingest_file(self._cache_path, keep_known=True)
         if isinstance(data, dict):
             self._cache_snapshot = data
 
-    def _ingest_file(self, path: str) -> dict | None:
+    def _ingest_file(self, path: str, keep_known: bool = False) -> dict | None:
         """Parse `path` as a type-catalog JSON file, register every valid
         entry into self._by_id/_by_name, and return the raw parsed dict (or
-        None if the file is absent/unreadable/corrupt/not-a-dict)."""
+        None if the file is absent/unreadable/corrupt/not-a-dict).
+
+        ``keep_known`` (the on-disk cache): skip an id the bundled table
+        already holds, so a stub cached from ESI can never outrank a bundle
+        that knows the type properly."""
         if not path or not os.path.exists(path):
             return None
         try:
@@ -242,6 +246,8 @@ class TypeCatalog:
             except (TypeError, ValueError):
                 continue
             if not isinstance(entry, dict):
+                continue
+            if keep_known and tid in self._by_id:
                 continue
             self._register(tid, entry)
         return data
