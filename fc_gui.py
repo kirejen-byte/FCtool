@@ -25925,7 +25925,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         (mirrors _autosave_staging_system). A BLANK keyword is stored blank and
         stays blank -- that is the module's second off switch, so silently
         restoring the default here would re-arm a feature the owner disarmed."""
-        if self._collect_range_check_settings():
+        block = self.config.get("range_check")      # read only: never seeds the block
+        before = block.get("keyword") if isinstance(block, dict) else None
+        if (self._collect_range_check_settings()
+                and self._range_check_config().get("keyword") != before):
             self._save_config()
 
     # ── Fleet-chat refit command (default ON) ───────────────────────────────
@@ -33054,8 +33057,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
     def _autosave_staging_system(self, *args):
         val = self._staging_entry.get().strip()
-        self.config.setdefault("zkillboard", {})["staging_system"] = val
-        self._save_config()
+        zk = self.config.setdefault("zkillboard", {})
+        changed = zk.get("staging_system") != val     # FocusOut also fires on app deactivation
+        zk["staging_system"] = val
+        if changed:
+            self._save_config()
         # Settings' staging entry autosaves outside the main Save flow (select
         # from the autocomplete, or FocusOut) — without this, the MOTD
         # composer's staging pill only re-syncs on the next fittings sub-tab
