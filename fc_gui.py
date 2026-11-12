@@ -24759,6 +24759,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                         sys_name = info["name"]
         except Exception:
             pass
+        # Poller-thread only: the loop stamps freshness only when this is True.
+        self._overlay_loc_answered = bool(loc)
 
         # FCPreview major-implant icon: keep this character's verdict fresh on
         # the SAME pass. Deliberately NOT gated on `loc` -- what is in the
@@ -26373,7 +26375,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     st = self._overlay_build_state(
                         auth, do_online=(kind == "online"), force_ship=force_ship)
                     self._overlay_states[name] = st
-                    self._overlay_state_ts[name] = time.monotonic()
+                    # A failed /location/ keeps the carried state but NOT its
+                    # stamp, so the staleness guard can fire (the primary's
+                    # twin stamps only on success too).
+                    if (getattr(self, "_overlay_loc_answered", True)
+                            or name not in self._overlay_state_ts):
+                        self._overlay_state_ts[name] = time.monotonic()
                     last[(name, kind)] = time.monotonic()
                     stop.wait(0.2)         # stagger ESI requests
             except Exception:
