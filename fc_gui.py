@@ -23701,7 +23701,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         to (None when unknown: no backend, a raising probe, or 0) — the retop
         gate's change detector, which must fire for a foreground change to ANY
         window, not just to a tracked client. Same single probe as everything
-        else here; no extra Win32 call.
+        else here; one extra `get_pid` lookup only when the foreground is neither
+        an EVE client nor a tile.
         Fails soft to focused=True (never hide on an errored probe)."""
         from types import SimpleNamespace
         info = SimpleNamespace(active_hwnd=None, focused=True, external_hwnd=None,
@@ -23740,9 +23741,15 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             get_pid = getattr(w, "get_pid", None)
             if callable(get_pid):
                 try:
-                    info.focused = int(get_pid(fg) or 0) == os.getpid()
+                    ours_by_pid = int(get_pid(fg) or 0) == os.getpid()
                 except Exception:
-                    pass
+                    ours_by_pid = False
+                if ours_by_pid:
+                    # Ours for the hide rules, but still the "switch back"
+                    # target: the main window is where a tile click came from.
+                    info.focused = True
+                    info.external_hwnd = fg
+                    return info
         if not info.focused:
             info.external_hwnd = fg      # neither an EVE client nor ours → switch target
         return info
