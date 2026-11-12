@@ -64,6 +64,10 @@ v1 simplifications, each of them honest -- every one shows up in
 * smartbomb damage is excluded from DPS;
 * missile application (explosion radius / velocity vs a target), capacitor,
   overheating, T3 subsystems and fighters are out of scope for v1.
+
+Every module is simulated ACTIVE (the engine's rule), except one carrying an
+:data:`ONLINE_ONLY_EFFECTS` burst (the Assault Damage Control), which reads
+its passive numbers -- the same default pyfa shows.
 """
 
 from __future__ import annotations
@@ -293,6 +297,19 @@ SPECIAL_STAT_EFFECTS = {
     4928: "Reactive Armor Hardener (not simulated)",
     38: "smartbomb damage excluded",
 }
+
+#: ACTIVE effects that are a seconds-long emergency button, not a standing
+#: state -- a module carrying one is capped at ``online``, so the readout
+#: shows the PASSIVE numbers (pyfa's default too: its ``activeStateLimit``).
+#: 7012 ``moduleBonusAssaultDamageControl``: the burst postAssigns the
+#: module's OWN twelve resonances to attribute 2746 (0.25), and the online
+#: effect 2302 then multiplies those onto the ship -- counted as permanent,
+#: an ADC fit showed shield/armor EHP ~3.6x too high.  Data shape (read off
+#: the shipped table, guarded by a golden census test): category 1, every
+#: row an ``itemID`` postAssign -- the only such effect today.
+ONLINE_ONLY_EFFECTS = frozenset({
+    7012,    # moduleBonusAssaultDamageControl
+})
 
 #: v2 watchlist -- ``moduleBonusMicrowarpdrive`` 6730 and
 #: ``moduleBonusAfterburner`` 6731 belong in ``SPECIAL_STAT_EFFECTS`` the moment
@@ -1289,6 +1306,22 @@ def _reloaded(parsed: ParsedFit, charges: dict) -> ParsedFit:
                      name_hint=parsed.name_hint)
 
 
+def _build_fit(parsed: ParsedFit):
+    """:func:`fit_sim.build_fit`, with every module carrying one of
+    :data:`ONLINE_ONLY_EFFECTS` capped at ``online`` (its charge too, which
+    always shares its module's state).  The ONE way this layer builds a fit,
+    so the ammo search and the readout agree.  Offline modules stay offline;
+    every other module keeps the engine's ``active``."""
+    fit = fit_sim.build_fit(parsed)
+    for item in fit.modules:
+        if item.state == fit_sim.STATE_ACTIVE and \
+                not ONLINE_ONLY_EFFECTS.isdisjoint(item.effects):
+            item.state = fit_sim.STATE_ONLINE
+            if item.charge is not None:
+                item.charge.state = fit_sim.STATE_ONLINE
+    return fit
+
+
 def _group_dps(fit, weapon_type_id: int) -> float:
     """The DPS ONE weapon group contributes to an evaluated fit.
 
@@ -1386,7 +1419,7 @@ def _choose_ammo(parsed: ParsedFit, name):
         for candidate in found:
             chosen[weapon_id] = candidate
             evaluated = fit_sim.evaluate(
-                fit_sim.build_fit(_reloaded(parsed, chosen)))
+                _build_fit(_reloaded(parsed, chosen)))
             scored.append((_group_dps(evaluated, weapon_id), candidate))
         chosen[weapon_id] = _best_candidate(scored, name)
 
@@ -1909,7 +1942,7 @@ def simulate(parsed: ParsedFit, *, name_of: Callable[[int], str] | None,
         ammo_unavailable, ammo_assumed = (), ()
         effective = parsed
 
-    fit = fit_sim.build_fit(effective)
+    fit = _build_fit(effective)
     unavailable: tuple = ()
     if links == TIER_NONE:
         # No booster, no discipline: the mode is validated but never resolved,
