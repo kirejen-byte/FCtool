@@ -1799,6 +1799,8 @@ class MapTab:
 
     def on_hidden(self) -> None:
         self._hover_cancel()                 # never leave a tooltip over a hidden tab
+        if not self._visible:
+            return       # not the tab being left: a switch between two OTHER tabs
         if self.renderer is None:
             # Hidden before the first show: the camera is still at fresh
             # defaults (the fit-universe sentinel hasn't been applied yet).
