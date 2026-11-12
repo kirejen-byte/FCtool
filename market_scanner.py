@@ -163,6 +163,23 @@ def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
 
+def is_failed_pull(snap) -> bool:
+    """True when ``snap`` came from an order pull that FAILED (the scan swallowed
+    an error and got no usable book): tagged ``orders_incomplete`` AND empty.
+    A genuinely empty but successful pull carries no tag, so it is not 'failed'."""
+    return (not getattr(snap, "depth", None)
+            and "orders_incomplete" in (getattr(snap, "degraded", None) or []))
+
+
+def keep_previous_snapshot(snap, previous) -> bool:
+    """True when a failed order pull must NOT replace ``previous`` (the last good
+    snapshot of the SAME source). A first-ever scan (no previous) applies as
+    before. One rule for the disk store and both GUI apply sites."""
+    if previous is None or not is_failed_pull(snap):
+        return False
+    return getattr(previous, "source_id", None) == getattr(snap, "source_id", None)
+
+
 def _emit_progress(progress, payload: dict) -> None:
     """Invoke an optional progress callback, swallowing ANY exception it raises.
 
@@ -724,7 +741,15 @@ class MarketScanner:
             scanned_type_ids=(tid_set if targeted else None),
             scope_label=((scope_label or "") if targeted else ""),
         )
-        self._store_snapshot(snap)
+        # A FAILED pull (tagged + empty) must not overwrite the last good cached
+        # snapshot of this source: keep it on disk (the return value and the
+        # "orders_incomplete" warning are unchanged; the GUI guards its own
+        # in-memory apply with the same rule). First scan ever: store as before.
+        if keep_previous_snapshot(snap, self.load_snapshot(source.source_id)):
+            log.warning("[market] order pull failed; keeping the last good "
+                        "snapshot for source %s", source.source_id)
+        else:
+            self._store_snapshot(snap)
         # Analysis-ready hand-off: the depth snapshot is fully built and cached,
         # so hand the finished object to any live consumer NOW. This is the seam
         # that lets the GUI paint doctrine/fit availability from ORDER data before

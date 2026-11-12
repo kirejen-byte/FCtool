@@ -40049,6 +40049,13 @@ $bmp.Dispose()
             return
         if not getattr(self, "_market_scanning", False):
             return  # scan already completed → don't stomp the final view
+        import market_scanner
+        if market_scanner.keep_previous_snapshot(
+                snap, getattr(self, "_market_snapshot", None)):
+            # Failed order pull: keep the last good book, still show the warning.
+            self._market_degraded_reasons = list(getattr(snap, "degraded", []) or [])
+            self._refresh_market_status_labels()
+            return
         self._market_snapshot = snap
         self._market_from_cache = False
         self._market_degraded_reasons = list(getattr(snap, "degraded", []) or [])
@@ -40093,7 +40100,13 @@ $bmp.Dispose()
             except Exception:
                 pass
             self._market_tick_after_id = None
-        if snap is not None:
+        import market_scanner
+        if snap is not None and market_scanner.keep_previous_snapshot(
+                snap, getattr(self, "_market_snapshot", None)):
+            # Failed order pull: keep the last good book and its scan stamp, but
+            # still surface the "orders_incomplete" warning.
+            self._market_degraded_reasons = list(getattr(snap, "degraded", []) or [])
+        elif snap is not None:
             self._market_snapshot = snap
             self._market_from_cache = False
             self._market_scan_ts = datetime.now()
