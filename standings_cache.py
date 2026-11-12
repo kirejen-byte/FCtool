@@ -47,10 +47,17 @@ class StandingsRefreshError(RuntimeError):
 
 
 # Contact-pull statuses that mean "this list cannot be known" rather than "the
-# pull failed": 403 = the token lacks the scope, 404 = no such list. Both read
-# as an empty list and the refresh completes (today's behaviour for a user
-# without the corp/alliance contact scopes).
-_CONTACT_STATUS_EMPTY = (403, 404)
+# pull failed": any 4xx EXCEPT the ones about auth or rate limits (401 = the
+# token is bad, 420 = error-limited, 429 = rate-limited), which are transient or
+# fixable and abort. 403 (no scope) and 404 (no such list) are the usual cases;
+# a deterministic 400 / 422 must not block standings for the whole session. All
+# of them read as an empty list and the refresh completes.
+_CONTACT_STATUS_ABORT_4XX = (401, 420, 429)
+
+
+def _contact_status_is_empty(status) -> bool:
+    return (isinstance(status, int) and not isinstance(status, bool)
+            and 400 <= status < 500 and status not in _CONTACT_STATUS_ABORT_4XX)
 
 
 def _coerce_id(value) -> int | None:
@@ -420,8 +427,9 @@ class StandingsCache:
     def _status_rows(name, ex, args, own_char_id) -> list:
         """Rows from one status-aware contact pull, or StandingsRefreshError.
 
-        200 with a list = the rows; 403 / 404 = an empty list; anything else
-        (status 0 = no response / no token, 5xx, 420, 429, a malformed body,
+        200 with a list = the rows; a 4xx other than 401 / 420 / 429 = an empty
+        list; anything else (status 0 = no response / no token, 5xx, 401, 420,
+        429, a malformed body,
         the fetcher raising) is a failed pull that aborts the refresh."""
         try:
             rows, status = ex(*args)
@@ -429,7 +437,7 @@ class StandingsCache:
             rows, status = None, f"error {exc!r}"
         if status == 200 and isinstance(rows, list):
             return rows
-        if status in _CONTACT_STATUS_EMPTY:
+        if _contact_status_is_empty(status):
             return []
         log.warning(
             "standings refresh aborted: %s did not answer (status %s) for "
