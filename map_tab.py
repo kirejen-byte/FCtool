@@ -4288,8 +4288,10 @@ class MapTab:
         is what lets the analyzer see WHICH sub-stage a given spike landed in (probe:
         the stall lands on overlay or itemconfig far more often than PhotoImage)."""
         self._gesture_inflight = False
-        if not self._visible:
-            self._last_crisp_sig = None  # a dropped frame must not block its re-request
+        if sig is not None and sig == getattr(self, "_last_crisp_sig", None):
+            # The memo'd request has landed (applied OR dropped): it is no longer
+            # "in flight", so a dropped frame can never block its own re-request.
+            self._last_crisp_sig = None
         if not self._visible or not self.state.is_current(generation):
             return                       # dropped -> _applied_sig stays unrecorded
         tele = self._tele
