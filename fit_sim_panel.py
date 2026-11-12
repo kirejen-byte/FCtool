@@ -473,6 +473,8 @@ def format_stats(stats) -> list:
     in or out per the owner's rule), never the raw ones: one headline per
     stat, and the raw total is a hover on the DPS row (:func:`dps_tip`). The
     Ammo rows sit under Range because they qualify exactly those weapons.
+    A partial result marks DPS, Volley AND the EHP total with
+    :data:`PARTIAL_MARK` -- most partial causes are tank gaps.
     """
     mark = PARTIAL_MARK if stats.partial else ""
     rows = [
@@ -485,7 +487,7 @@ def format_stats(stats) -> list:
     for index, line in enumerate(format_ammo_lines(stats)):
         rows.append(("Ammo" if index == 0 else "", line))
     rows.append(
-        ("EHP", f"{format_number(stats.ehp_total)}  "
+        ("EHP", f"{mark}{format_number(stats.ehp_total)}  "
                 f"(S {format_number(stats.ehp_shield)}"
                 f" · A {format_number(stats.ehp_armor)}"
                 f" · H {format_number(stats.ehp_hull)})"))
