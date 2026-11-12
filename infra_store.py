@@ -210,8 +210,10 @@ class InfraStore:
             if not os.path.exists(self.path):
                 return
             try:
-                with open(self.path, encoding="utf-8") as fh:
-                    data = json.load(fh)
+                # A refused open (AV / OneDrive hold) is retried before the store
+                # is called unreadable: 0.3 s at most, as this runs under the lock
+                # and can be on the Tk thread. Decoding is strict UTF-8 as before.
+                data = json.loads(app_io.read_bytes_retrying(self.path).decode("utf-8"))
             except (OSError, ValueError, UnicodeDecodeError):
                 # ValueError covers json.JSONDecodeError.
                 log.warning("Infrastructure store at %s is unreadable; "
