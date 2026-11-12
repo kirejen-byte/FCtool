@@ -163,6 +163,16 @@ def is_name_cached(entity_id: int, category: str) -> bool:
     return (category, entity_id) in _name_cache
 
 
+def is_name_known(entity_id: int, category: str) -> bool:
+    """True when ``resolve_name`` would answer without any HTTP call: the id is
+    in the permanent cache, or has an unexpired transient-failure entry."""
+    key = (category, entity_id)
+    if key in _name_cache:
+        return True
+    neg = _name_neg_cache.get(key)
+    return neg is not None and time.monotonic() < neg[1]
+
+
 def prime_names(entries) -> None:
     """Seed the permanent name cache from ``(category, id, name)`` rows (a bulk
     resolve elsewhere), so the per-id ``resolve_name`` path hits the cache."""

@@ -1229,10 +1229,10 @@ class ESIAuth:
         instead of doing one serial GET per pilot. A failed or odd bulk answer
         is silently skipped: the per-member path then resolves as before."""
         try:
-            from zkill_monitor import is_name_cached, prime_names
+            from zkill_monitor import is_name_known, prime_names
             ids = sorted({m["character_id"] for m in members
                           if m.get("character_id") and m.get("solar_system_id")
-                          and not is_name_cached(m["character_id"], "character")})
+                          and not is_name_known(m["character_id"], "character")})
             for i in range(0, len(ids), 1000):
                 data = ESIAuth.esi_post_public("/universe/names/", ids[i:i + 1000])
                 if isinstance(data, list):
