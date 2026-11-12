@@ -2263,6 +2263,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
     def _resolve_ansiblex_async(self):
         """Resolve Ansiblex system name pairs to ID pairs in background."""
         pairs = self.config.get("ansiblex_connections", [])
+        # Generation counter: a late worker from an earlier save must not write
+        # its stale result over a newer call's (or the cleared) caches.
+        gen = self._ansiblex_resolve_gen = getattr(self, "_ansiblex_resolve_gen", 0) + 1
         if not pairs:
             self._ansiblex_connections = []
             self._ansiblex_id_pairs = {}
@@ -2280,6 +2283,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                         id_pairs[(id1, id2)] = (pair[0], pair[1])
                         id_pairs[(id2, id1)] = (pair[1], pair[0])
                         print(f"[Ansiblex] Resolved: {pair[0]} <-> {pair[1]} ({id1}|{id2})")
+            if gen != getattr(self, "_ansiblex_resolve_gen", gen):
+                return          # superseded by a newer save
             self._ansiblex_connections = resolved
             self._ansiblex_id_pairs = id_pairs
             print(f"[Ansiblex] {len(resolved)} gate(s) configured")
