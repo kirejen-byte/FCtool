@@ -428,8 +428,8 @@ class StandingsCache:
         """Rows from one status-aware contact pull, or StandingsRefreshError.
 
         200 with a list = the rows; a 4xx other than 401 / 408 / 420 / 429 = an empty
-        list; anything else (status 0 = no response / no token, 5xx, 401, 420,
-        429, a malformed body,
+        list; anything else (status 0 = no response / no token, 5xx, 401, 408,
+        420, 429, a malformed body,
         the fetcher raising) is a failed pull that aborts the refresh."""
         try:
             rows, status = ex(*args)
