@@ -23733,6 +23733,17 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             pass
         info.focused = fg in our
         if not info.focused:
+            # ``winfo_id()`` is the inner TkChild, never the top-level the
+            # foreground probe returns, so also accept any window of THIS
+            # process (the main window, dialogs). Backends without ``get_pid``
+            # keep the hwnd comparison above.
+            get_pid = getattr(w, "get_pid", None)
+            if callable(get_pid):
+                try:
+                    info.focused = int(get_pid(fg) or 0) == os.getpid()
+                except Exception:
+                    pass
+        if not info.focused:
             info.external_hwnd = fg      # neither an EVE client nor ours → switch target
         return info
 
