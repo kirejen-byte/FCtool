@@ -48,11 +48,11 @@ class StandingsRefreshError(RuntimeError):
 
 # Contact-pull statuses that mean "this list cannot be known" rather than "the
 # pull failed": any 4xx EXCEPT the ones about auth or rate limits (401 = the
-# token is bad, 420 = error-limited, 429 = rate-limited), which are transient or
-# fixable and abort. 403 (no scope) and 404 (no such list) are the usual cases;
+# token is bad, 408 = timeout, 420 = error-limited, 429 = rate-limited), which
+# are transient or fixable and abort. 403 (no scope) and 404 (no such list) are the usual cases;
 # a deterministic 400 / 422 must not block standings for the whole session. All
 # of them read as an empty list and the refresh completes.
-_CONTACT_STATUS_ABORT_4XX = (401, 420, 429)
+_CONTACT_STATUS_ABORT_4XX = (401, 408, 420, 429)
 
 
 def _contact_status_is_empty(status) -> bool:
@@ -427,7 +427,7 @@ class StandingsCache:
     def _status_rows(name, ex, args, own_char_id) -> list:
         """Rows from one status-aware contact pull, or StandingsRefreshError.
 
-        200 with a list = the rows; a 4xx other than 401 / 420 / 429 = an empty
+        200 with a list = the rows; a 4xx other than 401 / 408 / 420 / 429 = an empty
         list; anything else (status 0 = no response / no token, 5xx, 401, 420,
         429, a malformed body,
         the fetcher raising) is a failed pull that aborts the refresh."""
