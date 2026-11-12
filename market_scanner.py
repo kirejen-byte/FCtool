@@ -1113,6 +1113,11 @@ class MarketScanner:
           "from_cache": k, "matches": m}`` — at the end.
         """
         t0 = time.monotonic()
+        # A fit listed twice in a doctrine arrives twice: de-dupe by id (first
+        # wins) so its contract matches are not appended once per listing.
+        _seen_fit_ids: set = set()
+        fits = [f for f in fits
+                if f.id not in _seen_fit_ids and not _seen_fit_ids.add(f.id)]
         matches: dict[str, list[ContractMatch]] = {f.id: [] for f in fits}
         scanned = 0
         from_cache = 0
