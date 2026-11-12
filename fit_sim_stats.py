@@ -156,6 +156,7 @@ ATTR = {
     "droneBandwidth": 1271,                 # on the ship
     "droneBandwidthUsed": 1272,             # on the drone
     "maxActiveDrones": 352,                 # on the ship
+    "fighterCapacity": 2055,                # on the ship; > 0 = can launch fighters
     # TANK MARKERS -- what a module DECLARES when it is tank gear.  Read off
     # real SDE rows, not guessed (1600mm Steel Plates II 20353 -> 1159; Large
     # Shield Extender II 3841 -> 72, which the SDE calls capacityBonus, NOT
@@ -1345,8 +1346,14 @@ def _build_fit(parsed: ParsedFit):
 
 def _fighter_type_ids(parsed: ParsedFit) -> tuple:
     """Distinct fighter type ids among the fit's cargo stacks, first-seen
-    order.  A type the table does not carry cannot be called a fighter, so it
-    is skipped (cargo is not fitted -- it never was a gap)."""
+    order -- but ONLY on a hull with fighter capacity (``fighterCapacity`` 2055
+    > 0).  A hauler carrying fighters as freight has complete numbers; an
+    unknown hull or a missing attribute means no capacity.  A type the table
+    does not carry cannot be called a fighter, so it is skipped (cargo is not
+    fitted -- it never was a gap)."""
+    ship_attrs = _type_attrs_or_empty(parsed.ship_type_id)
+    if _type_attr(ship_attrs, ATTR["fighterCapacity"]) <= 0.0:
+        return ()
     found: list = []
     for stack in parsed.cargo or ():
         type_id = stack.type_id
