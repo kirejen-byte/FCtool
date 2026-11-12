@@ -40,8 +40,8 @@ import overview_schema
 # (stateColorsNameList: state-key -> color NAME) against the live ``stateColors``
 # (state-key -> RGBA 4-tuple) decoded from the owner's real core_user files.
 # All 15 golden keys joined with ZERO conflicts and the RGBA values were
-# IDENTICAL across three independent accounts (core_user_2499436 / _12447433 /
-# _7335517), so these five are a stable, cross-account-verified mapping. This is
+# IDENTICAL across three independent accounts, so these five are a stable,
+# cross-account-verified mapping. This is
 # the {blue, darkBlue, orange, red, white} floor the research pinned (R §U6);
 # extend it as future packs surface more names. Unknown RGBA falls back to the
 # nearest-Euclidean name and the exact RGBA is recorded in LiveNotes.
