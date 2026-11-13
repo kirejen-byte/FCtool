@@ -430,15 +430,17 @@ _LEARNING_TOP_TIER = re.compile(r"-\s*improved\s*$", re.IGNORECASE)
 
 #: Trailing hardwiring code, e.g. "... Shield Upgrades SU-606" -> "606".
 _HARDWIRING_CODE = re.compile(r"\b[A-Z]{2,4}-(\d{3,4})$")
-#: Same code, DASH-LESS: the legacy Zainou 'Sharpshooter' missile line ships as
-#: "... ZMX10" / "ZMX11" / "ZMX100" / "ZMX110" / "ZMX1000" / "ZMX1100" (group
-#: 746, typeIDs 3149-3151 + 27204-27206). Without this they parse as code-LESS
-#: and are therefore treated as named rares — six cheap implants nagging in the
-#: default mode, which is the expensive error direction. Kept as a SEPARATE
-#: pattern rather than making the dash optional so the dashed form's behaviour
-#: is bit-for-bit unchanged: verified against the bundled SDE, these two
-#: patterns together reclassify exactly those 6 types and nothing else (the
-#: dash-optional variant additionally swallowed "Genolution 'Auroral' AU-79").
+#: Same code, DASH-LESS. Written for the legacy Zainou 'Sharpshooter' missile
+#: line, which shipped as "... ZMX10" / "ZMX11" / "ZMX100" / "ZMX110" /
+#: "ZMX1000" / "ZMX1100" (group 746, typeIDs 3149-3151 + 27204-27206): without
+#: it those six parsed as code-LESS and were treated as named rares. CCP has
+#: since renamed them "Zainou 'Snapshot' XL Torpedoes XT-601" .. "XT-606", so
+#: the DASHED pattern above now grades them like any other family, and on the
+#: bundled names (SDE 3693310) this pattern matches no implant at all -- its
+#: one hit there is a drone, "'Subverted' JVN-UC49". It stays as a guard for a
+#: dash-less code. It is a SEPARATE pattern rather than an optional dash so the
+#: dashed form's behaviour is bit-for-bit unchanged (the dash-optional variant
+#: also swallowed "Genolution 'Auroral' AU-79").
 _HARDWIRING_CODE_NODASH = re.compile(r"\b[A-Z]{2,4}(\d{2,4})$")
 
 
