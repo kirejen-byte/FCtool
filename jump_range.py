@@ -5,6 +5,7 @@ capital jump drive range using system coordinates.
 """
 
 import csv
+import hashlib
 import io
 import json
 import math
@@ -31,7 +32,8 @@ _CACHE_DIR = app_dir()
 _ROUTE_CACHE_FILE = os.path.join(_CACHE_DIR, "routes_cache.json")
 _SYSTEM_CACHE_FILE = os.path.join(_CACHE_DIR, "esi_cache.json")
 
-_route_disk_cache: dict[str, list[int]] = {}
+# Route key -> path ([] = no route); plus one str entry, _GRAPH_FP_KEY.
+_route_disk_cache: dict[str, list[int] | str] = {}
 _system_disk_cache: dict[str, dict] = {}  # system_id -> {position, name, ...}
 _system_name_cache: dict[str, int] = {}   # lowered name -> system_id
 # In-memory only (never persisted): lowered names ESI has definitively
@@ -372,6 +374,56 @@ def search_system(name: str) -> int | None:
     return None
 
 
+# -- Route cache <-> stargate graph fingerprint --------------------------------
+# routes_cache.json keeps every route (and every "no route" []) forever, so a
+# refreshed stargate graph (a new bundle after a CCP patch) must invalidate
+# it. The cache carries the fingerprint of the graph its routes came from
+# under _GRAPH_FP_KEY; a different (or absent) fingerprint drops every cached
+# route, once per process, before the first lookup. The key never collides
+# with a route key ("o:d[:conns]"), an older build never looks it up, and the
+# fc_gui Ansiblex purge (keys with ':' and '|') never matches it.
+_GRAPH_FP_KEY = "__graph__"
+_route_graph_checked = False
+
+
+def _graph_fingerprint(graph: dict[int, set[int]]) -> str | None:
+    """'<systems>:<links>:<sha1 prefix>' of a stargate graph; None if empty."""
+    if not graph:
+        return None
+    h = hashlib.sha1()
+    n_dir = 0
+    for sid in sorted(graph):
+        nbrs = sorted(graph[sid])
+        n_dir += len(nbrs)
+        h.update(f"{sid}:{','.join(map(str, nbrs))};".encode("ascii"))
+    return f"{len(graph)}:{n_dir // 2}:{h.hexdigest()[:12]}"
+
+
+def _check_route_cache_graph() -> None:
+    """Drop the cached routes when they came from a different stargate graph.
+
+    Runs once per process (one bool test afterwards). It loads the graph
+    itself, so it covers both the disk and the download branch of
+    _load_stargate_graph and runs BEFORE any cache lookup. With no graph at
+    all there is nothing to compare: the cache is left as it is."""
+    global _route_graph_checked, _cache_dirty
+    if _route_graph_checked:
+        return
+    _load_stargate_graph()                  # outside _cache_lock: may download
+    fp = _graph_fingerprint(_stargate_graph)
+    with _cache_lock:
+        if _route_graph_checked:
+            return
+        _route_graph_checked = True
+        if fp is None or _route_disk_cache.get(_GRAPH_FP_KEY) == fp:
+            return
+        dropped = sum(1 for k in _route_disk_cache if k != _GRAPH_FP_KEY)
+        _route_disk_cache.clear()           # in place: fc_gui holds this dict
+        _route_disk_cache[_GRAPH_FP_KEY] = fp
+        _cache_dirty = True
+    log.info("Stargate graph changed (%s); dropped %d cached routes", fp, dropped)
+
+
 def get_stargate_route(origin_id: int, destination_id: int,
                        preference: str = "shortest",
                        connections: list[str] | None = None) -> list[int] | None:
@@ -380,12 +432,15 @@ def get_stargate_route(origin_id: int, destination_id: int,
     Excludes Zarzakh (ESI treats its gates as normal stargates but in-game
     autopilot does not route through Zarzakh).
 
-    Uses persistent disk cache since stargate topology doesn't change.
+    Uses a persistent disk cache, valid for one stargate graph: the cache is
+    dropped once when the loaded graph's fingerprint differs from the one it
+    was built with (_check_route_cache_graph).
 
     connections: optional list of Ansiblex pairs as "id1|id2" strings.
                  These are added as extra edges in the BFS graph.
     """
     global _cache_dirty
+    _check_route_cache_graph()
     # Include connections in cache key so Ansiblex routes cache separately
     conn_suffix = ""
     if connections:
