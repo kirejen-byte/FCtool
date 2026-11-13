@@ -13,7 +13,7 @@ other fit.  The only hand-curated data here is :data:`TIER_PRESETS`: WHICH type
 ids make up each tier.  Everything downstream of those ids is dogma.
 
 How a burst's strength is assembled (read off the shipped table, SDE build
-3494416 -- spec Appendix A.6 / A.7)::
+3494416, re-checked on 3693310 -- spec Appendix A.6 / A.7)::
 
     module warfareBuff{N}Value      T1 1.0        T2 1.25       (base attribute)
       postMul  by the CHARGE's warfareBuff{N}Multiplier (+-8), effect 6737,

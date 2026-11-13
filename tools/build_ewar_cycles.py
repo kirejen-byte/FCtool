@@ -31,7 +31,8 @@ fire every 20 s and jam for 5 s, and what an icon has to show is the jam, so
 that is the number baked.  It would win over an attribute 73 for the same
 reason, though no type carries both today.
 
-Measured on SDE build 3494416 (2026-10-31): 168 entries kept, 13 skipped.
+Measured on SDE build 3693310 (2026-11-12): 170 entries kept, 13 skipped
+(3494416, 2026-10-31: 168 kept, the same 13 skipped).
 
 OUTPUT: the tool rewrites only the region of ``ewar_cycles.py`` between
 :data:`BEGIN_MARKER` and :data:`END_MARKER`, so the hand-written resolver

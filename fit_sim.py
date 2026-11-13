@@ -52,7 +52,7 @@ The engine owns exactly ONE module-level cache, the All-V skill prototype set
 ``_SKILL_GAPS``, ``_SKILL_NOTES``, ``_SKILL_GATE``, plus the
 ``_SKILL_PROTOTYPES_BUILD`` / ``_SKILL_PROTOTYPES_TABLE`` identity it was built
 for).  It is BOUNDED: one
-immutable tuple of at most one Item per skill the table keeps (588 today), never
+immutable tuple of at most one Item per skill the table keeps (590 today), never
 appended to, rebuilt wholesale when a different table is installed and dropped
 by :func:`_reset_prototypes_for_tests`.  Rebuilding those ~580 items per fit was
 8 of the 9 ms :func:`build_fit` used to cost.  Per-fit skill items SHARE the
@@ -117,9 +117,11 @@ gap BOOKKEEPING only, never a number -- the gate skill is unreached either way
 future SDE regen ever lets a kept skill require that gate skill.
 
 Skill-sourced modelling gaps are NOT user-facing.  Two paths feed them, and the
-measured shipped table (588 kept skills, SDE build 3494416) says the second is
-the flood: exactly ONE skill effect carries no ``modifierInfo`` at all, while
-~334 skill effects per fit REACH NOTHING on that particular fit (a hull bonus on
+measured shipped table (588 kept skills on SDE build 3494416, 590 on 3693310)
+says the second is the flood: exactly ONE skill effect carries no
+``modifierInfo`` at all (on both builds), while ~334 skill effects per fit
+(measured on 3494416; a stock HML Drake gains 2 on 3693310)
+REACH NOTHING on that particular fit (a hull bonus on
 the wrong hull, a turret skill on a missile boat) and are recorded by
 :func:`_record_effect_gap`.  Either way they would drown a fit's own handful of
 real gaps (7 on the reference Drake), so both land in

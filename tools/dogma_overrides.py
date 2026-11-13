@@ -16,7 +16,8 @@ skill's own in-game description line, and the generator splices them into the
 table so the ENGINE stays a generic ``modifierInfo`` interpreter with no
 per-effect special cases.
 
-Census (SDE build 3494416): **7** effects carried by a category-16 type have an
+Census (SDE builds 3494416 and 3693310, unchanged): **7** effects carried by a
+category-16 type have an
 empty modifier list, across 23 skills.  Six are overridden here; one
 (848) touches nothing in the v1 stat set and is listed in
 :data:`SKILL_EFFECTS_IGNORED`.  Nothing is silently unlisted -- the generator
@@ -70,8 +71,9 @@ SELF_SKILL = -1
 #: Keyed on the PAIR: keying on the skill alone would mint ONE id for two
 #: different overridden effects carried by the same skill, and the second would
 #: silently overwrite the first's rows.  The base sits far above every real SDE
-#: effect id (measured, build 3494416: the largest is **12,975**), and the span
-#: is wider than every real type id (measured: the largest is **371,027**), so
+#: effect id (measured, build 3693310: the largest is **13,078**; 12,975 on
+#: 3494416), and the span is wider than every real type id (measured on both
+#: builds: the largest is **371,027**), so
 #: the mapping is injective and no synthetic id can ever shadow a real effect.
 OVERRIDE_EFFECT_BASE = 9_000_000
 

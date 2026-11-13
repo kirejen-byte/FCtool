@@ -112,9 +112,10 @@ MINDLINK_NAME_NEEDLE = "mindlink"
 
 #: Charge name prefix -> owning faction id (``factions.jsonl`` ``_key``).
 #:
-#: MEASURED on SDE build 3494416: ``types.jsonl`` publishes ``factionID`` for
-#: 1,376 types and NOT ONE of them is a charge (the field lands on categories
-#: 2/3/6/9/11/17/20/91 only).  Republic Fleet EMP L (21894) and Domination EMP L
+#: MEASURED on SDE build 3494416, re-checked on 3693310: ``types.jsonl``
+#: publishes ``factionID`` for 1,403 types (1,376 on 3494416) and NOT ONE of
+#: them is a charge (the field lands on categories 2/3/6/9/11/17/20/91 only).
+#: Republic Fleet EMP L (21894) and Domination EMP L
 #: (20799) are byte-for-byte indistinguishable in the SDE outside their names:
 #: same group 83, same ``metaGroupID`` 4 "Faction", same market group 987, same
 #: ``variationParentTypeID`` 201, same icon, same base price.  ``typeLists``,
@@ -129,7 +130,7 @@ MINDLINK_NAME_NEEDLE = "mindlink"
 #: which is the SAFE direction -- the consumer's navy set is a whitelist, so
 #: "unknown" reads as "not empire navy" and is excluded, never promoted.
 CHARGE_FACTION_NAME_PREFIXES = (
-    # the four empire navies (128 charges on build 3494416)
+    # the four empire navies (128 charges on builds 3494416 and 3693310)
     ("Caldari Navy ", 500001),
     ("Republic Fleet ", 500002),
     ("Imperial Navy ", 500003),
@@ -305,13 +306,14 @@ def index_types(lines: Iterable, group_categories: dict) -> TypeIndex:
     table carries no names, and holding 53k of them would be pure waste.
 
     ``metaGroupID`` is recorded ONLY where the SDE publishes one (most types --
-    39,176 of 53,000 in build 3494416 -- have none), so the assembly step can
+    39,799 of 53,925 in build 3693310 -- have none), so the assembly step can
     omit the key rather than encode a made-up 0 for every type.
 
     ``factionID`` is recorded the same way, from the SDE's own field, with ONE
     fallback: the SDE publishes that field for not a single category-8 charge
-    (measured, build 3494416), so a charge that has none is classified from its
-    name (:func:`charge_faction_from_name`) instead of being lost."""
+    (measured, builds 3494416 and 3693310), so a charge that has none is
+    classified from its name (:func:`charge_faction_from_name`) instead of
+    being lost."""
     group, category, meta, faction = {}, {}, {}, {}
     skills, burst_modules, burst_charges, mindlinks = set(), set(), set(), set()
     for rec in iter_jsonl(lines):

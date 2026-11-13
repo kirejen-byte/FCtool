@@ -23,7 +23,7 @@ error direction is the implant reminder's: a missed warning is cheap, a
 spurious nag is what gets a feature switched off. So we never GUESS a cost —
 an unknown generator answers ``None`` and the state machine stays quiet.
 
-The cost model (measured against the shipped table, SDE build 3494416)
+The cost model (measured against the shipped table, SDE build 3693310)
 -----------------------------------------------------------------------
 A generator's Liquid Ozone consumption is attribute **714**
 (``consumptionQuantity``). Two multiplicative reductions apply, and the SDE
