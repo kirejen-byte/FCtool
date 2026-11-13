@@ -342,6 +342,24 @@ REPORTABLE_CATEGORIES = frozenset({
     fit_sim.CATEGORY_CHARGE, fit_sim.CATEGORY_DRONE,
 })
 
+#: Rig Synchronizer (SDE group 5140, new in build 3693310).  Every faction
+#: module of the nine synchronizer sets (Amarr / Caldari / Federation Navy,
+#: Republic Fleet, Dark Blood, True Sansha, Dread Guristas, Shadow Serpentis,
+#: Domination -- 606 types) carries a set-contribution effect (12963-12966,
+#: 12989-12993) whose ONLY rows are ``shipID`` LocationGroupModifiers aimed at
+#: this group.  With no synchronizer fitted it reaches nothing and moves no
+#: number.
+RIG_SYNCHRONIZER_GROUP = 5140
+
+#: Target groups for which "every row aimed at this group, and nothing of the
+#: group is in the fit" means the effect had NO POSSIBLE TARGET -- the engine
+#: working correctly, not a gap (see :func:`_has_no_possible_target`).
+#: Deliberately NOT every group: the same rule over all groups would also
+#: silence 167 module/implant effects the previous table already carried (a
+#: Gyrostabilizer on a fit with no projectile turret, say) and a fitted
+#: synchronizer's own weapon bonus, changing readouts the data did not change.
+SILENT_WHEN_ABSENT_GROUPS = frozenset({RIG_SYNCHRONIZER_GROUP})
+
 #: Fighters (SDE category 87).  The parser puts them in CARGO and the engine
 #: does not simulate them, so a fighter stack in the cargo is reported and
 #: makes the result ``partial`` -- keyed on the stack's own category, never on
@@ -1564,6 +1582,30 @@ def _effect_has_modifiers(effect_id) -> bool:
     return definition is not None and bool(definition.modifiers)
 
 
+def _has_no_possible_target(effect_id, fit_groups) -> bool:
+    """Whether this effect provably had nothing to reach on this fit.
+
+    True only when the effect HAS rows, every row is a ``shipID``
+    LocationGroupModifier aimed at a group in
+    :data:`SILENT_WHEN_ABSENT_GROUPS`, and no item of any of those groups is
+    anywhere in the fit (``fit_groups``: every evaluated item, the character
+    location included).  Then the empty target set is the answer, not a
+    failure.  Anything else -- no rows, another domain or func, a target
+    group with a member in the fit that the engine still did not reach --
+    stays a gap.
+    """
+    definition = dogma_data.effect(effect_id)
+    if definition is None or not definition.modifiers:
+        return False
+    for modifier in definition.modifiers:
+        if modifier.domain != fit_sim.DOMAIN_SHIP \
+                or modifier.func != fit_sim.FUNC_LOCATION_GROUP \
+                or modifier.group_id not in SILENT_WHEN_ABSENT_GROUPS \
+                or modifier.group_id in fit_groups:
+            return False
+    return True
+
+
 def _fold_repeats(lines, items):
     """Fold repeated reports into one counted line, first-seen order kept.
 
@@ -1626,12 +1668,18 @@ def _unmodeled_entries(fit, name):
     correctly, and the user can do nothing about it.  Those go to ``notes``
     and never set ``partial``.  A hull effect with no modifierInfo IS a gap
     (the table cannot express the bonus) and stays in ``lines``.
+
+    A NON-hull effect that had no possible target at all (a synchronizer set
+    effect with no Rig Synchronizer fitted -- :func:`_has_no_possible_target`)
+    is dropped without a line or a note: it is not a gap, and naming it on
+    every faction module would only bury the real entries.
     """
     lines = []
     items = []
     notes = []
     partial = False
     by_type = _items_by_type(fit)
+    fit_groups = None       # built on first need: most fits never ask
 
     def report(text, type_id, reason):
         lines.append(text)
@@ -1678,6 +1726,10 @@ def _unmodeled_entries(fit, name):
                     and _effect_has_modifiers(effect_id):
                 notes.append(f"{name(type_id)}: effect {effect_id} "
                              f"matched nothing on this fit")
+                continue
+            if fit_groups is None:
+                fit_groups = {i.group_id for i in fit.all_items()}
+            if _has_no_possible_target(effect_id, fit_groups):
                 continue
             report(f"{name(type_id)}: effect {effect_id}", type_id,
                    f"effect:{effect_id}")
