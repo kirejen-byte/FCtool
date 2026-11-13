@@ -31,9 +31,9 @@ import math
 import re
 
 # --- BEGIN GENERATED TABLE: tools/build_ewar_cycles.py ---
-# Generated 2026-10-31 by tools/build_ewar_cycles.py from
-# fit_dogma.json.gz (SDE build 3494416, attributes 73 and 2822) + fit_types.json.
-# 168 modules kept; 13 in-scope types carry no duration and rely on
+# Generated 2026-11-12 by tools/build_ewar_cycles.py from
+# fit_dogma.json.gz (SDE build 3693310, attributes 73 and 2822) + fit_types.json.
+# 170 modules kept; 13 in-scope types carry no duration and rely on
 # the size-word fallback below:
 #   Capital Abyssal Energy Neutralizer  (no attribute 73)
 #   Capital Abyssal Energy Nosferatu  (no attribute 73)
@@ -132,6 +132,7 @@ MODULE_CYCLE_MS: dict[str, int] = {
     'Heavy Gremlin Compact Energy Neutralizer': 24000,
     'Heavy Infectious Scoped Energy Neutralizer': 24000,
     'Heavy Knave Scoped Energy Nosferatu': 10000,
+    "Horm's Capital Energy Neutralizer": 48000,
     'Hornet EC-300': 5000,
     'Humboldt EC-900-I': 5000,
     'Hypnos Scoped Magnetometric ECM': 20000,
@@ -183,6 +184,7 @@ MODULE_CYCLE_MS: dict[str, int] = {
     "Raysere's Modified Heavy Energy Nosferatu": 10000,
     "Ryhad's Modified Medium Energy Neutralizer": 12000,
     "Ryhad's Modified Medium Energy Nosferatu": 5000,
+    "Sarikusa's Capital Energy Nosferatu": 20000,
     "Selynne's Modified Heavy Energy Neutralizer": 24000,
     "Selynne's Modified Heavy Energy Nosferatu": 10000,
     'Sentient Burst Jammer': 30000,
