@@ -239,12 +239,13 @@ GENERATOR_SHORT_DEFAULT = "Cyno"
 # generator, and every hull NOT below cannot — so a group that merely sounds
 # cyno-capable (Combat Recon, Mining Barge, Exhumer, Capital Industrial,
 # Industrial Command, the T1 Frigate group at large) is deliberately absent:
-# 66 hulls that cannot fit any of the three modules.
+# 66 hulls that cannot fit any of the three modules. The one exception is the
+# Penitence (a Combat Recon), which the normal generator names individually.
 #
 # Two shapes are needed because the SDE restricts by group AND by individual
-# type — the industrial generator names five specific hulls that live in groups
-# whose other members cannot fit it (an Etana is a Logistics cruiser, a Venture
-# a plain Frigate).
+# type — the generators name specific hulls that live in groups whose other
+# members cannot fit them (an Etana is a Logistics cruiser, a Venture a plain
+# Frigate, a Penitence a Combat Recon).
 #
 # ``ship_classes.CYNO_LOSS_GROUPS`` stays a strict SUBSET (test-pinned): this
 # gate still covers every hull CynoCheck treats as a lightswitch.
@@ -269,6 +270,7 @@ CYNO_HULL_TYPE_NAMES = {
     33697: "Prospect",                  # group 1283 Expedition Frigate
     32880: "Venture",                   # group 25 Frigate
     89648: "Venture Consortium Issue",  # group 25 Frigate
+    97904: "Penitence",                 # group 906 Combat Recon; normal cyno
 }
 
 #: The gate itself. Frozen so no consumer can widen either half in place.
@@ -279,7 +281,7 @@ CYNO_HULL_TYPE_IDS = frozenset(CYNO_HULL_TYPE_NAMES)
 def is_cyno_hull(group_id, type_id=None) -> bool:
     """Can this hull mount a cynosural field generator?
 
-    True when the hull's GROUP is cyno-capable or the hull is one of the five
+    True when the hull's GROUP is cyno-capable or the hull is one of the six
     types the SDE names individually. ``type_id`` is optional so a caller that
     only has a group can still ask — but a caller that has both should pass
     both, or it will miss a Venture (group 25 is not cyno-capable at large).
