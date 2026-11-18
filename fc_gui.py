@@ -14556,9 +14556,6 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._motd_last_check_ts = None
         self._motd_last_pushed_markup = None
         self._motd_link_state = "off"
-        self._motd_autopush_failures = 0      # consecutive transient failures
-        self._motd_autopush_inflight = False  # one autopush worker at a time
-        self._motd_preview_sig = None         # what the preview shows (gate)
         # A group import applied at this start added or updated a doctrine
         # (its fits) or a MOTD template (boot flag) -- either changes what
         # the next push would send: a remembered ON starts OFF. SESSION ONLY,
@@ -14568,6 +14565,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         if self._motd_link_enabled and group_boot.boot_flag("motd_disarm"):
             self._motd_link_enabled = False
             self._motd_link_state = "group_import"
+        self._motd_autopush_failures = 0      # consecutive transient failures
+        self._motd_autopush_inflight = False  # one autopush worker at a time
+        self._motd_baseline_gen = 0           # bumped by Clear seed / manual push
+        self._motd_preview_sig = None         # what the preview shows (gate)
 
         # ── Master split: composer (left) | preview (right) ──────────────────
         body = tk.Frame(tab, bg=BG_DARK)
@@ -17090,6 +17091,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             sig = (markup, warn_text, budget, w)
             if sig == getattr(self, "_motd_preview_sig", None):
                 return                      # nothing the preview shows changed
+            # Forget the old signature BEFORE the first write: a render that
+            # fails partway leaves None, so the next rebuild draws again.
+            self._motd_preview_sig = None
 
             # Raw pane: the built markup verbatim.
             preview.config(state=tk.NORMAL)
@@ -17451,6 +17455,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         if getattr(self, "_motd_link_enabled", False):
             self._motd_link_state = "ok"
         self._motd_last_pushed_markup = markup
+        # An autopush PUT still in flight must not overwrite this baseline.
+        self._motd_baseline_gen = getattr(self, "_motd_baseline_gen", 0) + 1
         self._motd_last_push_ts = time.monotonic()
         self._motd_last_check_ts = time.monotonic()
         self._motd_update_link_indicator()
@@ -17519,6 +17525,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # worker exit posts (the quiet guard-only tick included).
         if getattr(self, "_motd_autopush_inflight", False):
             return
+        # The baseline generation at dispatch: a Clear seed or a manual push
+        # that lands while this PUT is in flight bumps it, and the newer
+        # baseline then wins over what this worker pushed.
+        gen = getattr(self, "_motd_baseline_gen", 0)
 
         def worker():
             ok = False
@@ -17565,7 +17575,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 return
             if ok:
                 self._motd_last_push_ts = time.monotonic()
-                self._motd_last_pushed_markup = pushed
+                if getattr(self, "_motd_baseline_gen", 0) == gen:
+                    self._motd_last_pushed_markup = pushed
                 self._motd_link_state = "ok"
                 self._motd_autopush_failures = 0
             elif reason == "transient" and (
@@ -17852,6 +17863,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         if getattr(self, "_motd_link_enabled", False):
             try:
                 self._motd_last_pushed_markup = self._motd_output_markup()[0]
+                # An autopush PUT still in flight must not overwrite the seed.
+                self._motd_baseline_gen = (
+                    getattr(self, "_motd_baseline_gen", 0) + 1)
             except Exception:
                 log.exception("MOTD: could not seed the baseline after Clear")
 
