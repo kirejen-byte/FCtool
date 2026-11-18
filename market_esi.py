@@ -103,6 +103,8 @@ class AuthMarketAdapter:
         self._timeout = timeout
         # A dedicated public session avoids leaking the Authorization header to
         # unauthenticated endpoints; fall back to the auth's session if none.
+        # ``rebind`` keeps an explicitly passed one and re-derives the fallback.
+        self._explicit_public = public_session
         self._public = public_session or getattr(auth, "_session", None)
         self.last_headers: dict = {}
         # cache key -> {"pages": {page_no: (etag, page_body)}, "total": n}.
@@ -137,6 +139,18 @@ class AuthMarketAdapter:
         #                 CORP route (a scope/access shortfall re-auth may fix) →
         #                 do NOT cache, retry next scan.
 
+    def rebind(self, auth) -> None:
+        """Point this adapter at a new primary character's ``auth`` (or None when
+        no character is signed in), in place.
+
+        Swaps ``_auth`` and the auth-derived public session (an explicitly passed
+        ``public_session`` is kept). The per-page ETag cache is KEPT: it holds
+        public bodies only (region orders + public contracts), which do not depend
+        on the character. Called by the GUI on the Tk thread, never while a scan
+        runs, so the scanner (and its cache lock) stays ONE object."""
+        self._auth = auth
+        self._public = self._explicit_public or getattr(auth, "_session", None)
+
     # ── Error-limit awareness (§8.2) ──────────────────────────────────────────
 
     @property
@@ -168,10 +182,16 @@ class AuthMarketAdapter:
 
     def _get_page(self, url, *, authed: bool, params=None, headers=None):
         """One rate-limited GET. Returns the ``requests`` response (or None on a
-        transport error). Captures the rate/error-limit headers."""
+        transport error). Captures the rate/error-limit headers. An authed GET
+        with no character bound (``_auth`` None) is a transport miss too."""
         from rate_limiter import rate_limit
 
-        session = self._auth._session if authed else self._public
+        if authed:
+            if self._auth is None:
+                return None
+            session = self._auth._session
+        else:
+            session = self._public
         if session is None:
             return None
         req_headers = self._headers(authed=authed)
