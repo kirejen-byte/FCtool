@@ -34667,7 +34667,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         except tk.TclError:
             pass
 
-    def _xup_apply_dps_tie(self, vm):
+    def _xup_apply_dps_tie(self, vm, alert=True):
         """Follow the fleet's DPS-ship count while tied. Tk thread only.
 
         ``vm.modeled`` is the fleet_stats rule-4 pilot count — the SAME number
@@ -34682,6 +34682,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         True, so without this the READY is silent for the rest of the round.
         True->False (the fleet grew) needs no alert.
 
+        ``alert=False`` (the re-tie of a counter _setup_modules just rebuilt)
+        moves the target silently: a Settings->Save during a READY tied
+        form-up re-judged READY against the MANUAL target first, so the
+        False->True seen here is the Save, not the fleet.
+
         Returns True when the vm carried a usable count (the target now equals
         it), False when the tie is off or there was no data to tie to."""
         if not self._xup_tie_enabled() or vm is None:
@@ -34694,7 +34699,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             return False
         counter = getattr(self, "xup_counter", None)
         was_ready = bool(counter is not None and counter.state.is_ready)
-        if (self._xup_set_threshold(n) and not was_ready
+        if (self._xup_set_threshold(n) and alert and not was_ready
                 and counter.state.is_ready
                 and getattr(self, "_xup_status", None) is not None):
             self._flash_ready(counter.state)
@@ -34711,7 +34716,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         value, spinner synced to it."""
         if not self._xup_tie_enabled():
             return
-        if self._xup_apply_dps_tie(getattr(self, "_fleet_stats_vm", None)):
+        if self._xup_apply_dps_tie(getattr(self, "_fleet_stats_vm", None),
+                                   alert=False):
             return
         carry = self._xup_manual_threshold()
         if prev_threshold is not None:
