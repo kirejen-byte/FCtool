@@ -39415,8 +39415,24 @@ $bmp.Dispose()
         """Lazily construct the MarketScanner (over a live AuthMarketAdapter on
         the primary character). Degraded/public paths work when scopes are
         missing — the adapter/scanner already handle that. Returns None only if
-        construction itself fails (missing module, no catalog)."""
+        construction itself fails (missing module, no catalog).
+
+        Follows the primary: when the primary changed since this method built
+        the scanner (``_market_scanner_auth``, set ONLY here - a grafted scanner
+        is never compared) and no scan runs, the ONE adapter is rebound in place
+        (keeps its ETag cache, the scanner and its cache lock). A disconnect
+        (``esi_auth`` None) keeps the existing binding, so public station /
+        region pulls keep working on its session."""
         if self._market_scanner is not None:
+            if (hasattr(self, "_market_scanner_auth")
+                    and self.esi_auth is not None
+                    and self._market_scanner_auth is not self.esi_auth
+                    and not getattr(self, "_market_scanning", False)):
+                try:
+                    self._market_scanner._adapter.rebind(self.esi_auth)
+                    self._market_scanner_auth = self.esi_auth
+                except Exception:
+                    log.exception("[market] adapter rebind failed")
             return self._market_scanner
         try:
             import market_scanner
@@ -39425,9 +39441,11 @@ $bmp.Dispose()
             log.exception("[market] scanner modules unavailable")
             return None
         try:
-            adapter = market_esi.AuthMarketAdapter(self.esi_auth)
+            auth = self.esi_auth
+            adapter = market_esi.AuthMarketAdapter(auth)
             self._market_scanner = market_scanner.MarketScanner(
                 adapter, self.type_catalog)
+            self._market_scanner_auth = auth
         except Exception:
             log.exception("[market] failed to construct MarketScanner")
             return None
