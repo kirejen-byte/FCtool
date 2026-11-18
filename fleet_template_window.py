@@ -1802,6 +1802,9 @@ class FleetTemplateWindow:
         self._live_structure = structure
         self._live_members = members          # already enriched on the worker
         self._prev_members = members
+        # FLEET-3: a good sync proves the boss session is back, so it lifts a
+        # boss_lost abort. A 4xx abort waits for a manual action.
+        self._clear_executor_abort(only="boss_lost")
         self._status.config(text="● Synced", fg=FG_GREEN)
         self._reload_tree()
         self._refresh_members_tab()
@@ -1898,6 +1901,7 @@ class FleetTemplateWindow:
         import time
         self._ensure_executor()
         role = self._current_role_of(char_id)
+        self._clear_executor_abort()          # FLEET-3: a manual action resumes
         self._executor.submit(MoveJob(
             pilot_id=char_id, pilot_name=self._name_of(char_id),
             wing_id=wing_id, squad_id=squad_id, role=role, source="menu"))
@@ -2035,10 +2039,26 @@ class FleetTemplateWindow:
             raise fleet_esi.FleetESIError("no_token")
         # Point the executor at the freshest session each write.
         self._executor.session = session
-        fleet_esi.move_member(session, self._fleet_id, job.pilot_id,
-                              wing_id=job.wing_id, squad_id=job.squad_id,
-                              role=job.role)
+        try:
+            fleet_esi.move_member(session, self._fleet_id, job.pilot_id,
+                                  wing_id=job.wing_id, squad_id=job.squad_id,
+                                  role=job.role)
+        except fleet_esi.FleetESIError as e:
+            # FLEET-1: hand a plain HTTP failure (420 / 429 / other 4xx, a 5xx
+            # after the retry) back as its STATUS so the executor's freeze and
+            # 3x4xx abort can see it. not_found / boss_lost / network / no_token
+            # keep raising: the executor treats those by reason.
+            if e.reason == "http_error" and e.status:
+                return e.status
+            raise
         return 204
+
+    def _clear_executor_abort(self, only=None):
+        """FLEET-3: lift the executor's abort (any reason, or only `only`).
+        Tk thread only. Logs one line when something was actually cleared."""
+        clear = getattr(self._executor, "clear_abort", None)
+        if callable(clear) and clear(only=only):
+            self._log_line("Fleet move queue resumed.")
 
     def _job_still_needed(self, job):
         """After a burst re-poll, is this pilot still not where the job wants?"""
@@ -2121,6 +2141,7 @@ class FleetTemplateWindow:
         """Build + submit MoveJobs on the Tk thread. Used directly by drag/drop
         (ids known up front) and by the Apply worker's _post callback."""
         import time
+        cleared = source == "autosort"
         for mv in moves:
             wkey = (fleet_esi.clamp_name(mv.target_wing_name)
                     if mv.target_wing_name is not None else None)
@@ -2129,6 +2150,9 @@ class FleetTemplateWindow:
             if mv.target_squad_name is not None and wing_id is not None:
                 squad_id = squad_ids.get(
                     (wkey, fleet_esi.clamp_name(mv.target_squad_name)))
+            if not cleared:
+                self._clear_executor_abort()   # FLEET-3: a manual action resumes
+                cleared = True
             self._executor.submit(MoveJob(
                 pilot_id=mv.pilot_id, pilot_name=mv.pilot_name,
                 wing_id=wing_id, squad_id=squad_id, role=mv.target_role,
