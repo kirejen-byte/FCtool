@@ -11375,8 +11375,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         cyno_check_data: dict = {}
 
+        assets_complete = False
         try:
-            assets = acct.get_assets()
+            assets, assets_complete = acct.get_assets(with_status=True)
 
             # Filter: assembled ships in personal hangars only
             _PERSONAL_FLAGS = {"Hangar", "AutoFit"}
@@ -11427,6 +11428,23 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 }
         except Exception as e:
             print(f"[Characters] Asset fetch error for {acct.character_name}: {e}")
+            assets_complete = False
+
+        # A failed or truncated pull reads as "owns nothing": keep the last good
+        # capital lists and do NOT restamp the cache, so the next fetch retries
+        # and the empty result is never persisted. With no prior entry there is
+        # nothing better to show, so today's behaviour stands.
+        if not assets_complete and cached:
+            prior = cached[2]
+            for k in ("fax", "dreads", "blops", "titans"):
+                info[k] = list(prior.get(k, []))
+            if prior.get("ship_type_id") == info["ship_type_id"]:
+                for k in ("cyno", "cyno_ozone", "cyno_lights", "cyno_text",
+                          "cyno_low", "dictor"):
+                    if k in prior:
+                        info[k] = prior[k]
+            self._inject_piloted_capital(info)
+            return info
 
         # Deduplicate: group identical (ship, location) entries with counts
         from collections import Counter
