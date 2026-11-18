@@ -92,11 +92,12 @@ log = get_logger(__name__)
 
 ZKILL_API = "https://zkillboard.com/api"
 
-# zKillboard REST returns up to 1000 mails per page (the documented hard cap).
+# zKillboard REST returns up to 200 mails per page (its real page size; a short
+# page therefore means the last page).
 # We stop a group early on the first page whose mails are entirely older than
 # the cutoff, so the exact value only bounds the worst case.
-ZKILL_PAGE_SIZE = 1000
-MAX_PAGES_PER_GROUP = 10  # safety bound: 10 * 1000 = 10000 mails/group max
+ZKILL_PAGE_SIZE = 200
+MAX_PAGES_PER_GROUP = 10  # safety bound: 10 * 200 = 2000 mails/group max
 
 LOOKBACK_DAYS = 182  # ~6 months
 
