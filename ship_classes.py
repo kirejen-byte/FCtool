@@ -571,7 +571,8 @@ def _fetch_group_name(group_id: int) -> str | None:
     """Resolve a group_id to its display name via ESI, thread-safe + cached.
 
     ESI /universe/groups/{gid}/ carries a "name" field. Any failure caches and
-    returns None so we never hammer a bad id."""
+    returns None; the None is cached but expires after 300 s so a transient
+    failure is retried."""
     if not group_id:
         return None
     with _group_name_lock:
