@@ -587,6 +587,9 @@ class KillmailFanout:
 # failure (requests.RequestException — e.g. an SSLError CDN blip). Module-level
 # so tests can patch zkill_monitor.time.sleep instead of waiting for real.
 _RETRY_DELAY = 2.0
+# Idle polls between head checks, and the gap that triggers a jump to the head.
+_HEAD_CHECK_EVERY = 20
+_HEAD_JUMP_GAP = 200
 
 
 class ZKillMonitor:
@@ -923,6 +926,7 @@ class ZKillMonitor:
               f"(lookback {lookback})")
 
         consecutive_404s = 0
+        idle_nones = 0
         catching_up = True
 
         while self._running:
@@ -939,6 +943,20 @@ class ZKillMonitor:
                         continue
                     # No new kill at this sequence — wait before retrying
                     consecutive_404s += 1
+                    idle_nones += 1
+                    if not self._running:
+                        break
+                    if idle_nones >= _HEAD_CHECK_EVERY:
+                        # A permanently missing sequence (a hole R2Z2 never
+                        # fills) would park us here forever while the head
+                        # moves on: read the head and jump to it when far behind.
+                        idle_nones = 0
+                        head = self._get_current_sequence()
+                        if head is not None and head - self._sequence > _HEAD_JUMP_GAP:
+                            print(f"[zKill] Stuck at seq {self._sequence}, head={head}; jumping to head")
+                            self._sequence = head
+                            consecutive_404s = 0
+                            continue
                     # R2Z2 docs say minimum 6 seconds on 404
                     wait = min(6 + consecutive_404s, 15)  # Cap at 15s
                     self._stop_event.wait(wait)
@@ -946,6 +964,7 @@ class ZKillMonitor:
 
                 # Got a kill — process it
                 consecutive_404s = 0
+                idle_nones = 0
                 self._kills_processed += 1
                 self._sequence += 1
 

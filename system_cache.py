@@ -205,6 +205,9 @@ def download_system_names() -> dict[str, int]:
                     systems[entry["name"]] = entry["id"]
         else:
             print(f"[SystemCache] Batch {i//batch_size + 1} failed: {resp.status_code}")
+            # A partial name table would silently hide systems until the next
+            # refresh: bail out so the bundled seed is used and we retry next launch.
+            return {}
 
         # Progress
         done = min(i + batch_size, len(kspace_ids))
