@@ -948,16 +948,17 @@ def _guidance_tag_use(tag):
 
 
 def _tag_rename_refusal(new_name):
-    """Why a tag may not be renamed TO ``new_name``, or None. An old tag name
-    (``fittings_store._TAG_RENAMES``) is rewritten to its new name every time
-    the library loads, so such a rename would quietly undo itself."""
+    """Why a tag may not be added as, or renamed TO, ``new_name``, or None. An
+    old tag name (``fittings_store._TAG_RENAMES``) is rewritten to its new name
+    every time the library loads, so such a tag would quietly fold into it.
+    Shared by Manage Tags (Add and Rename) and the Tags dialog's Add tag."""
     import fittings_store as _fittings_store
     target = _fittings_store._TAG_RENAMES.get(new_name)
     if target is None:
         return None
     return (f"'{new_name}' is an old tag name: FCTool renames it to '{target}' "
-            "every time the library loads, so the rename would not last. "
-            "Pick another name.")
+            "every time the library loads, so a tag of that name would not "
+            "last. Pick another name.")
 
 
 def _linux_status_text(backend, text: str) -> str:
@@ -14093,6 +14094,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             name = name.strip()
             if not name:
                 return
+            refusal = _tag_rename_refusal(name)
+            if refusal is not None:
+                messagebox.showwarning("Add tag", refusal, parent=win)
+                return
             # Preserve current checkbox selections across the rebuild.
             for tag, v in tag_vars.items():
                 if v.get():
@@ -14446,6 +14451,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         def _add():
             name = entry_var.get().strip()
             if not name:
+                return
+            refusal = _tag_rename_refusal(name)
+            if refusal is not None:
+                messagebox.showwarning("Add tag", refusal, parent=win)
                 return
             if name in self.fittings.tags:
                 messagebox.showinfo("Add tag", f"'{name}' is already a tag.", parent=getattr(self, "root", None))
