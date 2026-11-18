@@ -14020,6 +14020,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         name = name.strip()
         if not name:
             return
+        refusal = _tag_rename_refusal(name)
+        if refusal is not None:
+            messagebox.showwarning("Add tag", refusal,
+                                   parent=getattr(self, "root", None))
+            return
         if name in self.fittings.tags:
             messagebox.showinfo("Add tag", f"'{name}' is already a tag.", parent=getattr(self, "root", None))
             return
@@ -26549,6 +26554,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 # Keeps the auto-update link's baseline honest: if the FC arms
                 # it later, an unchanged markup must read as already-synced.
                 self._motd_last_pushed_markup = markup
+                # An autopush PUT still in flight must not overwrite this baseline.
+                self._motd_baseline_gen = getattr(self, "_motd_baseline_gen", 0) + 1
                 self._motd_set_fleet_status("MOTD set successfully (204).",
                                             FG_GREEN)
             else:
