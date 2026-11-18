@@ -921,6 +921,45 @@ def _remove_exemption_entry(entries: list[dict], index: int) -> list[dict]:
     return out
 
 
+def _tag_dialog_choices(vocabulary, selected) -> list:
+    """The rows of the per-member Tags dialog: the vocabulary in its order, then
+    the member's selected tags the vocabulary lacks (a ``.fctdoc`` import puts
+    tags on members without adding them to it), in their own order, once each.
+    Listing them keeps OK-without-a-change from dropping them."""
+    rows = list(vocabulary)
+    for tag in selected or ():
+        if tag not in rows:
+            rows.append(tag)
+    return rows
+
+
+def _guidance_tag_use(tag):
+    """What fleet guidance keys on the exact tag name ``tag``, as a phrase, or
+    None. Renaming or deleting such a tag switches that guidance off for every
+    fit carrying it, so the Manage Tags dialog asks first."""
+    if tag == fleet_guidance.DEFENDER_TAG:
+        return f"the fleet-wide {tag} target"
+    if tag in fleet_guidance.COMPOSITION_ROLE_ORDER:
+        use = f"the {tag} composition role (its ideal and the Fleet-tab guidance"
+        if tag == "Links":
+            use += ", and the links range worked out from Links fits"
+        return use + ")"
+    return None
+
+
+def _tag_rename_refusal(new_name):
+    """Why a tag may not be renamed TO ``new_name``, or None. An old tag name
+    (``fittings_store._TAG_RENAMES``) is rewritten to its new name every time
+    the library loads, so such a rename would quietly undo itself."""
+    import fittings_store as _fittings_store
+    target = _fittings_store._TAG_RENAMES.get(new_name)
+    if target is None:
+        return None
+    return (f"'{new_name}' is an old tag name: FCTool renames it to '{target}' "
+            "every time the library loads, so the rename would not last. "
+            "Pick another name.")
+
+
 def _read_text_file_for_import(path: str) -> str:
     """Read a text file for one-time import (EVE-O config). Split out so tests
     can stub it without touching the real filesystem. EVE-O writes UTF-8."""
@@ -13916,7 +13955,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
     def _prompt_tag_multiselect(self, title, label, selected):
         """Modal multi-select of the library tag vocabulary via checkbuttons.
         Returns the chosen list of tags, or None if cancelled. Includes an
-        inline 'Add tag' button that extends the vocabulary live."""
+        inline 'Add tag' button that extends the vocabulary live. Selected
+        tags outside the vocabulary are listed after it, ticked."""
         win = tk.Toplevel(self.root)
         win.title(title)
         win.configure(bg=BG_DARK)
@@ -13946,14 +13986,20 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         canvas.bind("<Configure>",
                     lambda e: canvas.itemconfig(_win, width=e.width))
 
-        selected_set = set(selected or [])
+        selected_order = list(selected or [])
+        selected_set = set(selected_order)
         tag_vars: dict[str, tk.BooleanVar] = {}
 
         def _rebuild_checks():
             for w in inner.winfo_children():
                 w.destroy()
             tag_vars.clear()
-            for tag in self.fittings.tags:
+            # The vocabulary, then the member's tags outside it (ticked), so OK
+            # without a change keeps them. An extra the user unticked before an
+            # inline Add tag has left selected_set and is not listed again.
+            for tag in _tag_dialog_choices(
+                    self.fittings.tags,
+                    [t for t in selected_order if t in selected_set]):
                 v = tk.BooleanVar(value=tag in selected_set)
                 tag_vars[tag] = v
                 cb = tk.Checkbutton(
@@ -14262,9 +14308,22 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 return
             if new_name == tag:
                 return
+            refusal = _tag_rename_refusal(new_name)
+            if refusal is not None:
+                messagebox.showwarning(
+                    "Rename tag", refusal, parent=getattr(self, "root", None))
+                return
             if new_name in self.fittings.tags:
                 messagebox.showwarning(
                     "Rename tag", f"'{new_name}' is already a tag.", parent=getattr(self, "root", None))
+                return
+            use = _guidance_tag_use(tag)
+            if use is not None and not messagebox.askyesno(
+                    "Rename tag",
+                    f"Fleet guidance keys on the tag '{tag}': {use} uses this "
+                    f"exact name. Renamed to '{new_name}', the fits carrying it "
+                    "no longer count toward it.\n\nRename anyway?",
+                    parent=getattr(self, "root", None)):
                 return
             try:
                 # rename_tag persists internally (calls save()); do NOT save
@@ -14288,11 +14347,19 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         def _delete(tag):
             used = sum(1 for d in self.fittings.list_doctrines()
                        for m in d.members if tag in m.tags)
-            if used > 0:
+            use = _guidance_tag_use(tag)
+            if used > 0 or use is not None:
+                # ONE question, naming both what it strips and what keys on it.
+                question = f"Delete tag '{tag}'?"
+                if used > 0:
+                    question += (f" It is used by {used} fit(s) across your "
+                                 "doctrines and will be removed from them.")
+                if use is not None:
+                    question += (f"\n\nFleet guidance keys on the tag '{tag}': "
+                                 f"{use} uses this exact name and stops "
+                                 "working without it.")
                 if not messagebox.askyesno(
-                        "Delete tag",
-                        f"Delete tag '{tag}'? It is used by {used} fit(s) "
-                        "across your doctrines and will be removed from them.", parent=getattr(self, "root", None)):
+                        "Delete tag", question, parent=getattr(self, "root", None)):
                     return
             self.fittings.remove_tag(tag)
             self.fittings.save()
