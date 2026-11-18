@@ -1072,6 +1072,10 @@ class FleetTemplateWindow:
         if self.mode == "live":
             if kind not in ("livepilot", "unassigned"):
                 return
+            if dst in ids:
+                # A plain click (press + release on the same row) is not a
+                # drop: no move, no pin, no abort clear.
+                return
             char_ids = []
             for i in ids:
                 meta = self._node_meta.get(i)
@@ -1871,6 +1875,9 @@ class FleetTemplateWindow:
         # under a pending drag - the release runs it.
         if self._drag_pending:
             self._tree_rebuild_deferred = True
+            # Keep the shared preview current for the Members tab below; it is
+            # an in-memory compose and touches no tree item.
+            self._compose_preview()
         else:
             self._sync_rebuild_tree()
         self._refresh_members_tab()
@@ -1951,6 +1958,13 @@ class FleetTemplateWindow:
         clash = self._clamp_collision_text()
         if clash:                              # FLEET-5: would merge in EVE
             self._status.config(text=f"Auto-move refused: {clash}", fg=FG_RED)
+            return
+        if getattr(self._executor, "abort_reason", None) == "4xx":
+            # FLEET-3: every job would be dropped until a manual action, so
+            # queue nothing and say so once per tick (no per-pilot lines).
+            self._status.config(
+                text="Auto-move paused: 3 ESI errors in a row. A drag, menu "
+                     "move or Apply resumes it.", fg=FG_YELLOW)
             return
         res = fleet_composer.compose(
             t, self._live_members, self._live_structure,
@@ -2200,11 +2214,13 @@ class FleetTemplateWindow:
                                   wing_id=job.wing_id, squad_id=job.squad_id,
                                   role=job.role)
         except fleet_esi.FleetESIError as e:
-            # FLEET-1: hand a plain HTTP failure (420 / 429 / other 4xx, a 5xx
-            # after the retry) back as its STATUS so the executor's freeze and
-            # 3x4xx abort can see it. not_found / boss_lost / network / no_token
-            # keep raising: the executor treats those by reason.
-            if e.reason == "http_error" and e.status:
+            # FLEET-1: hand a plain 4xx HTTP failure (420 / 429 / 422 ...) back
+            # as its STATUS so the executor's freeze and 3x4xx abort can see
+            # it. A 5xx still failing after _call's retry keeps raising: the
+            # executor would read a returned non-4xx status as a success.
+            # not_found / boss_lost / network / no_token keep raising too.
+            if (e.reason == "http_error" and isinstance(e.status, int)
+                    and 400 <= e.status < 500):
                 return e.status
             raise
         return 204
@@ -2323,7 +2339,9 @@ class FleetTemplateWindow:
                 wing_id=wing_id, squad_id=squad_id, role=mv.target_role,
                 source=source))
             submitted.append(mv.pilot_id)
-        if submitted:
+        # An Apply wrote structure (wings/squads) even when it queued no move:
+        # keep its active cadence + reconcile poll so the new rows show soon.
+        if submitted or source == "apply":
             self._last_write_wall = time.time()   # go active-cadence after a write
             self._schedule_reconcile_poll()
         self._report_skipped(skipped)

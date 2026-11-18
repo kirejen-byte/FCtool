@@ -208,6 +208,11 @@ class FleetExecutor:
         with self._pending_lock:
             return set(self._pending)
 
+    @property
+    def abort_reason(self):
+        """"boss_lost" / "4xx" while aborted, else None."""
+        return self._abort_reason if self._aborted else None
+
     def clear_abort(self, only=None) -> bool:
         """Lift an abort so later jobs run again. `only` limits it to one
         reason (e.g. "boss_lost"): an abort for another reason is kept.
