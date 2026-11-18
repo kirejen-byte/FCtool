@@ -33047,12 +33047,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # not change stays up: a new one replays ~30 min and re-announces every
         # fight in it. Decided BEFORE the reload below replaces self.config;
         # _setup_modules re-checks it against the reloaded dict.
-        zk_live = getattr(self, "zkill_monitor", None)
-        keep_zkill = bool(
-            zk_live is not None
-            and FCToolGUI._zkill_is_running(zk_live)
-            and FCToolGUI._zkill_signature(self.config)
-            == getattr(self, "_zkill_sig", None))
+        keep_zkill = FCToolGUI._zkill_keepable(
+            getattr(self, "zkill_monitor", None), self.config,
+            getattr(self, "_zkill_sig", None))
         self._stop_monitoring(keep_zkill=keep_zkill)
         self.config = self._load_config()
         # The config OBJECT was just replaced, so the registry must be rebuilt
@@ -33240,6 +33237,16 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         no start(), and its replay cutoffs must not move)."""
         thread = getattr(monitor, "_thread", None)
         return thread is not None and thread.is_alive()
+
+    @staticmethod
+    def _zkill_keepable(monitor, config, built_sig):
+        """Settings->Save's keep decision: True only for a RUNNING monitor
+        whose build signature equals the one ``config`` (the dict about to be
+        saved) describes. Anything else rebuilds exactly as before."""
+        return bool(monitor is not None
+                    and FCToolGUI._zkill_is_running(monitor)
+                    and built_sig is not None
+                    and FCToolGUI._zkill_signature(config) == built_sig)
 
     def _build_range_monitor(self, logs_path, channel):
         """Build (and hook up) the range check's own fleet tail.
@@ -33565,9 +33572,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 pass
             # A successor generation already owns the tails (this thread
             # outlived its join mid-poll): leave the range tail to it rather
-            # than poll it concurrently. Identity, not stop.is_set(): one
+            # than poll it concurrently. _running covers the window between a
+            # Save's _setup_modules (a fresh range tail) and _start_monitoring
+            # (the successor's event). Identity, not stop.is_set(): one
             # is_set() per pass is the loop's contract with its callers.
-            if getattr(self, "_chat_stop", stop) is not stop:
+            if not self._running or getattr(self, "_chat_stop", stop) is not stop:
                 break
             try:
                 # The range check's listener-agnostic twin, polled from this
