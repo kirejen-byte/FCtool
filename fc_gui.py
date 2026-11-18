@@ -16956,7 +16956,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         text, the budget and the meter canvas width all equal the last render
         (``_motd_preview_sig``; None until the first render, which therefore
         always draws). The context build and ``refresh_pills()`` stay
-        unconditional — the deltas they resolve feed the markup."""
+        unconditional: the deltas they resolve feed the markup."""
         self._motd_preview_job = None
         preview = getattr(self, "_motd_preview", None)
         if preview is None:
