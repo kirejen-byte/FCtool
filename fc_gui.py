@@ -38386,10 +38386,7 @@ $bmp.Dispose()
             def _load_and_init_resolver():
                 try:
                     friendly, hostile = (set(), set())
-                    carried = getattr(self, "_intel_resolver_standings", None)
-                    if carried is not None:
-                        friendly, hostile = carried   # the last generation's
-                    elif self.esi_auth and self.esi_auth.is_authenticated:
+                    if self.esi_auth and self.esi_auth.is_authenticated:
                         try:
                             friendly, hostile = load_standings(self.esi_auth)
                         except Exception:
@@ -38490,11 +38487,6 @@ $bmp.Dispose()
             self._intel_monitor = None
         if self._intel_resolver is not None:
             try:
-                # Carried into the next generation's resolver, so a re-point
-                # keeps an earlier Refresh Standings instead of reverting to
-                # load_standings' session latch.
-                self._intel_resolver_standings = (
-                    self._intel_resolver.standings())
                 self._intel_resolver.stop()
             except Exception:
                 pass

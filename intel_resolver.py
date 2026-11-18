@@ -55,11 +55,6 @@ class IntelResolver:
             self._cache.clear()
             self._generation += 1
 
-    def standings(self) -> tuple[set[int], set[int]]:
-        """Copies of the current (friendly, hostile) sets, read together."""
-        with self._lock:
-            return set(self.friendly), set(self.hostile)
-
     # ── cache ────────────────────────────────────────────────────────────
     def _cache_put(self, res: Resolution, generation: int | None = None) -> None:
         key = res.name.lower()
