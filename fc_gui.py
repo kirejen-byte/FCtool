@@ -17601,8 +17601,19 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         Always clears locally first. When boss + fleet are known, asks for
         confirmation and, if accepted, pushes an EMPTY MOTD on a daemon thread
         (reusing the :meth:`_set_fleet_motd` threading pattern). When not boss
-        or not in a fleet, only the local builder is cleared."""
+        or not in a fleet, only the local builder is cleared.
+
+        With Auto-update armed, the cleared composer's output becomes the push
+        baseline: the next tick must not push the default skeleton over the
+        fleet's MOTD. The guard holds until the composed output changes (an
+        edit, or a pill whose resolved text changes). Only this button seeds
+        it; ``_clear_motd_builder`` is shared with the import path."""
         self._clear_motd_builder()
+        if getattr(self, "_motd_link_enabled", False):
+            try:
+                self._motd_last_pushed_markup = self._motd_output_markup()[0]
+            except Exception:
+                log.exception("MOTD: could not seed the baseline after Clear")
 
         if not getattr(self, "_motd_is_boss", False) or not getattr(
                 self, "_motd_fleet_id", None):
