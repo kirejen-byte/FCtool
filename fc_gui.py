@@ -971,10 +971,12 @@ FLEET_POLL_MISS = "miss"           # no usable answer -> grace counter / clear
 def classify_fleet_poll(info, polled_is_boss, members) -> str:
     """Decide what one ``_refresh_fleet_locations`` poll result means. Pure.
 
-    The load-bearing case is the third one. ``ESIAuth.esi_get`` flattens EVERY
-    failure to ``None`` -- 404 "fleet does not exist", 403, 5xx, a network
-    error, even a missing token -- so a caller cannot tell a disbanded fleet
-    from a transient blip by return shape. That matters because
+    The load-bearing case is the third one. The poll reads the status-keeping
+    ``_ex`` routes and filters out transient failures (0 / 420 / 429 / 5xx;
+    see ``fleet_poll_is_transient``) BEFORE calling this, so ``info`` /
+    ``members`` arrive here as definite answers -- except when an unbroken
+    transient run outlived ``FLEET_TRANSIENT_MAX_S``, which is then fed in as
+    a miss on purpose. That matters because
     ``/characters/{id}/fleet/`` is cached (and is famously stale after a
     disband) while ``/fleets/{id}/members/`` 404s the instant the fleet is
     gone: "I am the boss, and the boss-only roster route answered nothing" is
@@ -984,10 +986,10 @@ def classify_fleet_poll(info, polled_is_boss, members) -> str:
     kept the last roster -- so for as long as ESI kept serving the stale
     fleet_id, the Fleet tab and the HUD tile showed a fleet that no longer
     existed (owner-reported 2026-08-03). It is a MISS instead: the grace
-    counter absorbs a transient failure, and a fleet that really is gone
-    clears once the grace expires.
+    counter absorbs flicker, and a fleet that really is gone clears once the
+    grace expires.
 
-    ``members`` is the raw ``get_fleet_members`` answer: a non-empty list, or
+    ``members`` is the ``get_fleet_members_ex`` body: a non-empty list, or
     None/[] for "nothing came back". An empty list is a miss too -- a live
     fleet always contains its boss.
     """
@@ -8606,6 +8608,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # esi_auth is now (another account, or None).
             self._own_location_sid = None
             self._own_location_mono = 0.0
+            # Fleet poll state belongs to the departing primary -- reset it as
+            # _esi_set_primary does.
+            self._no_fleet_misses = 0
+            self._fleet_transient_since = None
             # Persist the new primary choice
             if self.esi_auth and self.esi_auth.character_id:
                 self.config["primary_character_id"] = self.esi_auth.character_id
@@ -35549,7 +35555,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         The poll is a self-rescheduling ``after`` chain armed from every arm
         site: startup, its own re-arms (30s not-auth / 15s in-flight / 60s
-        not-boss / 60s miss / 15s normal / 15s spawn-failure), and
+        not-boss / 60s miss / 60s transient ESI failure / 15s normal / 15s
+        spawn-failure), and
         ``_esi_set_primary``'s "poll again now, with the new primary" nudge.
         None of them stored an id and nothing ever cancelled, so every Set
         Primary click left the live chain running and started another one
@@ -35599,6 +35606,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # this 30s arm to 100 ms for as long as the user stays that way —
             # a 10 Hz spin with nothing to poll.
             self._fleet_refresh_asap = False
+            # No ESI = no fleet answer: drop the poll's cached fleet id / boss
+            # flag (the MOTD Set button and the HUD relevance gate read them).
+            # A revoked token never reaches the transient bound in do_fetch,
+            # so without this a dead fleet would be held forever.
+            self._last_polled_fleet_id = None
+            self._last_polled_fleet_is_boss = False
+            self._fleet_transient_since = None
             self._arm_fleet_refresh(30000)
             return
 
