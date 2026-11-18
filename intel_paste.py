@@ -63,7 +63,7 @@ class FleetSummary:
 ParsedScan = LocalScan | DScan | FleetComposition | FleetSummary
 
 
-_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9' \-]{0,35}[A-Za-z0-9]$")
+_NAME_RE = re.compile(r"^(?=.*[A-Za-z])[A-Za-z0-9][A-Za-z0-9' \-]{0,35}[A-Za-z0-9]$")
 
 
 def parse_local_scan(text: str) -> LocalScan:
