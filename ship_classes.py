@@ -6,6 +6,7 @@ fallback for unknown destroyer-class hulls.
 
 import requests
 import threading
+import time
 
 from esi_constants import ESI_BASE, ESI_HEADERS_JSON as HEADERS
 
@@ -264,11 +265,35 @@ ALL_BRIDGE = TITANS | BLACK_OPS
 _group_cache: dict[int, int | None] = {}
 _group_cache_lock = threading.Lock()
 
+# A cached None (a failed ESI lookup) expires after this many seconds so one
+# transient error does not blank a type for the whole session. Positives never
+# expire. Miss times live in a separate map keyed by (cache name, id); an entry
+# with no recorded miss time (seeded directly) is treated as permanent.
+_NEG_TTL_S = 300.0
+_miss_times: dict[tuple[str, int], float] = {}
+
+
+def _neg_expired(name: str, cache: dict, key: int) -> bool:
+    """True (and the stale None is dropped) when cache[key] is a None older than
+    the TTL. Caller holds the cache's lock."""
+    if cache.get(key, 0) is not None:
+        return False
+    t = _miss_times.get((name, key))
+    if t is None or time.monotonic() - t < _NEG_TTL_S:
+        return False
+    cache.pop(key, None)
+    _miss_times.pop((name, key), None)
+    return True
+
+
+def _note_miss(name: str, key: int) -> None:
+    _miss_times[(name, key)] = time.monotonic()
+
 
 def get_group_id(type_id: int) -> int | None:
     """Resolve a type_id to its group_id via ESI, with thread-safe caching."""
     with _group_cache_lock:
-        if type_id in _group_cache:
+        if type_id in _group_cache and not _neg_expired("group", _group_cache, type_id):
             return _group_cache[type_id]
 
     try:
@@ -288,6 +313,7 @@ def get_group_id(type_id: int) -> int | None:
 
     with _group_cache_lock:
         _group_cache[type_id] = None
+        _note_miss("group", type_id)
     return None
 
 
@@ -457,7 +483,7 @@ _type_group_lock = threading.Lock()
 def _fetch_group_id_for_type(type_id: int) -> int | None:
     """Resolve a type_id to its group_id via ESI, with in-memory caching."""
     with _type_group_lock:
-        if type_id in _type_group_cache:
+        if type_id in _type_group_cache and not _neg_expired("type_group", _type_group_cache, type_id):
             return _type_group_cache[type_id]
     try:
         from rate_limiter import rate_limit
@@ -476,6 +502,7 @@ def _fetch_group_id_for_type(type_id: int) -> int | None:
         pass
     with _type_group_lock:
         _type_group_cache[type_id] = None
+        _note_miss("type_group", type_id)
     return None
 
 
@@ -548,7 +575,7 @@ def _fetch_group_name(group_id: int) -> str | None:
     if not group_id:
         return None
     with _group_name_lock:
-        if group_id in _group_name_cache:
+        if group_id in _group_name_cache and not _neg_expired("group_name", _group_name_cache, group_id):
             return _group_name_cache[group_id]
     name: str | None = None
     try:
@@ -566,6 +593,8 @@ def _fetch_group_name(group_id: int) -> str | None:
         pass
     with _group_name_lock:
         _group_name_cache[group_id] = name
+        if name is None:
+            _note_miss("group_name", group_id)
     return name
 
 
