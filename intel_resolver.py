@@ -37,11 +37,30 @@ class IntelResolver:
         self._queue: "queue.Queue[tuple[list[str], Callable]]" = queue.Queue()
         self._worker: threading.Thread | None = None
         self._stop = threading.Event()
+        # Bumped by set_standings. A batch snapshots it with the sets it
+        # classifies against; a result from an older generation is still
+        # delivered but never cached, so a refresh cannot be undone by a batch
+        # that was in flight across it.
+        self._generation = 0
+
+    # ── standings ────────────────────────────────────────────────────────
+    def set_standings(self, friendly, hostile) -> None:
+        """Swap both standing sets and forget every cached name, so the next
+        request re-classifies against the refreshed sets (INTEL-9)."""
+        friendly = set(friendly or ())
+        hostile = set(hostile or ())
+        with self._lock:
+            self.friendly = friendly
+            self.hostile = hostile
+            self._cache.clear()
+            self._generation += 1
 
     # ── cache ────────────────────────────────────────────────────────────
-    def _cache_put(self, res: Resolution) -> None:
+    def _cache_put(self, res: Resolution, generation: int | None = None) -> None:
         key = res.name.lower()
         with self._lock:
+            if generation is not None and generation != self._generation:
+                return  # classified against standings since replaced
             if key in self._cache:
                 self._cache.move_to_end(key)
             self._cache[key] = res
@@ -100,9 +119,12 @@ class IntelResolver:
             if batch is None:  # stop sentinel
                 break
             out: dict[str, Resolution] = {}
+            with self._lock:
+                friendly, hostile = self.friendly, self.hostile
+                generation = self._generation
             try:
                 try:
-                    resolutions = self._resolve_fn(batch, self.friendly, self.hostile)
+                    resolutions = self._resolve_fn(batch, friendly, hostile)
                     resolve_ok = True
                 except Exception:
                     log.exception("IntelResolver: resolve_fn failed for %d names",
@@ -116,7 +138,7 @@ class IntelResolver:
                 for n in batch:
                     r = by_name.get(n.lower())
                     if r is not None:
-                        self._cache_put(r)
+                        self._cache_put(r, generation)
                         out[n] = r  # deliver under the requested-name key
                     elif resolve_ok:
                         # resolve_fn succeeded (returned a list, possibly empty) but
@@ -130,7 +152,7 @@ class IntelResolver:
                             name=n, character_id=None,
                             corporation_id=None, corporation="",
                             alliance_id=None, alliance="", standing="unknown",
-                        ))
+                        ), generation)
                     # else: resolve_fn RAISED — keep discard-and-retry (no cache).
             finally:
                 # ALWAYS clear in-flight membership for this batch, even if

@@ -552,6 +552,20 @@ def high_priority(report, min_reported: int) -> bool:
     return False
 
 
+def intel_min_reported_from(cfg) -> int:
+    """The saved intel "Min Reported" value: top-level
+    ``config["intel_min_reported"]``, clamped to the spinbox's 0..500. A
+    missing key or garbage reads as 0, the value every launch started at before
+    it was saved. Deliberately NOT in DEFAULT_CONFIG (the release gates pin its
+    top-level key set) and NOT inside ``intel_filter`` (a group-config import
+    target)."""
+    try:
+        val = int(cfg.get("intel_min_reported", 0))
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        return 0
+    return max(0, min(500, val))
+
+
 def add_filter_item(items: list, item: dict) -> tuple[list, bool]:
     """Append ``item`` ({"id", "name"}) to a copy of ``items``, de-duped by id.
 
@@ -6505,18 +6519,27 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # Min reported filter
         tk.Label(intel_row, text="  Min Reported:", font=("Consolas", 9),
                  fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT, padx=(10, 0))
-        self._intel_min_reported_var = tk.StringVar(value="0")
+        # Saved since build 2: starts at the persisted value (0 when absent).
+        self._intel_min_reported_var = tk.StringVar(
+            value=str(intel_min_reported_from(self.config)))
         # Mirror the min-reported filter into a plain int read by the off-main
         # intel message callback (Class B fix). The trace fires on the main
         # thread whenever the spinbox value changes; the worker reads the int.
         self._intel_min_reported_var.trace_add(
             "write", self._mirror_intel_min_reported)
-        tk.Spinbox(
+        self._mirror_intel_min_reported()
+        _min_rep_spin = tk.Spinbox(
             intel_row, from_=0, to=500, textvariable=self._intel_min_reported_var,
             font=("Consolas", 10), width=4, bg=BG_ENTRY, fg=FG_WHITE,
             insertbackground=FG_WHITE, buttonbackground=BG_PANEL,
             borderwidth=1, relief=tk.RIDGE,
-        ).pack(side=tk.LEFT, padx=(4, 10))
+            command=self._on_intel_min_reported_change,
+        )
+        _min_rep_spin.pack(side=tk.LEFT, padx=(4, 10))
+        _min_rep_spin.bind(
+            "<Return>", lambda e: self._on_intel_min_reported_change())
+        _min_rep_spin.bind(
+            "<FocusOut>", lambda e: self._on_intel_min_reported_change())
 
         # Opt-in audio ping for high-priority intel lines (default off; this is
         # the intel stream's own toggle, distinct from the global zkill mute).
@@ -6656,6 +6679,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # the same system is named repeatedly during a spike.
         self._cyno_beacon_cache: dict[int, tuple[bool, float]] = {}
         self._intel_find_var = tk.StringVar(value="")
+        # The pending debounced Find re-render (see _on_intel_find_write).
+        self._intel_find_after_id = None
 
         # One checkbox per tracked intel channel (user-configurable, sourced
         # from the Intel-TAGGED subset of config["channels"] via the derived
@@ -6721,8 +6746,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                               font=("Consolas", 9), width=18, bg=BG_ENTRY,
                               fg=FG_WHITE, insertbackground=FG_WHITE)
         find_entry.pack(side=tk.LEFT, padx=(4, 8))
-        self._intel_find_var.trace_add(
-            "write", lambda *a: self._intel_rerender_from_buffer())
+        # INTEL-6 (1): debounced -- one pending after() id, re-armed per write.
+        self._intel_find_var.trace_add("write", self._on_intel_find_write)
         self._intel_pause_var = tk.BooleanVar(value=False)
         tk.Checkbutton(
             controls, text="Pause", variable=self._intel_pause_var,
@@ -37812,6 +37837,13 @@ $bmp.Dispose()
         if self.zkill_monitor:
             self.zkill_monitor.set_friendly_ids(
                 set(self._standings_cache.friendly_ids))
+        # And into the intel stream's name resolver (INTEL-9): a locked set
+        # swap + cache clear. friendly_ids already holds the own corp/alliance.
+        resolver = getattr(self, "_intel_resolver", None)
+        if resolver is not None:
+            resolver.set_standings(
+                self._standings_cache.friendly_ids,
+                self._standings_cache.hostile_ids)
         self._push_standings_to_battle_ledger()
         self._update_standings_label()
         # The own alliance may have changed -> which Ansiblexes are usable did.
@@ -37858,6 +37890,13 @@ $bmp.Dispose()
                     if self.zkill_monitor:
                         self.zkill_monitor.set_friendly_ids(
                             set(self._standings_cache.friendly_ids))
+                    # Same argument for the intel resolver (INTEL-9): its
+                    # set_standings is a locked swap + cache clear, no Tk.
+                    resolver = getattr(self, "_intel_resolver", None)
+                    if resolver is not None:
+                        resolver.set_standings(
+                            self._standings_cache.friendly_ids,
+                            self._standings_cache.hostile_ids)
                     # Same argument for the battle ledger's ours/allies split.
                     self._push_standings_to_battle_ledger()
                     # Update label on the Tk thread (FCToolGUI uses self.root,
@@ -37977,6 +38016,24 @@ $bmp.Dispose()
             self._intel_min_reported = int(self._intel_min_reported_var.get())
         except (ValueError, AttributeError):
             self._intel_min_reported = 0
+
+    def _on_intel_min_reported_change(self):
+        """Persist the Min Reported spinbox (arrow / Return / FocusOut) as the
+        top-level ``config["intel_min_reported"]``, clamped 0..500, writing
+        config.json only when the value actually changed. Mid-typing garbage
+        is ignored, like ``_on_min_pilots_change``."""
+        try:
+            val = int(self._intel_min_reported_var.get())
+        except (TypeError, ValueError):
+            return
+        val = max(0, min(500, val))
+        if val == intel_min_reported_from(self.config):
+            return
+        self.config["intel_min_reported"] = val
+        try:
+            self._save_config()
+        except Exception:
+            pass
 
     def _mirror_zkill_min_pilots(self, *_):
         """Main-thread Var-trace: mirror the zKill display Min Pilots spinbox
@@ -38512,9 +38569,52 @@ $bmp.Dispose()
         if hasattr(self, "_intel_buffer"):
             self._intel_rerender_from_buffer()
 
+    _INTEL_FIND_DEBOUNCE_MS = 250
+
+    def _on_intel_find_write(self, *_):
+        """Find-box write trace (INTEL-6 (1)): re-render once the typing pauses.
+        Each write cancels the one pending ``after`` id and arms a new one, so
+        a burst of keystrokes costs one full re-render instead of one each."""
+        pending = getattr(self, "_intel_find_after_id", None)
+        self._intel_find_after_id = None
+        if pending is not None:
+            try:
+                self.root.after_cancel(pending)
+            except tk.TclError:
+                pass
+
+        def _due():
+            self._intel_find_after_id = None
+            if hasattr(self, "_intel_buffer"):
+                try:
+                    self._intel_rerender_from_buffer()
+                except tk.TclError:
+                    pass                    # widget gone (window closing)
+
+        self._intel_find_after_id = self.root.after(
+            self._INTEL_FIND_DEBOUNCE_MS, _due)
+
     def _intel_rerender_from_buffer(self):
         """Clear the Text and re-render every buffered entry that passes the
-        current view filter. The deque is never mutated -- no data is lost."""
+        current view filter. The deque is never mutated -- no data is lost.
+
+        INTEL-6 (3): the LAST ``INTEL_RESOLVE_TAIL_LINES`` re-rendered lines
+        get the standing colours of the names the resolver ALREADY has cached,
+        each scoped to its own line's range, once every line is written (older
+        lines stay uncoloured, as before). Colouring all of them measured ~2x
+        the re-render on a mapped widget: every later line's yview / see slows
+        under thousands of new tags. Cache only (no request, no network), and
+        never a negative-cache entry (``standing == "unknown"`` / no character
+        id): a re-render must not dim a name the live path would leave
+        untagged."""
+        # This re-render supersedes a pending debounced Find re-render.
+        try:
+            pending = getattr(self, "_intel_find_after_id", None)
+            if pending is not None:
+                self._intel_find_after_id = None
+                self.root.after_cancel(pending)
+        except Exception:
+            pass
         log = self._intel_log
         log.config(state=tk.NORMAL)
         log.delete("1.0", tk.END)
@@ -38522,10 +38622,42 @@ $bmp.Dispose()
         # channel toggle / find-filter re-render doesn't leak the old span tags.
         self._intel_sweep_dynamic_tags(log)
         log.config(state=tk.DISABLED)
+        resolver = getattr(self, "_intel_resolver", None)
+        # (msg, start mark, end mark) of the newest rendered lines. The ranges
+        # ride left-gravity Text MARKS because a later line's trim can
+        # renumber them; the mark names cycle, so an evicted entry's slot is
+        # simply re-set by the entry that evicted it.
+        tail = collections.deque(maxlen=INTEL_RESOLVE_TAIL_LINES)
+        seq = 0
         for entry in list(self._intel_buffer):
             msg = entry[0]
             if self._passes_view_filter(msg):
-                self._render_line(entry)
+                start, end = self._render_line(entry)
+                if resolver is not None:
+                    slot = seq % INTEL_RESOLVE_TAIL_LINES
+                    seq += 1
+                    s_mark, e_mark = f"intel_rr_s{slot}", f"intel_rr_e{slot}"
+                    log.mark_set(s_mark, start)
+                    log.mark_gravity(s_mark, "left")
+                    log.mark_set(e_mark, end)
+                    log.mark_gravity(e_mark, "left")
+                    tail.append((msg, s_mark, e_mark))
+        for msg, s_mark, e_mark in tail:
+            try:
+                cached = {}
+                for name in intel_stream.candidate_names(msg.message):
+                    res = resolver.lookup_cached(name)
+                    if (res is None or res.character_id is None
+                            or res.standing == "unknown"):
+                        continue
+                    cached[name] = res
+                if cached:
+                    self._intel_apply_resolutions(
+                        cached, (log.index(s_mark), log.index(e_mark)))
+            except Exception:
+                pass
+        for _msg, s_mark, e_mark in tail:
+            log.mark_unset(s_mark, e_mark)
         self._intel_new_count = 0
         self._intel_update_new_button()
 
@@ -41191,6 +41323,14 @@ $bmp.Dispose()
             if poll_id is not None:
                 self.root.after_cancel(poll_id)
                 self._fleet_refresh_after_id = None
+        except Exception:
+            pass
+        # And the debounced intel Find re-render, if a keystroke armed one.
+        try:
+            find_id = getattr(self, "_intel_find_after_id", None)
+            if find_id is not None:
+                self.root.after_cancel(find_id)
+                self._intel_find_after_id = None
         except Exception:
             pass
         self.root.destroy()
