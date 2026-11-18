@@ -911,6 +911,23 @@ def _remove_exemption_entry(entries: list[dict], index: int) -> list[dict]:
     return out
 
 
+def _linux_status_text(backend, text: str) -> str:
+    """Prefix `text` with the Linux/X11 helper state. No backend (every Windows
+    run) returns `text` untouched. Total: a raising snapshot reads "unknown".
+    ASCII prefix only."""
+    if backend is None:
+        return text
+    try:
+        snap = backend.supervisor.status_snapshot()
+        state, last_error = snap.state, snap.last_error
+    except Exception:
+        state, last_error = "unknown", None
+    text = "Linux/X11 previews (%s) - %s" % (state, text)
+    if state == "failed" and last_error:
+        text += " - " + str(last_error)[:80]
+    return text
+
+
 def _read_text_file_for_import(path: str) -> str:
     """Read a text file for one-time import (EVE-O config). Split out so tests
     can stub it without touching the real filesystem. EVE-O writes UTF-8."""
@@ -24734,10 +24751,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             self._preview_after_id = None
             return
         status = self._preview_native_tick_body()
-        self._preview_status = status
+        self._preview_status = status       # bare: the prefix is label-only
         if getattr(self, "_preview_status_label", None) is not None:
             try:
-                self._preview_status_label.config(text=status)
+                self._preview_status_label.config(text=_linux_status_text(
+                    getattr(self, "_preview_thumb_backend", None), status))
             except tk.TclError:
                 pass
         # Heartbeat the Gamelogs diagnostic from the monitor's cached snapshot
@@ -27951,18 +27969,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # Linux/X11: name the backend and its helper state in FRONT of the
         # tick's own status, so "0 tiles" is never mute about why. No backend
         # (every Windows run) leaves the string untouched. ASCII only.
-        be = getattr(self, "_preview_thumb_backend", None)
-        if be is None:
-            return text
-        try:
-            snap = be.supervisor.status_snapshot()
-            state, last_error = snap.state, snap.last_error
-        except Exception:
-            state, last_error = "unknown", None
-        text = "Linux/X11 previews (%s) - %s" % (state, text)
-        if state == "failed" and last_error:
-            text += " - " + str(last_error)[:80]
-        return text
+        return _linux_status_text(
+            getattr(self, "_preview_thumb_backend", None), text)
 
     def _preview_set_mode(self, new_mode: str):
         """Switch preview mode: tear down the old mode, persist, boot the new one.
