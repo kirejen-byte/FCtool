@@ -144,7 +144,8 @@ _FILTER_PROGRESS_STRIDE = 25
 # location resolve and the item fetch. Every value here MUST stay <= the true
 # packaged volume of every hull in the group: too low only filters less, too
 # HIGH silently drops real matches. Values = 80% of the minimum
-# ``min(packagedVolume, volume)`` over every hull the bundled fit_types.json
+# ``min(packagedVolume, volume)`` (the 1,300,000 capital groups rounded down
+# further, to 1,000,000) over every hull the bundled fit_types.json
 # lists in the group (the table's keys are exactly its category-6 groups),
 # measured on SDE build 3693310 (the bundle's own build) - which includes the
 # newer hulls (Herald 893 at 2,500; Penitence 906 at 10,000; Oracle / Naga /
@@ -155,7 +156,7 @@ _FILTER_PROGRESS_STRIDE = 25
 # this table disables the filter for the whole scan (fail open) - see
 # ``_contract_volume_floor``.
 _HULL_GROUP_MIN_PACKAGED_M3: dict[int, float] = {
-    25: 2_000,          # Frigate                    (SDE min 2,500)
+    25: 2_000,          # Frigate                      (SDE min 2,500)
     26: 8_000,          # Cruiser                      (10,000)
     27: 40_000,         # Battleship                   (50,000)
     28: 16_000,         # Hauler                       (20,000)
@@ -169,7 +170,7 @@ _HULL_GROUP_MIN_PACKAGED_M3: dict[int, float] = {
     419: 12_000,        # Combat Battlecruiser         (15,000)
     420: 4_000,         # Destroyer                    (5,000)
     463: 3_000,         # Mining Barge                 (3,750)
-    485: 1_000_000,     # Dreadnought                (1,300,000)
+    485: 1_000_000,     # Dreadnought                  (1,300,000)
     513: 1_000_000,     # Freighter                    (1,300,000)
     540: 12_000,        # Command Ship                 (15,000)
     541: 4_000,         # Interdictor                  (5,000)
