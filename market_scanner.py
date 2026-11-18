@@ -707,6 +707,9 @@ class _FetchResult:
     error_limited: bool  # the adapter reported error-budget floor after this call
     raised: bool  # the adapter call raised (→ transient, do not cache)
     match_list: list  # [(fit_id, ContractMatch), ...] for this contract
+    # A 429 hold on a contract-items route was live after this call (see
+    # ``MarketScanner._contract_items_rate_limited``).
+    rate_limited: bool = False
 
 
 # ── The scanner (§4.2) ───────────────────────────────────────────────────────
@@ -836,6 +839,14 @@ class MarketScanner:
         lh = getattr(self._adapter, "last_headers", None)
         if isinstance(lh, dict):
             lh.clear()
+        # Same for the 429 holds (``rate_limited``): one 429 must not stop the
+        # next scan's contract pass (duck-typed: fakes without the seam pass).
+        clear_holds = getattr(self._adapter, "clear_rate_limits", None)
+        if callable(clear_holds):
+            try:
+                clear_holds()
+            except Exception:
+                log.debug("[market] clear_rate_limits raised (ignored)", exc_info=True)
 
         _emit_progress(progress, {"stage": "market", "status": "orders_start"})
         try:
@@ -1227,8 +1238,11 @@ class MarketScanner:
         ESI error budget drops below the floor it STOPS submitting, drains the
         in-flight fetches, records ``"contract_error_limit"`` in the returned
         scan's ``degraded`` list, and keeps the matches gathered so far (partial,
-        never a crash). ``cancel`` (optional) is a zero-arg predicate polled the
-        same way: a truthy return stops new submissions, drains what is running,
+        never a crash). A live 429 hold on a contract-items route (the adapter's
+        ``rate_limited`` over its ``contract_items_groups``, duck-typed) stops
+        the pass the same way, with the same tag: token-bucket routes never send
+        the legacy error-limit header. ``cancel`` (optional) is a zero-arg
+        predicate polled the same way: a truthy return stops new submissions, drains what is running,
         and returns the partial result promptly (bounded by the in-flight fetches'
         own timeouts) — the executor is always shut down cleanly, so a cancel can
         never hang the caller. ``cancel=None`` (the default) never cancels, so the
@@ -1402,7 +1416,8 @@ class MarketScanner:
             # is byte-identical to the serial pass (then a final per-fit price sort,
             # as before).
             match_by_idx: dict[int, list] = {}
-            aborted = False       # ESI error-limit floor forced an early stop
+            aborted = False       # ESI error-limit floor (or a 429 hold) forced an early stop
+            rate_held = False     # ... and it was a 429 hold on a contract-items route
             cancelled = False     # the caller's cancel predicate fired
 
             def _stop_requested() -> bool:
@@ -1456,6 +1471,8 @@ class MarketScanner:
                     # an earlier phase may already have driven the budget down.
                     if bool(getattr(self._adapter, "error_limited", False)):
                         aborted = True
+                    elif self._contract_items_rate_limited():
+                        aborted = rate_held = True
                     else:
                         for _ in range(workers):
                             if not _submit_next():
@@ -1477,14 +1494,20 @@ class MarketScanner:
                             )
                             if res.error_limited:
                                 aborted = True
-                        # Poll cancel + the live error-limit flag on EACH completion
-                        # (4b); once either fires, stop feeding and let the in-flight
-                        # fetches drain (the while loop keeps consuming them).
+                            if res.rate_limited:
+                                aborted = rate_held = True
+                        # Poll cancel + the live error-limit flag + the 429 holds on
+                        # EACH completion (4b); once any fires, stop feeding and let
+                        # the in-flight fetches drain (the while loop keeps
+                        # consuming them).
                         if _stop_requested():
                             cancelled = True
                         if not aborted and not cancelled and bool(
                                 getattr(self._adapter, "error_limited", False)):
                             aborted = True
+                        if (not aborted and not cancelled
+                                and self._contract_items_rate_limited()):
+                            aborted = rate_held = True
                         if aborted or cancelled:
                             continue
                         for _ in range(len(done)):
@@ -1501,8 +1524,10 @@ class MarketScanner:
             if aborted and "contract_error_limit" not in degraded:
                 degraded.append("contract_error_limit")
                 log.warning(
-                    "[market] contract scan hit the ESI error-limit floor after "
+                    "[market] contract scan hit %s after "
                     "%d/%d fetched — stopped early, partial matches kept",
+                    "an ESI rate limit (429)" if rate_held
+                    else "the ESI error-limit floor",
                     scanned, total_fetch,
                 )
 
@@ -1590,14 +1615,34 @@ class MarketScanner:
             log.exception("[market] contract items pull failed for %s", cid)
             return _FetchResult(idx, cid, [], "raise", False, True, [])
         # ``error_limited`` is a monotonic global budget signal (not per-call), so
-        # reading it off the adapter here is safe under concurrency.
+        # reading it off the adapter here is safe under concurrency. The 429
+        # holds are global per route / group in the same way.
         err = bool(getattr(self._adapter, "error_limited", False))
+        held = self._contract_items_rate_limited()
         items = items or []
         match_list = (
             self._match_contract_items(items, contract, is_alliance, loc_id, csys, fit_specs)
             if items else []
         )
-        return _FetchResult(idx, cid, items, status, err, False, match_list)
+        return _FetchResult(idx, cid, items, status, err, False, match_list, held)
+
+    def _contract_items_rate_limited(self) -> bool:
+        """True while the adapter holds a 429 on a contract-items route.
+
+        Duck-typed: the adapter needs BOTH ``rate_limited(key)`` and a
+        ``contract_items_groups`` sequence of keys; anything else (older fakes,
+        a raising reader, a non-``True`` answer) reads as not held. Token-bucket
+        routes never send the legacy error-limit header, so ``error_limited``
+        cannot see their bucket run dry - this is the contract pass's 429 stop."""
+        reader = getattr(self._adapter, "rate_limited", None)
+        keys = getattr(self._adapter, "contract_items_groups", None)
+        if not callable(reader) or not isinstance(keys, (tuple, list, set, frozenset)):
+            return False
+        try:
+            return any(reader(k) is True for k in keys)
+        except Exception:
+            log.debug("[market] rate_limited raised (ignored)", exc_info=True)
+            return False
 
     def _match_contract_items(
         self, items: list, contract: dict, is_alliance: bool,
