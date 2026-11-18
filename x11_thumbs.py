@@ -1018,6 +1018,10 @@ class HelperSupervisor(object):
     @staticmethod
     def _check_hello(msg, token):
         """None when ``msg`` is a hello bearing our token, else the problem."""
+        if msg.get("type") == proto.T_ERROR:
+            # The helper's own pre-hello failure (_fail_early): say why.
+            return ("helper reported %s: %s"
+                    % (_ascii(msg.get("code")), _ascii(msg.get("msg"))))
         if msg.get("type") != proto.T_HELLO:
             return ("first helper line was '%s', not hello"
                     % (_ascii(msg.get("type")),))
