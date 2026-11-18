@@ -944,6 +944,8 @@ class ZKillMonitor:
                     # No new kill at this sequence — wait before retrying
                     consecutive_404s += 1
                     idle_nones += 1
+                    if not self._running:
+                        break
                     if idle_nones >= _HEAD_CHECK_EVERY:
                         # A permanently missing sequence (a hole R2Z2 never
                         # fills) would park us here forever while the head
