@@ -110,6 +110,9 @@ T_MONITORS_REPLY = getattr(proto, "T_MONITORS_REPLY", "monitors_reply")
 LAYOUT_TOLERANCE = 0.01
 
 
+_CONTROL_TO_SPACE = {c: " " for c in list(range(0x20)) + [0x7F]}
+
+
 def _ascii(value, default="-"):
     """Collapse any value to a one-line ASCII string (cp1252 log trap)."""
     if value is None:
@@ -119,7 +122,8 @@ def _ascii(value, default="-"):
     except Exception:
         return default
     text = text.encode("ascii", "replace").decode("ascii")
-    return text.replace("\r", " ").replace("\n", " ").strip() or default
+    text = text.translate(_CONTROL_TO_SPACE)
+    return text.strip() or default
 
 
 # --------------------------------------------------------------- snapshot
