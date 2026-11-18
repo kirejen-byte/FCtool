@@ -126,7 +126,15 @@ class FleetExecutor:
         self._remaining_needed = remaining_needed
         self._on_boss_lost = on_boss_lost
         self._consecutive_4xx = 0
+        # Abort state. `_aborted` is the switch the worker reads; `_abort_reason`
+        # says WHY ("boss_lost" or "4xx") so the window can clear a boss_lost
+        # abort on its next good sync but keep a 4xx abort until a manual action
+        # (clear_abort). `_abort_logged`: one "dropping" log line per abort.
+        # Plain attributes written on the Tk thread (clear_abort) and the worker
+        # (_perform): single reads/writes, GIL-atomic.
         self._aborted = False
+        self._abort_reason = None
+        self._abort_logged = False
         self._now = now or _time.monotonic
         self._q: _queue.Queue = _queue.Queue()
         self._worker: _threading.Thread | None = None
@@ -200,6 +208,42 @@ class FleetExecutor:
         with self._pending_lock:
             return set(self._pending)
 
+    @property
+    def abort_reason(self):
+        """"boss_lost" / "4xx" while aborted, else None."""
+        return self._abort_reason if self._aborted else None
+
+    def clear_abort(self, only=None) -> bool:
+        """Lift an abort so later jobs run again. `only` limits it to one
+        reason (e.g. "boss_lost"): an abort for another reason is kept.
+        Returns True when an abort was cleared."""
+        if not self._aborted:
+            return False
+        if only is not None and self._abort_reason != only:
+            return False
+        self._consecutive_4xx = 0
+        self._abort_reason = None
+        self._abort_logged = False
+        self._aborted = False
+        return True
+
+    def _abort(self, reason) -> None:
+        self._abort_reason = reason
+        self._abort_logged = False
+        self._aborted = True
+
+    def _note_abort_drop(self, job) -> None:
+        """Say once per abort that queued moves are being dropped."""
+        if self._abort_logged:
+            return
+        self._abort_logged = True
+        if self._abort_reason == "boss_lost":
+            why = "fleet boss lost; resumes after the next good sync"
+        else:
+            why = "3 ESI errors in a row; a drag, menu move or Apply resumes it"
+        self._post(self._on_log,
+                   f"[{job.source}] queue aborted ({why}) - dropping moves")
+
     def drain(self) -> None:
         """Run the exact worker loop body inline until the queue is empty.
 
@@ -256,6 +300,7 @@ class FleetExecutor:
         # the OTHER jobs they discard; they never touch this job (already popped).
         try:
             if self._aborted:
+                self._note_abort_drop(job)
                 self._drain_remaining()
                 return
             if not self._gate(job):
@@ -346,7 +391,7 @@ class FleetExecutor:
             status = self._on_move(job)
         except fleet_esi.FleetESIError as e:
             if e.reason == "boss_lost":
-                self._aborted = True
+                self._abort("boss_lost")
                 self._post(self._on_boss_lost)
                 return (job, 403, "boss lost (403) — queue aborted")
             self._consecutive_4xx = 0
@@ -372,7 +417,7 @@ class FleetExecutor:
         if 400 <= status < 500:
             self._consecutive_4xx += 1
             if self._consecutive_4xx >= CONSECUTIVE_4XX_ABORT:
-                self._aborted = True
+                self._abort("4xx")
                 return (job, status, f"{status} — 3rd consecutive 4xx, aborting queue")
             return (job, status, f"{status} error")
         self._consecutive_4xx = 0

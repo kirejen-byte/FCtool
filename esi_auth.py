@@ -210,6 +210,16 @@ class ESIAuth:
         # within the access_token property (which also acquires).
         self._refresh_lock = threading.RLock()
 
+        # SSO refresh backoff (ESI-3): a failed _do_refresh stamps the
+        # monotonic time and a growing delay; the access_token property does
+        # not POST again until the delay has passed. Cleared by a success.
+        self._refresh_failed_at: float | None = None
+        self._refresh_backoff: float = 0.0
+        # The `scp` set of the last decoded access token (ESI-3 / SETTINGS-2),
+        # so granted_scopes() can answer while the token is gone after a
+        # failed refresh. None = never decoded.
+        self._last_scopes: frozenset | None = None
+
         # Cache for the sibling ESIAuth delegate resolved by
         # _any_authenticated_auth() when *this* instance is unauthenticated.
         # Constructing a sibling ESIAuth fires a live SSO refresh that rotates
@@ -282,9 +292,51 @@ class ESIAuth:
                 # Another thread refreshed while we waited.
                 return self._access_token
             if self._refresh_token:
+                if self._in_refresh_backoff():
+                    # A recent refresh failed: no SSO POST until the
+                    # backoff window has passed (ESI-3).
+                    return None
                 self._do_refresh()
                 return self._access_token
             return None
+
+    # SSO refresh backoff: first delay, doubling per failure, capped.
+    _REFRESH_BACKOFF_FIRST = 60.0
+    _REFRESH_BACKOFF_MAX = 300.0
+
+    def _in_refresh_backoff(self) -> bool:
+        """True while a failed refresh's backoff window is still open."""
+        failed_at = getattr(self, "_refresh_failed_at", None)
+        if failed_at is None:
+            return False
+        delay = getattr(self, "_refresh_backoff", 0.0) or 0.0
+        return time.monotonic() - failed_at < delay
+
+    def _note_refresh_failure(self) -> None:
+        """Stamp a failed refresh: 60 s, then doubling, capped at 300 s."""
+        prev = getattr(self, "_refresh_backoff", 0.0) or 0.0
+        if prev <= 0:
+            delay = self._REFRESH_BACKOFF_FIRST
+        else:
+            delay = min(prev * 2, self._REFRESH_BACKOFF_MAX)
+        self._refresh_backoff = delay
+        self._refresh_failed_at = time.monotonic()
+
+    def _clear_refresh_backoff(self) -> None:
+        self._refresh_failed_at = None
+        self._refresh_backoff = 0.0
+
+    def adopt_tokens(self, other: "ESIAuth") -> None:
+        """Take over a fresh login's tokens (re-authorizing a character that is
+        already in the account list). Runs under this account's refresh lock,
+        so an in-flight refresh of the OLD token finishes first and cannot
+        wipe the fresh one afterwards; the refresh backoff is cleared."""
+        with self._refresh_lock:
+            self._refresh_token = other._refresh_token
+            self._access_token = other._access_token
+            self._expires_at = other._expires_at
+            self._last_scopes = getattr(other, "_last_scopes", None)
+            self._clear_refresh_backoff()
 
     # ── PKCE Helpers ──────────────────────────────────────────────────────────
 
@@ -441,6 +493,7 @@ class ESIAuth:
                 SSO_TOKEN_URL,
                 headers=headers,
                 data=data,
+                timeout=15,
             )
             if not resp.ok:
                 print(f"[ESI Auth] Token exchange failed: {resp.status_code} {resp.text}")
@@ -452,6 +505,8 @@ class ESIAuth:
             self._expires_at = datetime.now(timezone.utc) + timedelta(
                 seconds=data.get("expires_in", 1199)
             )
+            # A fresh login is a fresh credential: no refresh backoff left.
+            self._clear_refresh_backoff()
 
             # Verifier is single-use; drop it once the code is redeemed.
             self._code_verifier = None
@@ -473,6 +528,10 @@ class ESIAuth:
         (HTTP 400 invalid_grant — EVE SSO revoked the refresh token),
         clears all token state and persists an empty token file so the
         class cannot linger in a zombie-authenticated state.
+
+        Every failure stamps the refresh backoff (_note_refresh_failure) and a
+        success clears it. Only the access_token property honours the window;
+        a direct call here always POSTs.
 
         RLock guards the body so concurrent callers (access_token property,
         _load_tokens) don't race on the refresh-token rotation that SSO
@@ -518,10 +577,12 @@ class ESIAuth:
                 # Transient: network didn't reach SSO. Keep refresh token.
                 print(f"[ESI Auth] Token refresh transient network error: {e}")
                 self._access_token = None
+                self._note_refresh_failure()
                 return False
             except Exception as e:
                 print(f"[ESI Auth] Refresh error: {e}")
                 self._access_token = None
+                self._note_refresh_failure()
                 return False
 
             if not resp.ok:
@@ -545,6 +606,7 @@ class ESIAuth:
                     self._access_token = None
                     self._refresh_token = None
                     self._expires_at = None
+                    self._note_refresh_failure()
                     # Persist an empty token file so on next start we don't
                     # silently "restore" a dead session.
                     try:
@@ -563,6 +625,7 @@ class ESIAuth:
                     f"{resp.status_code}"
                 )
                 self._access_token = None
+                self._note_refresh_failure()
                 return False
 
             try:
@@ -572,11 +635,13 @@ class ESIAuth:
                 self._expires_at = datetime.now(timezone.utc) + timedelta(
                     seconds=data.get("expires_in", 1199)
                 )
+                self._clear_refresh_backoff()
                 self._save_tokens()
                 return True
             except Exception as e:
                 print(f"[ESI Auth] Refresh response parse error: {e}")
                 self._access_token = None
+                self._note_refresh_failure()
                 return False
 
     @staticmethod
@@ -604,6 +669,7 @@ class ESIAuth:
                 # character_id/name intact (matches prior behavior where a
                 # decode failure was swallowed without overwriting state).
                 return
+            self._last_scopes = frozenset(self._scopes_from_payload(payload))
 
             # Subject format: "CHARACTER:EVE:1234567890"
             sub = payload.get("sub", "")
@@ -625,9 +691,22 @@ class ESIAuth:
         space-separated string — both are handled. Triggers a refresh via the
         access_token property if no decoded token is in memory yet. Returns an
         empty set on any error (missing/expired token, malformed JWT), so
-        callers can treat 'unknown' as 'not granted' and route to re-auth."""
-        token = self._access_token
+        callers can treat 'unknown' as 'not granted' and route to re-auth.
+
+        With no token in memory (a failed refresh dropped it) an account that
+        still holds its refresh token answers from the set cached at the last
+        decode, so this does no network I/O then; only with no cached set does
+        it fall back to the lazy access_token read. That read is skipped
+        entirely once a refresh has failed (until a success clears the stamp),
+        even past the backoff window: scope checks run on the Tk thread and
+        must not wait on a 15 s SSO POST."""
+        token = getattr(self, "_access_token", None)
         if not token:
+            cached = getattr(self, "_last_scopes", None)
+            if cached is not None and getattr(self, "_refresh_token", None):
+                return set(cached)
+            if getattr(self, "_refresh_failed_at", None) is not None:
+                return set()
             # Lazily obtain a valid access token (may refresh) so a freshly
             # loaded account still reports its scopes. Never raises.
             try:
@@ -636,7 +715,17 @@ class ESIAuth:
                 token = None
         if not token:
             return set()
-        scp = self._decode_jwt_payload(token).get("scp")
+        payload = self._decode_jwt_payload(token)
+        scopes = self._scopes_from_payload(payload)
+        if payload:
+            self._last_scopes = frozenset(scopes)
+        return scopes
+
+    @staticmethod
+    def _scopes_from_payload(payload: dict) -> set[str]:
+        """The `scp` claim of a decoded JWT payload as a set (list or
+        space-separated string); empty when absent or malformed."""
+        scp = payload.get("scp") if isinstance(payload, dict) else None
         if isinstance(scp, str):
             return {s for s in scp.split(" ") if s}
         if isinstance(scp, (list, tuple)):
@@ -656,8 +745,17 @@ class ESIAuth:
         or the fittings scopes) reports those as missing so the UI can flag ⚠ +
         offer Re-authorize for ANY missing scope — not just fittings. Defensive:
         an unreadable/expired token (no granted scopes) reports every scope
-        missing, routing the user to re-auth rather than silently degrading."""
+        missing, routing the user to re-auth rather than silently degrading.
+
+        Unknown is not missing: an account that holds its refresh token but has
+        neither an access token nor a cached scope set (its refresh failed and
+        nothing was ever decoded) reports an EMPTY set rather than every scope."""
         granted = self.granted_scopes()
+        if (not granted
+                and getattr(self, "_refresh_token", None)
+                and not getattr(self, "_access_token", None)
+                and getattr(self, "_last_scopes", None) is None):
+            return set()
         return {s for s in SCOPES if s not in granted}
 
     def has_market_structure_scope(self) -> bool:
@@ -751,9 +849,15 @@ class ESIAuth:
                 if self._do_refresh():
                     self._decode_character_info()
                     print(f"[ESI Auth] Restored session: {self._character_name}")
+                elif self._refresh_token:
+                    # Transient failure (network, 5xx, 429): keep the account
+                    # and its refresh token; the backoff window paces the
+                    # retry (ESI-3). Only invalid_grant clears the token, in
+                    # _do_refresh.
+                    print("[ESI Auth] Token refresh failed at start-up; "
+                          "keeping the account, will retry")
                 else:
                     print("[ESI Auth] Stored token expired, re-login needed")
-                    self._refresh_token = None
         except Exception as e:
             print(f"[ESI Auth] Error loading tokens: {e}")
 

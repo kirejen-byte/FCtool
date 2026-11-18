@@ -110,6 +110,9 @@ T_MONITORS_REPLY = getattr(proto, "T_MONITORS_REPLY", "monitors_reply")
 LAYOUT_TOLERANCE = 0.01
 
 
+_CONTROL_TO_SPACE = {c: " " for c in list(range(0x20)) + [0x7F]}
+
+
 def _ascii(value, default="-"):
     """Collapse any value to a one-line ASCII string (cp1252 log trap)."""
     if value is None:
@@ -119,7 +122,8 @@ def _ascii(value, default="-"):
     except Exception:
         return default
     text = text.encode("ascii", "replace").decode("ascii")
-    return text.replace("\r", " ").replace("\n", " ").strip() or default
+    text = text.translate(_CONTROL_TO_SPACE)
+    return text.strip() or default
 
 
 # --------------------------------------------------------------- snapshot
@@ -1018,6 +1022,10 @@ class HelperSupervisor(object):
     @staticmethod
     def _check_hello(msg, token):
         """None when ``msg`` is a hello bearing our token, else the problem."""
+        if msg.get("type") == proto.T_ERROR:
+            # The helper's own pre-hello failure (_fail_early): say why.
+            return ("helper reported %s: %s"
+                    % (_ascii(msg.get("code")), _ascii(msg.get("msg"))))
         if msg.get("type") != proto.T_HELLO:
             return ("first helper line was '%s', not hello"
                     % (_ascii(msg.get("type")),))

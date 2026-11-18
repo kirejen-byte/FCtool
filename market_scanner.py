@@ -110,6 +110,50 @@ CACHE_TTL_CONTRACT_ITEMS = 3600
 # behaviour), so existing cache files load unchanged.
 CACHE_TTL_CONTRACT_ITEMS_EMPTY = 12 * 3600
 
+# Contract-location resolves (station / structure id -> system id). A positive is
+# persisted in ``locations`` forever (a station never moves). A DEFINITIVE miss
+# (404, or a 403 = no docking access for the CURRENT character) is persisted in
+# ``locations_neg`` as ``{id: epoch}`` and expires after this TTL, so a new
+# primary with docking rights heals within a day. A TRANSIENT miss (timeout, 5xx,
+# 420, no character) is kept for the running pass only and never persisted.
+LOCATION_NEG_TTL = 24 * 3600
+
+
+def _positive_sysid(val) -> "int | None":
+    """A ``locations`` value that is a real system id, else None. The legacy
+    ``-1`` "unknown" sentinel (and any non-int) reads as a miss."""
+    if isinstance(val, int) and not isinstance(val, bool) and val > 0:
+        return val
+    return None
+
+
+def _neg_fresh(stamp, now: float) -> bool:
+    """A ``locations_neg`` stamp still inside ``LOCATION_NEG_TTL``. A garbage or
+    future stamp (clock skew) counts as expired: the id is re-resolved."""
+    if isinstance(stamp, bool) or not isinstance(stamp, (int, float)):
+        return False
+    age = now - float(stamp)
+    return 0 <= age < LOCATION_NEG_TTL
+
+
+def _put_location_negative(data: dict, key: str, stamp: float) -> None:
+    """Cache-dict mutation: stamp ``key`` as a definitive miss and drop a legacy
+    ``-1`` for it from ``locations`` (a positive there is left alone)."""
+    neg = data.get("locations_neg")
+    if not isinstance(neg, dict):
+        neg = data["locations_neg"] = {}
+    neg[key] = stamp
+    locs = data.get("locations")
+    if isinstance(locs, dict) and key in locs and _positive_sysid(locs[key]) is None:
+        del locs[key]
+
+
+def _drop_location_negative(data: dict, key: str) -> None:
+    """Cache-dict mutation: forget a negative for ``key`` (a positive landed)."""
+    neg = data.get("locations_neg")
+    if isinstance(neg, dict):
+        neg.pop(key, None)
+
 # Pass 2 of the contract scan fetches each surviving contract's items over ESI.
 # Each fetch is one blocking ~0.4-1.0s round-trip, so fetching 300+ survivors
 # SERIALLY took minutes (the user-reported "stuck at 309/316" plateau — the
@@ -630,6 +674,12 @@ class MarketEsiAdapter(Protocol):
         ...
 
     def resolve_location_system(self, location_id: int) -> int | None:
+        ...
+
+    # Optional, duck-typed (preferred when present): ``(sysid, kind)`` with kind
+    # "ok" / "not_found" / "forbidden" / "transient", so the scanner persists only
+    # definitive misses. Without it a None from the method above is transient.
+    def resolve_location_system_ex(self, location_id: int) -> "tuple[int | None, str]":
         ...
 
     # Optional (corp/alliance contracts). The scanner duck-types their presence.
@@ -1297,7 +1347,25 @@ class MarketScanner:
                 # system filter is active. With no filter the match is region-wide
                 # and csys is informational only — skip the resolve entirely.
                 if system_id is not None:
+                    sess = self._session
+                    hits_before = sess.loc_net_resolves
                     csys = self._resolve_system_cached(loc_id)
+                    # ESI error-limit floor: ``error_limited`` reads the LAST
+                    # response, so consult it only after THIS pass itself asked
+                    # the adapter for a resolve (counted per adapter call; a
+                    # low reading left by the order pull must not stop pass 1
+                    # before it starts). Once at the floor, the remaining
+                    # uncached locations are not resolved (unknown, nothing
+                    # cached); the scan is flagged at the first such skip.
+                    if (not sess.loc_network_blocked
+                            and sess.loc_net_resolves > hits_before
+                            and bool(getattr(self._adapter, "error_limited", False))):
+                        sess.loc_network_blocked = True
+                    if sess.loc_skipped and "contract_error_limit" not in degraded:
+                        degraded.append("contract_error_limit")
+                        log.warning(
+                            "[market] location resolves hit the ESI error-limit "
+                            "floor - remaining unresolved locations skipped")
                     # Strict system filter keeps ONLY confirmed in-staging
                     # contracts (csys == system_id): other-system AND
                     # unknown-location (csys is None) are both dropped BEFORE any
@@ -1597,20 +1665,58 @@ class MarketScanner:
 
     def _resolve_system_cached(self, location_id: int) -> int | None:
         """Resolve a contract ``location_id`` to a system id, memoized in the
-        cache. 0 / falsy → None. Adapter errors → None (treated as unknown)."""
+        cache. 0 / falsy → None. Adapter errors → None (treated as unknown).
+
+        A positive is persisted; a DEFINITIVE miss (404 / 403) is persisted in
+        ``locations_neg`` for ``LOCATION_NEG_TTL``; a TRANSIENT miss (and an
+        adapter exception) is memoised for the running pass only. During a pass
+        whose resolves reached the error-limit floor an uncached id is not
+        resolved at all (None, nothing cached)."""
         if not location_id:
             return None
         cached = self._read_location_cache(int(location_id))
         if cached is not None:
-            # Sentinel -1 means "resolved to unknown" — don't re-hit ESI for it.
+            # Sentinel -1 means "known unknown" (a fresh definitive miss, or a
+            # transient one earlier in this pass) - don't re-hit ESI for it.
             return None if cached == -1 else cached
+        sess = self._session
+        if sess is not None:
+            if sess.loc_network_blocked:
+                sess.loc_skipped += 1
+                return None
+            sess.loc_net_resolves += 1
+        sysid, kind = self._resolve_location(int(location_id))
+        if kind == "ok":
+            self._write_location_cache(int(location_id), sysid)
+        else:
+            self._write_location_negative(
+                int(location_id), definitive=kind in ("not_found", "forbidden"))
+        return sysid
+
+    def _resolve_location(self, location_id: int) -> "tuple[int | None, str]":
+        """One adapter resolve as ``(sysid, kind)``. Prefers the duck-typed
+        ``resolve_location_system_ex``; an adapter with only the old method
+        reports a None as transient (it cannot say why). An exception, an
+        unknown kind or an unusable "ok" id are transient."""
+        ex = getattr(self._adapter, "resolve_location_system_ex", None)
         try:
-            sysid = self._adapter.resolve_location_system(int(location_id))
+            if callable(ex):
+                sysid, kind = ex(location_id)
+            else:
+                sysid = self._adapter.resolve_location_system(location_id)
+                kind = "ok" if sysid is not None else "transient"
         except Exception:
             log.exception("[market] location resolve failed for %s", location_id)
-            sysid = None
-        self._write_location_cache(int(location_id), sysid if sysid is not None else -1)
-        return sysid
+            return None, "transient"
+        if kind == "ok":
+            try:
+                sysid = _positive_sysid(int(sysid))
+            except (TypeError, ValueError):
+                sysid = None
+            return (sysid, "ok") if sysid is not None else (None, "transient")
+        if kind in ("not_found", "forbidden"):
+            return None, kind
+        return None, "transient"
 
     # ── Gap list ──────────────────────────────────────────────────────────────
 
@@ -1746,7 +1852,10 @@ class MarketScanner:
     #     "snapshots": {"<source_id>": <MarketSnapshot.to_dict>},
     #     "contract_items": {"<contract_id>": {"items": [...], "etag": str|null,
     #                                          "fetched_at": iso}},
-    #     "locations": {"<location_id>": system_id_int_or_-1},
+    #     "locations": {"<location_id>": system_id_int},  # positives only; a
+    #                  legacy -1 (older builds) reads as a miss
+    #     "locations_neg": {"<location_id>": epoch},  # definitive misses,
+    #                  LOCATION_NEG_TTL; pruned at write once expired
     #     "etags": {"<key>": etag}     # region-orders / contracts-list ETags
     #   }
 
@@ -1778,6 +1887,7 @@ class MarketScanner:
                 log.exception("[market] cache mutate failed")
                 return
             self._prune_expired_contract_items(data)
+            self._prune_expired_location_negatives(data)
             parent = os.path.dirname(self._cache_path)
             if parent and not os.path.isdir(parent):
                 try:
@@ -1804,6 +1914,18 @@ class MarketScanner:
                         CACHE_TTL_CONTRACT_ITEMS_EMPTY if e.get("empty")
                         else CACHE_TTL_CONTRACT_ITEMS)]:
             del items[key]
+
+    @staticmethod
+    def _prune_expired_location_negatives(data: dict) -> None:
+        """Drop ``locations_neg`` stamps the readers no longer honour (expired,
+        garbage or future - the SAME ``_neg_fresh`` rule), so the map stays
+        bounded. Positives in ``locations`` are never touched here."""
+        neg = data.get("locations_neg")
+        if not isinstance(neg, dict):
+            return
+        now = time.time()
+        for key in [k for k, v in neg.items() if not _neg_fresh(v, now)]:
+            del neg[key]
 
     def _store_snapshot(self, snap: MarketSnapshot) -> None:
         if not snap.source_id:
@@ -1880,21 +2002,49 @@ class MarketScanner:
         self._write_cache(_mut)
 
     def _read_location_cache(self, location_id: int) -> int | None:
+        """A positive system id, ``-1`` for a fresh definitive miss, or None (a
+        miss: resolve it). A legacy ``-1`` in ``locations`` is a miss."""
         # During a scan, served from the in-memory session (so hundreds of
         # contracts at one citadel share a single resolve AND a single disk read).
         if self._session is not None:
             return self._session.get_location(int(location_id))
         data = self._read_cache()
-        val = (data.get("locations") or {}).get(str(location_id))
-        return int(val) if isinstance(val, int) else None
+        key = str(location_id)
+        pos = _positive_sysid((data.get("locations") or {}).get(key))
+        if pos is not None:
+            return pos
+        neg = data.get("locations_neg")
+        if isinstance(neg, dict) and _neg_fresh(neg.get(key), time.time()):
+            return -1
+        return None
 
     def _write_location_cache(self, location_id: int, system_id: int) -> None:
+        """Persist a POSITIVE resolve (and forget any negative for the id)."""
         if self._session is not None:
             self._session.put_location(int(location_id), int(system_id))
             return
+        key = str(location_id)
 
         def _mut(data: dict) -> None:
-            data.setdefault("locations", {})[str(location_id)] = int(system_id)
+            data.setdefault("locations", {})[key] = int(system_id)
+            _drop_location_negative(data, key)
+
+        self._write_cache(_mut)
+
+    def _write_location_negative(self, location_id: int, *, definitive: bool) -> None:
+        """Record a failed resolve: a DEFINITIVE one is persisted in
+        ``locations_neg`` (stamped now); a transient one only in the running
+        pass's session (outside a pass it is not recorded at all)."""
+        if self._session is not None:
+            self._session.put_location_negative(int(location_id), definitive=definitive)
+            return
+        if not definitive:
+            return
+        key = str(location_id)
+        stamp = time.time()
+
+        def _mut(data: dict) -> None:
+            _put_location_negative(data, key, stamp)
 
         self._write_cache(_mut)
 
@@ -1928,14 +2078,26 @@ class _ContractCacheSession:
         data = scanner._read_cache()  # the ONE disk read for the whole pass
         raw_items = data.get("contract_items")
         raw_locs = data.get("locations")
+        raw_neg = data.get("locations_neg")
         # Full in-memory view (loaded ∪ fetched-this-pass), for serving lookups.
         self._items: dict[str, dict] = dict(raw_items) if isinstance(raw_items, dict) else {}
         self._locations: dict[str, int] = dict(raw_locs) if isinstance(raw_locs, dict) else {}
+        self._loc_neg: dict[str, float] = dict(raw_neg) if isinstance(raw_neg, dict) else {}
+        # Transient resolve failures: memoised for THIS pass only, never flushed.
+        self._transient_locs: set[str] = set()
         # Delta accumulated since the last flush (only these are written back, so
         # a concurrent writer's other keys survive the merge).
         self._pending_items: dict[str, dict] = {}
         self._pending_locs: dict[str, int] = {}
+        self._pending_neg: dict[str, float] = {}
         self._fetched_since_flush = 0
+        # Pass-1 error-limit bookkeeping (read/written by the scanner): how many
+        # resolves of THIS pass were handed to the adapter (calls, not
+        # responses), whether the floor was reached (then uncached ids are no
+        # longer resolved), and how many uncached ids were skipped since.
+        self.loc_net_resolves = 0
+        self.loc_network_blocked = False
+        self.loc_skipped = 0
 
     # ── contract items ────────────────────────────────────────────────────────
 
@@ -1978,36 +2140,62 @@ class _ContractCacheSession:
     # ── locations ─────────────────────────────────────────────────────────────
 
     def get_location(self, location_id: int) -> int | None:
-        """Cached resolved system id (or the -1 unknown sentinel), else None. The
-        caller (`_resolve_system_cached`) interprets the sentinel."""
-        val = self._locations.get(str(location_id))
-        return int(val) if isinstance(val, int) else None
+        """Cached resolved system id, the -1 "known unknown" sentinel (a fresh
+        definitive miss, or a transient miss earlier in this pass), else None.
+        A legacy -1 in ``locations`` is a miss. The caller
+        (`_resolve_system_cached`) interprets the sentinel."""
+        key = str(location_id)
+        pos = _positive_sysid(self._locations.get(key))
+        if pos is not None:
+            return pos
+        if key in self._transient_locs or _neg_fresh(self._loc_neg.get(key), time.time()):
+            return -1
+        return None
 
     def put_location(self, location_id: int, system_id: int) -> None:
         key = str(location_id)
         self._locations[key] = int(system_id)
         self._pending_locs[key] = int(system_id)
+        self._loc_neg.pop(key, None)
+        self._pending_neg.pop(key, None)
+
+    def put_location_negative(self, location_id: int, *, definitive: bool) -> None:
+        """A failed resolve: definitive -> stamped and flushed to
+        ``locations_neg``; transient -> this pass's memo only."""
+        key = str(location_id)
+        if not definitive:
+            self._transient_locs.add(key)
+            return
+        stamp = time.time()
+        self._loc_neg[key] = stamp
+        self._pending_neg[key] = stamp
 
     # ── flush ─────────────────────────────────────────────────────────────────
 
     def flush(self) -> None:
         """Persist the pending delta (merged into a fresh disk read) and reset the
         counter. No-op when nothing is pending."""
-        if not self._pending_items and not self._pending_locs:
+        if not self._pending_items and not self._pending_locs and not self._pending_neg:
             self._fetched_since_flush = 0
             return
         pend_items = self._pending_items
         pend_locs = self._pending_locs
+        pend_neg = self._pending_neg
 
         def _mut(data: dict) -> None:
             if pend_items:
                 data.setdefault("contract_items", {}).update(pend_items)
             if pend_locs:
                 data.setdefault("locations", {}).update(pend_locs)
+                for key in pend_locs:
+                    _drop_location_negative(data, key)
+            for key, stamp in pend_neg.items():
+                _put_location_negative(data, key, stamp)
 
         self._scanner._write_cache(_mut)
         self._pending_items = {}
         self._pending_locs = {}
+        self._pending_neg = {}
         self._fetched_since_flush = 0
 
 

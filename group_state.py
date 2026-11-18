@@ -8,7 +8,10 @@ reaches exactly these names inside the ``app_dir`` it is handed (spec 6.7 and 7.
   ``group_import_applying.json`` (the same file, renamed while it is applied) and
   ``group_config_state.json`` (history, attention, tasks, remembered exports, last report);
 * the ``backups`` directory - one ``group-import-YYYYMMDD-HHMMSS`` folder per apply, holding a
-  copy of every file about to change plus ``manifest.json``;
+  copy of every file about to change plus ``manifest.json``; and one
+  ``before-restore-YYYYMMDD-HHMMSS`` folder per History restore, holding today's versions of
+  the files it puts back (``copy_before_restore``; outside every rule of the import backups,
+  the newest ``KEEP_BEFORE_RESTORE`` kept);
 * temp siblings of the above (``<name>.<pid>.<n>.tmp``) - and those a killed write left
   beside the state, pending, applying and side files are removed again, under the apply lock
   (``claim_pending``, ``restore_backup``, ``prune_backups``);
@@ -28,6 +31,7 @@ locked or damaged file gives a clean value, never an exception. A writer that co
 job says so, because carrying on in silence would lose settings:
 
 * ``StateWriteError`` (``.file`` = the file name) - ``write_state``, ``make_backup``,
+  ``copy_before_restore`` (which answers ``None`` instead for a backup it cannot read),
   ``write_pending``, ``update_applying``, ``cancel_pending``. Two subclasses:
   ``StateTooBigError`` - ``write_pending`` / ``update_applying`` for work larger than
   ``MAX_PENDING_BYTES``: nothing was written; ``StateApplyingError`` - ``write_pending`` /
@@ -140,9 +144,14 @@ PENDING_FILE = "group_import_pending.json"
 APPLYING_FILE = "group_import_applying.json"
 BACKUP_DIR = "backups"
 BACKUP_PREFIX = "group-import-"
+# A History restore first copies the files it is about to replace (``copy_before_restore``)
+# into a folder of THIS name - outside the import backups' pattern, so no rule of theirs
+# (listing, ranking, pruning, the damaged-run record) ever sees it.
+BEFORE_RESTORE_PREFIX = "before-restore-"
 MANIFEST_FILE = "manifest.json"
 LOCK_FILE = "group_import.lock"         # only where there are no named mutexes
 KEEP_BACKUPS = 5
+KEEP_BEFORE_RESTORE = 3
 HISTORY_KEEP = 10
 
 # The indentation each file's own writer uses, so a file written here differs from the app's
@@ -181,6 +190,8 @@ _MSG_NO_NAME = "too many backups share one name - remove the newest folder in ba
 # "time" must never be handed on to a new backup's name.
 _BACKUP_NAME = re.compile(re.escape(BACKUP_PREFIX)
                           + r"([0-9]{8}-[0-9]{6})(?:-([0-9]{1,6}))?")
+_BEFORE_RESTORE_NAME = re.compile(re.escape(BEFORE_RESTORE_PREFIX)
+                                  + r"([0-9]{8}-[0-9]{6})(?:-([0-9]{1,6}))?")
 _SHA256 = re.compile(r"[0-9a-f]{64}")
 # What a killed write of one of this module's files leaves beside it: the five state files
 # (a restore here, and the app's own writer, name their temp files alike), the pending and
@@ -669,8 +680,9 @@ def _backup_keys(keys) -> list:
     return wanted
 
 
-def _new_backup_folder(root, moment):
-    """Create and return ``(name, path)`` of a fresh backup folder.
+def _new_backup_folder(root, moment, prefix=BACKUP_PREFIX, pattern=None):
+    """Create and return ``(name, path)`` of a fresh backup folder (``prefix`` / ``pattern``:
+    an import backup unless told otherwise - the before-restore copies are named alike).
 
     The name sorts after EVERY entry of the backup pattern that is there - folder, file or
     link: it carries the clock's second, or the newest second among those entries when the
@@ -683,14 +695,15 @@ def _new_backup_folder(root, moment):
     is a mistake, not a first run."""
     if not os.path.isdir(root):
         raise FileNotFoundError(root)
+    pattern = _BACKUP_NAME if pattern is None else pattern
     parent = os.path.join(root, BACKUP_DIR)
     try:
         os.mkdir(parent)
     except FileExistsError:
         pass
-    there = [match for match in map(_BACKUP_NAME.fullmatch, os.listdir(parent)) if match]
+    there = [match for match in map(pattern.fullmatch, os.listdir(parent)) if match]
     stamp = max([moment.strftime("%Y%m%d-%H%M%S")] + [match.group(1) for match in there])
-    base = BACKUP_PREFIX + stamp
+    base = prefix + stamp
     highest = 0
     for match in there:
         if match.group(1) == stamp:
@@ -815,16 +828,18 @@ def _is_link(path) -> bool:
     return os.path.islink(path) or bool(isjunction and isjunction(path))
 
 
-def _backup_names(parent) -> list:
+def _backup_names(parent, pattern=None) -> list:
     """Names of the backup folders under ``parent``, newest first. Only real directories this
-    module could have created: the name pattern is the whole test, links are left alone."""
+    module could have created: the name pattern is the whole test, links are left alone.
+    ``pattern``: the import backups' unless told otherwise (``_BEFORE_RESTORE_NAME``)."""
+    pattern = _BACKUP_NAME if pattern is None else pattern
     try:
         listed = os.listdir(parent)
     except (OSError, ValueError, TypeError):
         return []
     found = []
     for name in listed:
-        match = _BACKUP_NAME.fullmatch(name)
+        match = pattern.fullmatch(name)
         if not match:
             continue
         path = os.path.join(parent, name)
@@ -984,6 +999,71 @@ def restore_backup(app_dir, name, *, sleep=time.sleep) -> list:
         if done:
             restored.append(file_name)
     return restored
+
+
+def copy_before_restore(app_dir, name, *, token="", now=None, sleep=time.sleep):
+    """Before backup ``name`` is put back: copy the LIVE versions of exactly the files it
+    holds into a new ``backups/before-restore-YYYYMMDD-HHMMSS`` folder (UTC; named like the
+    import backups, after the newest such folder) with a ``manifest.json``
+    (``{version, backup, token, created, files}``, ``files`` as ``make_backup`` writes
+    them), keep the newest ``KEEP_BEFORE_RESTORE`` of those folders, and return its name.
+
+    A restore puts back WHOLE files - every setting in them, also those no import may
+    write - so this copy is the way back from it, for the user to take by hand. Its name is
+    outside the ``group-import-`` pattern: ``list_backups``, ``prune_backups``, a restore and
+    the damaged-run record never see it, and it takes none of the ``KEEP_BACKUPS`` places.
+
+    ``None`` - nothing copied - when ``name`` is no backup whose manifest can be used right
+    now: the restore touches no file then either. When a folder made for the same backup
+    and the same non-empty ``token`` (the staged restore's) is there, its name comes back
+    and nothing is copied: a restore that is repeated at a later start found the files put
+    back, wholly or in part, and the copy of its first attempt is the one of today's state.
+    A live file that is not there is recorded ``existed: false``. A copy that could not be
+    completed is removed and ``StateWriteError`` raised. The caller holds ``apply_lock``."""
+    folder = _backup_folder(app_dir, name)
+    if folder is None or _is_link(folder):
+        return None
+    manifest = _read_manifest(folder, sleep)
+    if not isinstance(manifest, dict):          # none, not usable, or in use right now
+        return None
+    root = _writable_root(app_dir, BACKUP_DIR)
+    parent = os.path.join(root, BACKUP_DIR)
+    token = token if isinstance(token, str) else ""
+    if token:
+        for made in _backup_names(parent, _BEFORE_RESTORE_NAME):
+            data = _read_json(os.path.join(parent, made, MANIFEST_FILE), sleep,
+                              limit=MAX_SMALL_FILE_BYTES)
+            if isinstance(data, dict) and data.get("token") == token \
+                    and data.get("backup") == name:
+                return made
+    moment = _as_utc(now)
+    try:
+        made, target = _new_backup_folder(root, moment, BEFORE_RESTORE_PREFIX,
+                                          _BEFORE_RESTORE_NAME)
+    except FileExistsError as exc:              # the one case: no suffix left for that second
+        raise StateWriteError(BACKUP_DIR, _MSG_NO_NAME) from exc
+    except OSError as exc:
+        raise StateWriteError(BACKUP_DIR) from exc
+    failing = MANIFEST_FILE
+    try:
+        entries = []
+        for entry in manifest["files"]:
+            failing = entry["name"]
+            copy = os.path.join(target, failing)
+            existed = _copy_retrying(os.path.join(root, failing), copy, sleep)
+            digest = _settle_copy(copy, sleep) if existed else None
+            entries.append({"key": entry["key"], "name": failing, "existed": existed,
+                            "sha256": digest})
+        failing = MANIFEST_FILE
+        atomic_write_json(os.path.join(target, MANIFEST_FILE),
+                          {"version": 1, "backup": name, "token": token,
+                           "created": _iso(moment), "files": entries}, indent=2)
+    except Exception as exc:
+        _remove_tree(target)
+        raise StateWriteError(failing) from exc
+    for old in _backup_names(parent, _BEFORE_RESTORE_NAME)[KEEP_BEFORE_RESTORE:]:
+        _remove_tree(os.path.join(parent, old))     # best effort: the newest stay
+    return made
 
 
 _GOOD, _IN_USE, _DAMAGED, _HALF = "good", "in use", "damaged", "half"
