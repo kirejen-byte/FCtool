@@ -649,6 +649,7 @@ class GamelogMonitor:
         # that calls _bump_status(), and poll_once re-aggregates only when the
         # generation moved. (gen, GamelogStatus) or None.
         self._status_gen = 0
+        self._status_lock = threading.Lock()
         self._status_cache = None
 
     def _bump_status(self) -> None:
@@ -657,8 +658,10 @@ class GamelogMonitor:
         INVARIANT: mutate FIRST, then bump. The reader (_refresh_status)
         snapshots the generation before aggregating, so a bump that lands
         before its mutation lets a status built from the old state be cached
-        under the new generation and stick."""
-        self._status_gen += 1
+        under the new generation and stick. The increment is locked (writers
+        run on the Tk and poll threads); the reader's read stays lock-free."""
+        with self._status_lock:
+            self._status_gen += 1
 
     def _set_position(self, path, value) -> None:
         """Store a tail offset. Only a NEW key changes the status (it counts
@@ -685,7 +688,8 @@ class GamelogMonitor:
         except OSError:
             exists = False
         cache = self._status_cache
-        if cache is None or cache[0] != gen:
+        if (cache is None or cache[0] != gen
+                or cache[1].logs_dir != (d or "")):
             status = compute_status(d, self._positions, self._listeners,
                                     self._tracked, scanning=True,
                                     dir_exists=exists)
