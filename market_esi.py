@@ -103,6 +103,8 @@ class AuthMarketAdapter:
         self._timeout = timeout
         # A dedicated public session avoids leaking the Authorization header to
         # unauthenticated endpoints; fall back to the auth's session if none.
+        # ``rebind`` keeps an explicitly passed one and re-derives the fallback.
+        self._explicit_public = public_session
         self._public = public_session or getattr(auth, "_session", None)
         self.last_headers: dict = {}
         # cache key -> {"pages": {page_no: (etag, page_body)}, "total": n}.
@@ -137,6 +139,18 @@ class AuthMarketAdapter:
         #                 CORP route (a scope/access shortfall re-auth may fix) →
         #                 do NOT cache, retry next scan.
 
+    def rebind(self, auth) -> None:
+        """Point this adapter at a new primary character's ``auth`` (or None when
+        no character is signed in), in place.
+
+        Swaps ``_auth`` and the auth-derived public session (an explicitly passed
+        ``public_session`` is kept). The per-page ETag cache is KEPT: it holds
+        public bodies only (region orders + public contracts), which do not depend
+        on the character. Called by the GUI on the Tk thread, never while a scan
+        runs, so the scanner (and its cache lock) stays ONE object."""
+        self._auth = auth
+        self._public = self._explicit_public or getattr(auth, "_session", None)
+
     # ── Error-limit awareness (§8.2) ──────────────────────────────────────────
 
     @property
@@ -168,10 +182,16 @@ class AuthMarketAdapter:
 
     def _get_page(self, url, *, authed: bool, params=None, headers=None):
         """One rate-limited GET. Returns the ``requests`` response (or None on a
-        transport error). Captures the rate/error-limit headers."""
+        transport error). Captures the rate/error-limit headers. An authed GET
+        with no character bound (``_auth`` None) is a transport miss too."""
         from rate_limiter import rate_limit
 
-        session = self._auth._session if authed else self._public
+        if authed:
+            if self._auth is None:
+                return None
+            session = self._auth._session
+        else:
+            session = self._public
         if session is None:
             return None
         req_headers = self._headers(authed=authed)
@@ -548,17 +568,37 @@ class AuthMarketAdapter:
         (``system_id``). Upwell structure (id >= 1e12) → authed
         ``/universe/structures/`` (``solar_system_id``; scope already granted, 403
         on no docking access → None). Ids outside both ranges → None."""
+        return self.resolve_location_system_ex(location_id)[0]
+
+    def resolve_location_system_ex(self, location_id: int) -> "tuple[int | None, str]":
+        """``resolve_location_system`` plus WHY a miss missed: ``(sysid, kind)``.
+
+        ``kind`` is ``"ok"`` (``sysid`` set), ``"not_found"`` (404/410, or an id
+        outside both ranges), ``"forbidden"`` (403: no docking access for THIS
+        character) or ``"transient"`` (no response, no character bound, 5xx,
+        420/429, 401, any other non-OK, or an unusable body). The scanner
+        persists the definitive kinds and keeps a transient one for the pass."""
         if _STATION_ID_MIN <= location_id < _STATION_ID_MAX:
             resp = self._get_page(
                 f"{ESI_BASE}/universe/stations/{location_id}/", authed=False
             )
-            return _extract_system(resp, "system_id")
-        if location_id >= _STRUCTURE_ID_MIN:
+            key = "system_id"
+        elif location_id >= _STRUCTURE_ID_MIN:
             resp = self._get_page(
                 f"{ESI_BASE}/universe/structures/{location_id}/", authed=True
             )
-            return _extract_system(resp, "solar_system_id")
-        return None
+            key = "solar_system_id"
+        else:
+            return None, "not_found"
+        if resp is None:
+            return None, "transient"
+        code = getattr(resp, "status_code", None)
+        if code == 403:
+            return None, "forbidden"
+        if code in (404, 410):
+            return None, "not_found"
+        sysid = _extract_system(resp, key)
+        return (sysid, "ok") if sysid is not None else (None, "transient")
 
 
 def _extract_system(resp, key: str) -> int | None:

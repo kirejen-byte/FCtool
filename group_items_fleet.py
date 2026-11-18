@@ -843,7 +843,12 @@ class _TemplatesItem(Item):
     the template selector picks). ``theirs``: its content is replaced; its ``id`` stays, so
     everything that points at it keeps working, and so does its ``doctrine_id`` (a link to
     MY library that a file never carries). ``mine``: skipped. Content that is already the
-    same is ``unchanged`` whatever the choice. A template I do not have is appended with a
+    same - also when mine differs only in what ``_clean_template`` takes out or repairs on
+    the way into a file: named pilots and ``character`` rules (no file carries them), a role
+    outside ``ROLE_VALUES`` (a squad member there) and a rule of a kind outside
+    ``CONDITION_TYPES`` (left out there) - is ``unchanged`` whatever the choice, and keeps
+    all of those as they are. A
+    template I do not have is appended with a
     new id. Everything else in the file - other templates, entries the store cannot read,
     ``cached_characters``, ``ui``, ``version`` - is left exactly as it is.
     """
@@ -1007,10 +1012,17 @@ class _TemplatesItem(Item):
                 continue
             mine = new[index]
             view = _normal(mine, version, _new_stats(), scrub=False)
+            # Mine as it would travel: no pilot, no `character` rule, repaired the way the
+            # group's template was. ``None`` (a template a file could not carry) -> the two
+            # comparisons before it decide alone.
+            travels = _clean_template(mine, version, [])
             # The same as stored, or the same once the store has loaded it (an old-format
-            # file is migrated on load; what an earlier import wrote into it is not).
+            # file is migrated on load; what an earlier import wrote into it is not), or the
+            # same apart from my pilots - which no group file carries.
             if (all(mine.get(key) == template[key] for key in _CONTENT_KEYS)
-                    or all(view[key] == template[key] for key in _CONTENT_KEYS)):
+                    or all(view[key] == template[key] for key in _CONTENT_KEYS)
+                    or (travels is not None
+                        and all(travels[key] == template[key] for key in _CONTENT_KEYS))):
                 result.unchanged.append(name)
                 continue
             if conflict == "mine":

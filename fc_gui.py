@@ -960,6 +960,23 @@ def _tag_rename_refusal(new_name):
             "Pick another name.")
 
 
+def _linux_status_text(backend, text: str) -> str:
+    """Prefix `text` with the Linux/X11 helper state. No backend (every Windows
+    run) returns `text` untouched. Total: a raising snapshot reads "unknown".
+    ASCII prefix only."""
+    if backend is None:
+        return text
+    try:
+        snap = backend.supervisor.status_snapshot()
+        state, last_error = snap.state, snap.last_error
+    except Exception:
+        state, last_error = "unknown", None
+    text = "Linux/X11 previews (%s) - %s" % (state, text)
+    if state == "failed" and last_error:
+        text += " - " + str(last_error)[:80]
+    return text
+
+
 def _read_text_file_for_import(path: str) -> str:
     """Read a text file for one-time import (EVE-O config). Split out so tests
     can stub it without touching the real filesystem. EVE-O writes UTF-8."""
@@ -1020,10 +1037,12 @@ FLEET_POLL_MISS = "miss"           # no usable answer -> grace counter / clear
 def classify_fleet_poll(info, polled_is_boss, members) -> str:
     """Decide what one ``_refresh_fleet_locations`` poll result means. Pure.
 
-    The load-bearing case is the third one. ``ESIAuth.esi_get`` flattens EVERY
-    failure to ``None`` -- 404 "fleet does not exist", 403, 5xx, a network
-    error, even a missing token -- so a caller cannot tell a disbanded fleet
-    from a transient blip by return shape. That matters because
+    The load-bearing case is the third one. The poll reads the status-keeping
+    ``_ex`` routes and filters out transient failures (0 / 420 / 429 / 5xx;
+    see ``fleet_poll_is_transient``) BEFORE calling this, so ``info`` /
+    ``members`` arrive here as definite answers -- except when an unbroken
+    transient run outlived ``FLEET_TRANSIENT_MAX_S``, which is then fed in as
+    a miss on purpose. That matters because
     ``/characters/{id}/fleet/`` is cached (and is famously stale after a
     disband) while ``/fleets/{id}/members/`` 404s the instant the fleet is
     gone: "I am the boss, and the boss-only roster route answered nothing" is
@@ -1033,10 +1052,10 @@ def classify_fleet_poll(info, polled_is_boss, members) -> str:
     kept the last roster -- so for as long as ESI kept serving the stale
     fleet_id, the Fleet tab and the HUD tile showed a fleet that no longer
     existed (owner-reported 2026-08-03). It is a MISS instead: the grace
-    counter absorbs a transient failure, and a fleet that really is gone
-    clears once the grace expires.
+    counter absorbs flicker, and a fleet that really is gone clears once the
+    grace expires.
 
-    ``members`` is the raw ``get_fleet_members`` answer: a non-empty list, or
+    ``members`` is the ``get_fleet_members_ex`` body: a non-empty list, or
     None/[] for "nothing came back". An empty list is a miss too -- a live
     fleet always contains its boss.
     """
@@ -1050,6 +1069,32 @@ def classify_fleet_poll(info, polled_is_boss, members) -> str:
         # the not-boss branch hands it to _process_nonboss_losses.
         return FLEET_POLL_NOT_BOSS
     return FLEET_POLL_MISS
+
+
+# An unbroken run of "could not ask" fleet polls this old counts as a miss:
+# status 0 is also "no token", so a revoked token must not keep a dead fleet
+# on screen forever.
+FLEET_TRANSIENT_MAX_S = 600.0
+
+
+def fleet_poll_is_transient(status, *, members=False) -> bool:
+    """True when an ESI status on the fleet poll means "could not ask". Pure.
+
+    Definite answers: 200, and 404 ("not in a fleet" on the character route,
+    "fleet gone" on the members route). On the boss-only members route a 403
+    is definite too (we are not the boss). Everything else -- 0 (no token /
+    raised), 403 on the CHARACTER route, 420, 429, 5xx, an uncached 304 -- is
+    transient and must not count toward the no-fleet grace."""
+    if status in (200, 404):
+        return False
+    return not (members and status == 403)
+
+
+def fleet_transient_run_expired(since, now,
+                                limit=FLEET_TRANSIENT_MAX_S) -> bool:
+    """True once a transient run that began at monotonic ``since`` has lasted
+    ``limit`` seconds. No run (``since`` None) never expires. Pure."""
+    return since is not None and now - since >= limit
 
 
 def _resolve_reinforced_id_pairs(store, entries=None):
@@ -8535,6 +8580,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # quietly replaces this 100 ms one and the click buys a minute of
         # stale data instead of a fresh poll.
         self._no_fleet_misses = 0
+        self._fleet_transient_since = None   # the old primary's failed asks
         self._fleet_refresh_asap = True
         self._arm_fleet_refresh(100)
 
@@ -8628,6 +8674,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # esi_auth is now (another account, or None).
             self._own_location_sid = None
             self._own_location_mono = 0.0
+            # Fleet poll state belongs to the departing primary -- reset it as
+            # _esi_set_primary does.
+            self._no_fleet_misses = 0
+            self._fleet_transient_since = None
             # Persist the new primary choice
             if self.esi_auth and self.esi_auth.character_id:
                 self.config["primary_character_id"] = self.esi_auth.character_id
@@ -8682,10 +8732,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # Check for duplicate character
             for existing in self.esi_accounts:
                 if existing.character_id == new_auth.character_id:
-                    # Update existing account's tokens
-                    existing._refresh_token = new_auth._refresh_token
-                    existing._access_token = new_auth._access_token
-                    existing._expires_at = new_auth._expires_at
+                    # Update existing account's tokens (under its refresh
+                    # lock, clearing any refresh backoff)
+                    existing.adopt_tokens(new_auth)
                     existing._save_tokens()
                     # Clean up temp file
                     try:
@@ -10905,7 +10954,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # scopes — without re-authorizing they can't import/push in-game fits.
         # The Re-authorize button reuses the SSO login flow (re-logging in as
         # the same character refreshes its tokens with the full current SCOPES).
-        if acct.is_authenticated and not acct.has_scope(SCOPE_FITTINGS_READ):
+        # Same rule as Settings (_acct_missing_scopes): an account whose scopes
+        # are not known yet (start-up refresh failed) is not flagged.
+        if (acct.is_authenticated
+                and SCOPE_FITTINGS_READ in self._acct_missing_scopes(acct)):
             reauth_row = tk.Frame(panel, bg=BG_PANEL)
             reauth_row.pack(fill=tk.X, padx=20, pady=(0, 5))
             tk.Label(
@@ -11391,8 +11443,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         cyno_check_data: dict = {}
 
+        assets_complete = False
         try:
-            assets = acct.get_assets()
+            assets, assets_complete = acct.get_assets(with_status=True)
 
             # Filter: assembled ships in personal hangars only
             _PERSONAL_FLAGS = {"Hangar", "AutoFit"}
@@ -11443,6 +11496,29 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 }
         except Exception as e:
             print(f"[Characters] Asset fetch error for {acct.character_name}: {e}")
+            assets_complete = False
+
+        # A failed or truncated pull reads as "owns nothing": keep the last good
+        # capital lists and do NOT restamp the cache, so the next fetch retries
+        # and the empty result is never persisted. With no prior entry there is
+        # nothing better to show, so today's behaviour stands.
+        if not assets_complete and cached:
+            prior = cached[2]
+            for k in ("fax", "dreads", "blops", "titans"):
+                info[k] = list(prior.get(k, []))
+            if prior.get("ship_type_id") == info["ship_type_id"] \
+                    and "dictor" in prior:
+                info["dictor"] = prior["dictor"]
+            # Cyno state is per HULL (item), not per type: restore it only from
+            # the check recorded for the ship flown now, as the cache-hit path does.
+            if cyno_hull:
+                ship_check = (prior.get("cyno_check") or {}).get(
+                    str(info["ship_item_id"]))
+                if ship_check and "gen" in ship_check:
+                    _ozone_fill_cyno(info, ship_check.get("gen"),
+                                     ship_check.get("ozone", 0), ozone_cfg)
+            self._inject_piloted_capital(info)
+            return info
 
         # Deduplicate: group identical (ship, location) entries with counts
         from collections import Counter
@@ -24876,10 +24952,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             self._preview_after_id = None
             return
         status = self._preview_native_tick_body()
-        self._preview_status = status
+        self._preview_status = status       # bare: the prefix is label-only
         if getattr(self, "_preview_status_label", None) is not None:
             try:
-                self._preview_status_label.config(text=status)
+                self._preview_status_label.config(text=_linux_status_text(
+                    getattr(self, "_preview_thumb_backend", None), status))
             except tk.TclError:
                 pass
         # Heartbeat the Gamelogs diagnostic from the monitor's cached snapshot
@@ -28093,18 +28170,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # Linux/X11: name the backend and its helper state in FRONT of the
         # tick's own status, so "0 tiles" is never mute about why. No backend
         # (every Windows run) leaves the string untouched. ASCII only.
-        be = getattr(self, "_preview_thumb_backend", None)
-        if be is None:
-            return text
-        try:
-            snap = be.supervisor.status_snapshot()
-            state, last_error = snap.state, snap.last_error
-        except Exception:
-            state, last_error = "unknown", None
-        text = "Linux/X11 previews (%s) - %s" % (state, text)
-        if state == "failed" and last_error:
-            text += " - " + str(last_error)[:80]
-        return text
+        return _linux_status_text(
+            getattr(self, "_preview_thumb_backend", None), text)
 
     def _preview_set_mode(self, new_mode: str):
         """Switch preview mode: tear down the old mode, persist, boot the new one.
@@ -28600,6 +28667,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             return {"layouts": {}, "focus_hotkeys": {}, "cycle_order": [],
                     "errors": [f"could not parse EVE-O config: {e}"]}
 
+        def _dict_or_empty(value):
+            return value if isinstance(value, dict) else {}
+
         def _char_key(title: str):
             # Reuse the tracker's own title parser for exact prefix parity.
             char = eve_client_tracker._char_from_title(
@@ -28609,7 +28679,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             return char.strip().lower()
 
         layouts: dict = {}
-        for title, point in (data.get("FlatLayout") or {}).items():
+        for title, point in _dict_or_empty(data.get("FlatLayout")).items():
             key = _char_key(title)
             if key is None:
                 continue
@@ -28620,7 +28690,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 errors.append(f"bad layout point for {title!r}: {point!r}")
 
         focus_hotkeys: dict = {}
-        for title, hk in (data.get("ClientHotkey") or {}).items():
+        for title, hk in _dict_or_empty(data.get("ClientHotkey")).items():
             key = _char_key(title)
             if key is None:
                 continue
@@ -28635,7 +28705,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             focus_hotkeys[key] = text
 
         order_pairs = []
-        for title, idx in (data.get("CycleGroup1ClientsOrder") or {}).items():
+        for title, idx in _dict_or_empty(data.get("CycleGroup1ClientsOrder")).items():
             key = _char_key(title)
             if key is None:
                 continue
@@ -28789,6 +28859,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             return
         parsed = self.parse_eveo_config(text)
         summary = self._preview_merge_eveo(parsed)
+        # The merge wrote cfg only; re-register the live hotkeys so the imported
+        # focus/cycle keys work now, not after a restart.
+        if getattr(self, "_preview_hotkeys", None) is not None:
+            try:
+                self._preview_restart_hotkeys()
+            except Exception:
+                log.exception("[preview] hotkey re-register after EVE-O import failed")
         lines = [
             f"Imported from:\n{path}\n",
             f"Layouts added: {summary['added_layouts']}",
@@ -32511,6 +32588,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # the range check dead until the next Settings->Save.
             if getattr(self, "_range_monitor", None) is None:
                 self._build_range_monitor(logs_path, channel)
+            # Record what the tails now stand on, in _setup_modules' shape, so
+            # the Settings->Save that may follow keeps them instead of
+            # rebuilding both for a character it has already applied.
+            self._chat_tail_sig = FCToolGUI._chat_tail_signature(
+                self.config, logs_path, channel, tracked_char)
             # New listener = a new log universe, so the backfill budget charges
             # (and records the key, so the Save that may follow does not).
             key = (logs_path, channel, tracked_char)
@@ -33180,8 +33262,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._save_config()
         self._save_status.config(text="Saved!", fg=FG_GREEN)
 
-        # Restart modules
-        self._stop_monitoring()
+        # Restart modules. A running zKill monitor whose inputs this Save did
+        # not change stays up: a new one replays ~30 min and re-announces every
+        # fight in it. Decided BEFORE the reload below replaces self.config;
+        # _setup_modules re-checks it against the reloaded dict.
+        keep_zkill = FCToolGUI._zkill_keepable(
+            getattr(self, "zkill_monitor", None), self.config,
+            getattr(self, "_zkill_sig", None))
+        self._stop_monitoring(keep_zkill=keep_zkill)
         self.config = self._load_config()
         # The config OBJECT was just replaced, so the registry must be rebuilt
         # against the new dict — otherwise every later _save_channels() would
@@ -33201,8 +33289,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             self._hud_host.config = self.config
         self._refresh_channel_rows()
         self._rebuild_intel_channel_checkboxes()
-        self._setup_modules()
-        self._start_monitoring()
+        self._setup_modules(keep_zkill=keep_zkill)
+        self._start_monitoring(keep_zkill=keep_zkill)
         # Both of intel ingest's inputs live in this dialog (the logs path and,
         # via the Channels registry, the Intel-tagged set), so re-point it here.
         # Idempotent: unchanged inputs cost one dict read.
@@ -33331,6 +33419,54 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
     # ── Module Setup ──────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _chat_tail_signature(config, logs_path, channel, tracked_char):
+        """The inputs both fleet tails are built from. ONE shape for both
+        writers of ``_chat_tail_sig`` (_setup_modules and the tracked-character
+        change), so a Settings->Save that changed none of them keeps the live
+        monitors instead of re-discovering every log."""
+        return (logs_path, channel, tracked_char,
+                config.get("poll_interval_seconds", 1.0))
+
+    @staticmethod
+    def _zkill_signature(config):
+        """The zKill config the running ZKillMonitor was built from. Equal
+        before and after a Settings->Save = keep the live monitor (its alert
+        history and sequence position), see _save_settings."""
+        zk = config.get("zkillboard", {})
+        if not isinstance(zk, dict):
+            zk = {}
+
+        def _frozen(value):
+            try:
+                return tuple(value or ())
+            except TypeError:
+                return (value,)
+
+        return (bool(zk.get("enabled")),
+                _frozen(zk.get("watch_regions", [])),
+                _frozen(zk.get("watch_alliances", [])),
+                _frozen(zk.get("watch_systems", [])),
+                zk.get("min_kill_value_millions", 0),
+                zk.get("alert_window_seconds", 300))
+
+    @staticmethod
+    def _zkill_is_running(monitor):
+        """True when ``monitor``'s poll thread is alive (a kept monitor needs
+        no start(), and its replay cutoffs must not move)."""
+        thread = getattr(monitor, "_thread", None)
+        return thread is not None and thread.is_alive()
+
+    @staticmethod
+    def _zkill_keepable(monitor, config, built_sig):
+        """Settings->Save's keep decision: True only for a RUNNING monitor
+        whose build signature equals the one ``config`` (the dict about to be
+        saved) describes. Anything else rebuilds exactly as before."""
+        return bool(monitor is not None
+                    and FCToolGUI._zkill_is_running(monitor)
+                    and built_sig is not None
+                    and FCToolGUI._zkill_signature(config) == built_sig)
+
     def _build_range_monitor(self, logs_path, channel):
         """Build (and hook up) the range check's own fleet tail.
 
@@ -33371,13 +33507,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         )
         self._range_monitor.on_message(self._range_check_observe)
 
-    def _setup_modules(self):
+    def _setup_modules(self, keep_zkill=False):
         # Fleet Management
         xup_cfg = self.config.get("xup", {})
         # Read BEFORE the counter is replaced: a tied target with no aggregate
         # to re-tie to carries across a Settings->Save (see below).
         prev_xup_threshold = getattr(
             getattr(self, "xup_counter", None), "threshold", None)
+        # ...and its live roster: a Save pressed during a form-up must not
+        # throw the x-ups away (the chat tail resumes past them, so they would
+        # never be re-read). None on the startup pass.
+        prev_xup_state = getattr(
+            getattr(self, "xup_counter", None), "state", None)
         self.xup_counter = XUpCounter(
             trigger_word=xup_cfg.get("trigger_word", "x"),
             fire_word=xup_cfg.get("fire_word", "FIRE"),
@@ -33387,13 +33528,21 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             on_fire=self._on_xup_fire,
             on_update=self._on_xup_update,
         )
+        if isinstance(prev_xup_state, XUpState):
+            # Carry the roster, then re-judge READY against the threshold the
+            # new counter was BUILT with, before the re-tie below (which only
+            # recomputes when the threshold moves). A READY flip caused by the
+            # carry fires no on_ready sound: no x-up arrived.
+            self.xup_counter.state = prev_xup_state
+            prev_xup_state.is_ready = (
+                prev_xup_state.count >= self.xup_counter.threshold)
         # A Settings->Save rebuilds the counter at the MANUAL threshold; while
         # "= DPS" is ticked, re-tie it to the last aggregate straight away.
         self._xup_retie_rebuilt_counter(prev_xup_threshold)
 
         # Chat Monitor
         logs_path = self.config.get("eve_logs_path", "")
-        # This also runs on every Settings->Save, which REPLACES the monitor:
+        # This also runs on every Settings->Save, which may REPLACE the monitor:
         # flush the outgoing one's tail positions first (the per-pass flush is
         # throttled), or its successor re-tails what it already delivered.
         # Guarded — there is no monitor yet on the __init__ pass.
@@ -33408,17 +33557,32 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         if logs_path and os.path.isdir(logs_path):
             channel = xup_cfg.get("channel_name", "Fleet")
             tracked_char = self.config.get("tracked_character", "") or None
-            self.chat_monitor = ChatMonitor(
-                logs_path=logs_path,
-                poll_interval=self.config.get("poll_interval_seconds", 1.0),
-                channel_filter=channel,
-                listener_filter=tracked_char,
-            )
-            self.chat_monitor.on_message(self._on_chat_message)
-            # The range check's own listener-agnostic tail beside it -- see
-            # _build_range_monitor for why it is a second monitor and why its
-            # kwargs are what they are.
-            self._build_range_monitor(logs_path, channel)
+            # A Settings->Save that changed none of the tails' inputs keeps
+            # BOTH live monitors: a fresh ChatMonitor re-globs the folder and
+            # re-reads the header of every candidate log (seconds of work).
+            # Not while a poll thread outlived its join (a wedged pass): it may
+            # still be inside these objects, so build new ones as before.
+            tail_sig = FCToolGUI._chat_tail_signature(
+                self.config, logs_path, channel, tracked_char)
+            poller = getattr(self, "_chat_thread", None)
+            keep_tails = (
+                tail_sig == getattr(self, "_chat_tail_sig", None)
+                and getattr(self, "chat_monitor", None) is not None
+                and getattr(self, "_range_monitor", None) is not None
+                and not (poller is not None and poller.is_alive()))
+            if not keep_tails:
+                self.chat_monitor = ChatMonitor(
+                    logs_path=logs_path,
+                    poll_interval=self.config.get("poll_interval_seconds", 1.0),
+                    channel_filter=channel,
+                    listener_filter=tracked_char,
+                )
+                self.chat_monitor.on_message(self._on_chat_message)
+                # The range check's own listener-agnostic tail beside it --
+                # see _build_range_monitor for why it is a second monitor and
+                # why its kwargs are what they are.
+                self._build_range_monitor(logs_path, channel)
+                self._chat_tail_sig = tail_sig
             # This method also runs on every Settings->Save, so charge the
             # one-shot backfill budget only when the log universe actually
             # changed — see _links_backfill_key in __init__.
@@ -33431,6 +33595,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         else:
             self.chat_monitor = None
             self._range_monitor = None
+            self._chat_tail_sig = None
             # No readable logs path: a budget charged by the PREVIOUS config
             # must not outlive it, or the poller reads a log the settings in
             # force say nothing about.
@@ -33449,11 +33614,30 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # PICKED while a different one was actually in force.
         if hasattr(self, "_loss_source_var"):
             self._loss_source_var.set(self._loss_reconciler.source)
-        if zk_cfg.get("enabled"):
+        # keep_zkill: _save_settings found the zKill inputs unchanged and left
+        # the monitor running. Re-check against the RELOADED config; on a
+        # mismatch stop it here and build a new one exactly as before.
+        zk_sig = FCToolGUI._zkill_signature(self.config)
+        kept_zkill = getattr(self, "zkill_monitor", None) if keep_zkill else None
+        if kept_zkill is not None and (
+                not zk_cfg.get("enabled")
+                or zk_sig != getattr(self, "_zkill_sig", None)):
+            kept_zkill.stop()
+            kept_zkill = None
+        if zk_cfg.get("enabled") and kept_zkill is not None:
+            # The live monitor keeps its alert history and sequence position
+            # (a new one replays ~30 min and re-announces every fight in it);
+            # refresh the two inputs that do not live in its signature.
+            kept_zkill.set_friendly_ids(set(self._standings_cache.friendly_ids))
+            kept_zkill.on_killmail = self._killmail_hook()
+            self.zkill_monitor = kept_zkill
+            self._zkill_status.config(text="ZKILL: ON", fg=FG_GREEN)
+        elif zk_cfg.get("enabled"):
             # Monitor runs with watch_all=True and min_pilots=1 to capture
             # everything; GUI-only filters (All K-Space, min pilots, max jumps)
             # are applied at display time so they don't affect what the
             # monitor captures.
+            self._zkill_sig = zk_sig
             self.zkill_monitor = ZKillMonitor(
                 watch_regions=zk_cfg.get("watch_regions", []),
                 watch_alliances=zk_cfg.get("watch_alliances", []),
@@ -33472,6 +33656,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             self._zkill_status.config(text="ZKILL: ON", fg=FG_GREEN)
         else:
             self.zkill_monitor = None
+            self._zkill_sig = None
             self._zkill_status.config(text="ZKILL: OFF", fg=FG_DIM)
         # No monitor => no killmails at all. The ledger must SAY so, not render
         # an empty table that reads as "no losses".
@@ -33487,7 +33672,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
     # ── Monitoring ────────────────────────────────────────────────────────────
 
-    def _start_monitoring(self):
+    def _start_monitoring(self, keep_zkill=False):
         self._running = True
         if self.chat_monitor:
             # Restart-safe spawn (the ZKillMonitor.start / GamelogMonitor.start
@@ -33515,7 +33700,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     target=self._chat_poll_loop, args=(stop,),
                     name=CHAT_POLL_THREAD_NAME, daemon=True)
                 self._chat_thread.start()
-        if self.zkill_monitor:
+        if self.zkill_monitor and keep_zkill and FCToolGUI._zkill_is_running(
+                self.zkill_monitor):
+            # A Settings->Save kept the live monitor (unchanged zKill config):
+            # it replays nothing, so the replay cutoffs stay where its own
+            # start put them; moving them would drop kills that happened
+            # before the Save but reach zKill after it.
+            pass
+        elif self.zkill_monitor:
             # A starting monitor replays ~200 sequences (~30 min) of backlog, so
             # move both engines' replay cutoffs to NOW — that history is not
             # this session's fleet losses, and it must not ARM a phantom fight.
@@ -33523,7 +33715,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             self._battle_ledger.set_started_at()
             self.zkill_monitor.start()
 
-    def _stop_monitoring(self):
+    def _stop_monitoring(self, keep_zkill=False):
         self._running = False
         # Wake the chat poll thread out of its interval wait, then wait for it
         # to actually exit, so a caller can rely on at most one poller existing
@@ -33562,7 +33754,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             if callable(range_flush):
                 range_flush()
             range_monitor.stop()
-        if self.zkill_monitor:
+        # keep_zkill: only Settings->Save passes it, when the zKill config is
+        # unchanged (see _save_settings). Shutdown stops everything.
+        if self.zkill_monitor and not keep_zkill:
             self.zkill_monitor.stop()
         if hasattr(self, '_intel_monitor') and self._intel_monitor:
             # Deliberately NOT _intel_stop: this also runs on Settings->Save,
@@ -33595,6 +33789,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     monitor.poll()
             except Exception:
                 pass
+            # A successor generation already owns the tails (this thread
+            # outlived its join mid-poll): leave the range tail to it rather
+            # than poll it concurrently. _running covers the window between a
+            # Save's _setup_modules (a fresh range tail) and _start_monitoring
+            # (the successor's event). Identity, not stop.is_set(): one
+            # is_set() per pass is the loop's contract with its callers.
+            if not self._running or getattr(self, "_chat_stop", stop) is not stop:
+                break
             try:
                 # The range check's listener-agnostic twin, polled from this
                 # same thread so nothing new is spawned — and polled on EVERY
@@ -34693,7 +34895,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         except tk.TclError:
             pass
 
-    def _xup_apply_dps_tie(self, vm):
+    def _xup_apply_dps_tie(self, vm, alert=True):
         """Follow the fleet's DPS-ship count while tied. Tk thread only.
 
         ``vm.modeled`` is the fleet_stats rule-4 pilot count — the SAME number
@@ -34708,6 +34910,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         True, so without this the READY is silent for the rest of the round.
         True->False (the fleet grew) needs no alert.
 
+        ``alert=False`` (the re-tie of a counter _setup_modules just rebuilt)
+        moves the target silently: a Settings->Save during a READY tied
+        form-up re-judged READY against the MANUAL target first, so the
+        False->True seen here is the Save, not the fleet.
+
         Returns True when the vm carried a usable count (the target now equals
         it), False when the tie is off or there was no data to tie to."""
         if not self._xup_tie_enabled() or vm is None:
@@ -34720,7 +34927,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             return False
         counter = getattr(self, "xup_counter", None)
         was_ready = bool(counter is not None and counter.state.is_ready)
-        if (self._xup_set_threshold(n) and not was_ready
+        if (self._xup_set_threshold(n) and alert and not was_ready
                 and counter.state.is_ready
                 and getattr(self, "_xup_status", None) is not None):
             self._flash_ready(counter.state)
@@ -34737,7 +34944,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         value, spinner synced to it."""
         if not self._xup_tie_enabled():
             return
-        if self._xup_apply_dps_tie(getattr(self, "_fleet_stats_vm", None)):
+        if self._xup_apply_dps_tie(getattr(self, "_fleet_stats_vm", None),
+                                   alert=False):
             return
         carry = self._xup_manual_threshold()
         if prev_threshold is not None:
@@ -35697,7 +35905,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         The poll is a self-rescheduling ``after`` chain armed from every arm
         site: startup, its own re-arms (30s not-auth / 15s in-flight / 60s
-        not-boss / 60s miss / 15s normal / 15s spawn-failure), and
+        not-boss / 60s miss / 60s transient ESI failure / 15s normal / 15s
+        spawn-failure), and
         ``_esi_set_primary``'s "poll again now, with the new primary" nudge.
         None of them stored an id and nothing ever cancelled, so every Set
         Primary click left the live chain running and started another one
@@ -35747,6 +35956,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # this 30s arm to 100 ms for as long as the user stays that way —
             # a 10 Hz spin with nothing to poll.
             self._fleet_refresh_asap = False
+            # No ESI = no fleet answer: drop the poll's cached fleet id / boss
+            # flag (the MOTD Set button and the HUD relevance gate read them).
+            # A revoked token never reaches the transient bound in do_fetch,
+            # so without this a dead fleet would be held forever.
+            self._last_polled_fleet_id = None
+            self._last_polled_fleet_is_boss = False
+            self._fleet_transient_since = None
             self._arm_fleet_refresh(30000)
             return
 
@@ -35772,22 +35988,52 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         def do_fetch():
             try:
-                info = self.esi_auth.get_fleet_info()
+                # The _ex routes keep the HTTP status: only a 404 is "not in a
+                # fleet". 0 / 420 / 429 / 5xx / a character-route 403 mean "could
+                # not ask" and must not feed the no-fleet grace below.
+                info, info_status = self.esi_auth.get_fleet_info_ex()
+                transient = None            # (route, status) of a failed ask
+                if fleet_poll_is_transient(info_status):
+                    transient, info = ("fleet", info_status), None
                 fleet_id = info["fleet_id"] if info else None
                 # Only the fleet boss may read /fleets/{id}/members/ (others get
                 # a guaranteed 403); non-boss falls into the existing back-off.
                 polled_is_boss = bool(
                     info and self.esi_auth.is_boss(
                         info, self.esi_auth.character_id))
-                # Cache the primary character's fleet/boss state so the MOTD tab
-                # can give instant Set-button feedback without re-querying ESI
-                # (see _motd_refresh_fleet_status).
-                self._last_polled_fleet_id = fleet_id if info else None
-                self._last_polled_fleet_is_boss = polled_is_boss
-                if polled_is_boss:
-                    members = self.esi_auth.get_fleet_members(fleet_id=fleet_id)
+                members = None
+                if transient is None:
+                    # Cache the primary character's fleet/boss state so the MOTD
+                    # tab can give instant Set-button feedback without
+                    # re-querying ESI (see _motd_refresh_fleet_status). Only an
+                    # ANSWER is cached: a blip must not drop the Set button or
+                    # the HUD relevance gate.
+                    self._last_polled_fleet_id = fleet_id if info else None
+                    self._last_polled_fleet_is_boss = polled_is_boss
+                    if polled_is_boss:
+                        members, m_status = self.esi_auth.get_fleet_members_ex(
+                            fleet_id=fleet_id)
+                        if fleet_poll_is_transient(m_status, members=True):
+                            transient, members = ("members", m_status), None
+                if transient is not None:
+                    # Bounded: the run's start is kept until a definite answer,
+                    # so once it is FLEET_TRANSIENT_MAX_S old every further
+                    # failed poll counts as a miss (status 0 = no token too).
+                    now = time.monotonic()
+                    since = getattr(self, "_fleet_transient_since", None)
+                    if since is None:
+                        self._fleet_transient_since = since = now
+                    if not fleet_transient_run_expired(since, now):
+                        print(f"[Fleet] ESI {transient[0]} poll answered "
+                              f"{transient[1]} - transient, keeping previous "
+                              f"state")
+                        self._post_ui(self._arm_fleet_refresh, 60000)
+                        return
+                    print(f"[Fleet] ESI {transient[0]} poll answered "
+                          f"{transient[1]}; unanswered for "
+                          f"{int(now - since)}s - counting it as a miss")
                 else:
-                    members = None
+                    self._fleet_transient_since = None
                 verdict = classify_fleet_poll(info, polled_is_boss, members)
                 if verdict == FLEET_POLL_ROSTER:
                     # Got a real fleet — reset miss counter
@@ -35858,8 +36104,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     # No usable fleet answer: either ESI says we are in no fleet,
                     # or we ARE the boss and the boss-only members route gave us
                     # nothing (a disbanded fleet, once /characters/{id}/fleet/'s
-                    # cached id outlives it — see classify_fleet_poll). Both could
-                    # equally be a transient ESI error, so only clear after
+                    # cached id outlives it — see classify_fleet_poll). A failed
+                    # ask (5xx / 420 / no token) never gets here unless its run
+                    # outlived FLEET_TRANSIENT_MAX_S; still, only clear after
                     # NO_FLEET_GRACE consecutive misses to avoid flicker.
                     self._no_fleet_misses += 1
                     if self._no_fleet_misses >= NO_FLEET_GRACE:
@@ -36560,12 +36807,15 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             err = None
             try:
                 from zkill_monitor import resolve_name
-                members = auth.get_fleet_members(fleet_id=fleet_id) or []
+                members = auth.get_fleet_members(fleet_id=fleet_id)
+                if not isinstance(members, list):
+                    raise RuntimeError("the fleet roster did not load")
+                import kick_pods
+                own = getattr(auth, "character_id", None)
                 for m in members:
-                    if m.get("ship_type_id") in ship_classes.CAPSULE_TYPE_IDS:
-                        cid = m.get("character_id")
-                        if cid:
-                            pods.append((cid, resolve_name(cid, "character") or str(cid)))
+                    cid = m.get("character_id")
+                    if cid in kick_pods.pod_ids([m], ship_classes.CAPSULE_TYPE_IDS, own):
+                        pods.append((cid, resolve_name(cid, "character") or str(cid)))
             except Exception as e:
                 err = str(e)
             self._post_ui(_confirm, pods, err)
@@ -36594,18 +36844,38 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         def _do_kick(pods):
             def worker():
-                kicked = failed = 0
-                for cid, _name in pods:
-                    if auth.esi_delete(f"/fleets/{fleet_id}/members/{cid}/"):
-                        kicked += 1
-                    else:
-                        failed += 1
-                self._post_ui(_done, kicked, failed)
+                try:
+                    import kick_pods
+                    res = kick_pods.kick_confirmed(
+                        auth, fleet_id, [c for c, _n in pods],
+                        ship_classes.CAPSULE_TYPE_IDS,
+                        getattr(auth, "character_id", None))
+                except Exception:
+                    log.exception("Kick Pods: the kick run failed")
+                    res = None
+                self._post_ui(_done, *(res or (0, 0, 0, None)))
             threading.Thread(target=worker, daemon=True).start()
 
-        def _done(kicked, failed):
+        def _done(kicked, failed, skipped=0, reread_ok=True):
+            if reread_ok is None:
+                self._themed_modal(
+                    "Kick Pods",
+                    "The kick run failed; some pilots may already have been "
+                    "kicked. See fctool.log.",
+                    buttons=[("OK", "Dark.TButton", None)], accent=FG_RED)
+                return
+            if not reread_ok:
+                self._themed_modal(
+                    "Kick Pods",
+                    "Could not re-read the fleet members, so nobody was kicked.",
+                    buttons=[("OK", "Dark.TButton", None)], accent=FG_RED)
+                return
             msg = f"Kicked {kicked} pod(s) from the fleet."
             accent = FG_GREEN
+            if skipped:
+                msg += (f"\n{skipped} not kicked (no longer in a pod, left the "
+                        "fleet, or the run stopped after repeated failures).")
+                accent = FG_YELLOW
             if failed:
                 msg += (f"\n{failed} could not be kicked (they may have left, "
                         "swapped ship, or you lost the boss role).")
@@ -39518,8 +39788,24 @@ $bmp.Dispose()
         """Lazily construct the MarketScanner (over a live AuthMarketAdapter on
         the primary character). Degraded/public paths work when scopes are
         missing — the adapter/scanner already handle that. Returns None only if
-        construction itself fails (missing module, no catalog)."""
+        construction itself fails (missing module, no catalog).
+
+        Follows the primary: when the primary changed since this method built
+        the scanner (``_market_scanner_auth``, set ONLY here - a grafted scanner
+        is never compared) and no scan runs, the ONE adapter is rebound in place
+        (keeps its ETag cache, the scanner and its cache lock). A disconnect
+        (``esi_auth`` None) keeps the existing binding, so public station /
+        region pulls keep working on its session."""
         if self._market_scanner is not None:
+            if (hasattr(self, "_market_scanner_auth")
+                    and self.esi_auth is not None
+                    and self._market_scanner_auth is not self.esi_auth
+                    and not getattr(self, "_market_scanning", False)):
+                try:
+                    self._market_scanner._adapter.rebind(self.esi_auth)
+                    self._market_scanner_auth = self.esi_auth
+                except Exception:
+                    log.exception("[market] adapter rebind failed")
             return self._market_scanner
         try:
             import market_scanner
@@ -39528,9 +39814,11 @@ $bmp.Dispose()
             log.exception("[market] scanner modules unavailable")
             return None
         try:
-            adapter = market_esi.AuthMarketAdapter(self.esi_auth)
+            auth = self.esi_auth
+            adapter = market_esi.AuthMarketAdapter(auth)
             self._market_scanner = market_scanner.MarketScanner(
                 adapter, self.type_catalog)
+            self._market_scanner_auth = auth
         except Exception:
             log.exception("[market] failed to construct MarketScanner")
             return None
@@ -40967,6 +41255,32 @@ $bmp.Dispose()
 
     def _on_close(self):
         self._running = False
+        # Save BEFORE anything is torn down. The map's camera / layer state is
+        # otherwise persisted only when the Map tab is LEFT, so closing from
+        # the map lost it (MAP-3). save_state(), never on_hidden(): on_hidden
+        # also joins up to three worker threads (2 s each) for a process that
+        # is about to end. Guarded like every close step: never block shutdown.
+        try:
+            map_tab = getattr(self, "map_tab", None)
+            if map_tab is not None:
+                map_tab.save_state()
+        except Exception:
+            log.exception("[map] state save at shutdown failed")
+        # An infra scan pass writes the store ONCE, when the pass ends, on the
+        # scan worker - and the process ends with os._exit, so a close mid-pass
+        # lost the whole pass (INFRA-3). The deferral is per thread, so a save
+        # from here writes everything merged so far (the store's RLock
+        # serialises it with the worker). Only while a pass runs: nothing else
+        # leaves a write pending, and an unreadable store loads EMPTY - an
+        # unconditional save would write that over the user's file.
+        try:
+            store = getattr(self, "_infra_store", None)
+            scanner = getattr(self, "_infra_scanner", None)
+            if (store is not None and scanner is not None
+                    and scanner.is_running()):
+                store.save()
+        except Exception:
+            log.exception("[INFRA] store save at shutdown failed")
         self._stop_monitoring()
         # Stop the region-map prewarm's ESI fan-out. Unlike every thread we
         # start ourselves, ThreadPoolExecutor workers are NON-daemon, and
