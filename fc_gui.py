@@ -33236,6 +33236,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # to re-tie to carries across a Settings->Save (see below).
         prev_xup_threshold = getattr(
             getattr(self, "xup_counter", None), "threshold", None)
+        # ...and its live roster: a Save pressed during a form-up must not
+        # throw the x-ups away (the chat tail resumes past them, so they would
+        # never be re-read). None on the startup pass.
+        prev_xup_state = getattr(
+            getattr(self, "xup_counter", None), "state", None)
         self.xup_counter = XUpCounter(
             trigger_word=xup_cfg.get("trigger_word", "x"),
             fire_word=xup_cfg.get("fire_word", "FIRE"),
@@ -33245,6 +33250,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             on_fire=self._on_xup_fire,
             on_update=self._on_xup_update,
         )
+        if isinstance(prev_xup_state, XUpState):
+            # Carry the roster, then re-judge READY against the threshold the
+            # new counter was BUILT with, before the re-tie below (which only
+            # recomputes when the threshold moves). A READY flip caused by the
+            # carry fires no on_ready sound: no x-up arrived.
+            self.xup_counter.state = prev_xup_state
+            prev_xup_state.is_ready = (
+                prev_xup_state.count >= self.xup_counter.threshold)
         # A Settings->Save rebuilds the counter at the MANUAL threshold; while
         # "= DPS" is ticked, re-tie it to the last aggregate straight away.
         self._xup_retie_rebuilt_counter(prev_xup_threshold)
