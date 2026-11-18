@@ -31,6 +31,7 @@ locked or damaged file gives a clean value, never an exception. A writer that co
 job says so, because carrying on in silence would lose settings:
 
 * ``StateWriteError`` (``.file`` = the file name) - ``write_state``, ``make_backup``,
+  ``copy_before_restore`` (which answers ``None`` instead for a backup it cannot read),
   ``write_pending``, ``update_applying``, ``cancel_pending``. Two subclasses:
   ``StateTooBigError`` - ``write_pending`` / ``update_applying`` for work larger than
   ``MAX_PENDING_BYTES``: nothing was written; ``StateApplyingError`` - ``write_pending`` /

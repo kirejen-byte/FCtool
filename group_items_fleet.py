@@ -843,8 +843,11 @@ class _TemplatesItem(Item):
     the template selector picks). ``theirs``: its content is replaced; its ``id`` stays, so
     everything that points at it keeps working, and so does its ``doctrine_id`` (a link to
     MY library that a file never carries). ``mine``: skipped. Content that is already the
-    same - also when mine differs only in its named pilots and ``character`` rules, which
-    no file carries - is ``unchanged`` whatever the choice, and keeps those pilots. A
+    same - also when mine differs only in what ``_clean_template`` takes out or repairs on
+    the way into a file: named pilots and ``character`` rules (no file carries them), a role
+    outside ``ROLE_VALUES`` (a squad member there) and a rule of a kind outside
+    ``CONDITION_TYPES`` (left out there) - is ``unchanged`` whatever the choice, and keeps
+    all of those as they are. A
     template I do not have is appended with a
     new id. Everything else in the file - other templates, entries the store cannot read,
     ``cached_characters``, ``ui``, ``version`` - is left exactly as it is.

@@ -1421,8 +1421,9 @@ MSG_REPLACE = ("{what} is already waiting for the next start of FCTool.\n\n"
 MSG_RESTORE = ("Put back the settings from before the import of {when}?\n\nThe files that "
                "import changed go back whole: every setting in them returns to that day, not "
                "only the ones the group file set, and every change made to them since then "
-               "is lost. A copy of them as they are today is kept in the backups folder "
-               "in FCTool's folder (before-restore-...). FCTool restarts to do it.")
+               "is lost from them. Before that, a copy of them as they are today is put in "
+               "the backups folder in FCTool's folder (before-restore-...). FCTool restarts "
+               "to do it.")
 MSG_NAMES = ("The file would contain: {names}.\n\nThose are your own character names. Go "
              "back and take them out of the text they stand in (a MOTD, the name of a "
              "template, a tag), or save the file as it is.")
