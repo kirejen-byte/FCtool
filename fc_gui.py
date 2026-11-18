@@ -8666,10 +8666,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # Check for duplicate character
             for existing in self.esi_accounts:
                 if existing.character_id == new_auth.character_id:
-                    # Update existing account's tokens
-                    existing._refresh_token = new_auth._refresh_token
-                    existing._access_token = new_auth._access_token
-                    existing._expires_at = new_auth._expires_at
+                    # Update existing account's tokens (under its refresh
+                    # lock, clearing any refresh backoff)
+                    existing.adopt_tokens(new_auth)
                     existing._save_tokens()
                     # Clean up temp file
                     try:
@@ -10889,7 +10888,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # scopes — without re-authorizing they can't import/push in-game fits.
         # The Re-authorize button reuses the SSO login flow (re-logging in as
         # the same character refreshes its tokens with the full current SCOPES).
-        if acct.is_authenticated and not acct.has_scope(SCOPE_FITTINGS_READ):
+        # Same rule as Settings (_acct_missing_scopes): an account whose scopes
+        # are not known yet (start-up refresh failed) is not flagged.
+        if (acct.is_authenticated
+                and SCOPE_FITTINGS_READ in self._acct_missing_scopes(acct)):
             reauth_row = tk.Frame(panel, bg=BG_PANEL)
             reauth_row.pack(fill=tk.X, padx=20, pady=(0, 5))
             tk.Label(
