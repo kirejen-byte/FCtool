@@ -350,14 +350,18 @@ class TypeCatalog:
             return None
         return CATEGORY_NAMES.get(entry.get("c"), "other")
 
-    def group_of(self, type_id: int) -> int | None:
+    def group_of(self, type_id: int, *, offline: bool = False) -> int | None:
         """Return the SDE groupID for ``type_id``, or ``None`` if unknown.
 
         Used to order Tech III subsystems by subsystem slot when serializing a
         fit to DNA/ESI. ESI-only entries carry no group, so they return ``None``.
+
+        ``offline=True`` answers from the bundled table + on-disk cache only and
+        NEVER asks ESI for an unknown id (the market scanner's contract volume
+        pre-filter: an unknown group there just disables the filter).
         """
         entry = self._by_id.get(type_id)
-        if entry is None:
+        if entry is None and not offline:
             entry = self._resolve_unknown(type_id)
         if entry is None:
             return None
