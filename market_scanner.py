@@ -1351,17 +1351,18 @@ class MarketScanner:
                     hits_before = sess.loc_net_resolves
                     csys = self._resolve_system_cached(loc_id)
                     # ESI error-limit floor: ``error_limited`` reads the LAST
-                    # response, so consult it only after one of THIS pass's own
-                    # resolves hit the network (a low reading left by the order
-                    # pull must not stop pass 1 before it starts). Once at the
-                    # floor, the remaining uncached locations are not resolved
-                    # (unknown, nothing cached) and the scan is flagged.
+                    # response, so consult it only after THIS pass itself asked
+                    # the adapter for a resolve (counted per adapter call; a
+                    # low reading left by the order pull must not stop pass 1
+                    # before it starts). Once at the floor, the remaining
+                    # uncached locations are not resolved (unknown, nothing
+                    # cached); the scan is flagged at the first such skip.
                     if (not sess.loc_network_blocked
                             and sess.loc_net_resolves > hits_before
                             and bool(getattr(self._adapter, "error_limited", False))):
                         sess.loc_network_blocked = True
-                        if "contract_error_limit" not in degraded:
-                            degraded.append("contract_error_limit")
+                    if sess.loc_skipped and "contract_error_limit" not in degraded:
+                        degraded.append("contract_error_limit")
                         log.warning(
                             "[market] location resolves hit the ESI error-limit "
                             "floor - remaining unresolved locations skipped")
@@ -1681,6 +1682,7 @@ class MarketScanner:
         sess = self._session
         if sess is not None:
             if sess.loc_network_blocked:
+                sess.loc_skipped += 1
                 return None
             sess.loc_net_resolves += 1
         sysid, kind = self._resolve_location(int(location_id))
@@ -2090,10 +2092,12 @@ class _ContractCacheSession:
         self._pending_neg: dict[str, float] = {}
         self._fetched_since_flush = 0
         # Pass-1 error-limit bookkeeping (read/written by the scanner): how many
-        # resolves of THIS pass went to the adapter, and whether the floor was
-        # reached (then uncached ids are no longer resolved).
+        # resolves of THIS pass were handed to the adapter (calls, not
+        # responses), whether the floor was reached (then uncached ids are no
+        # longer resolved), and how many uncached ids were skipped since.
         self.loc_net_resolves = 0
         self.loc_network_blocked = False
+        self.loc_skipped = 0
 
     # ── contract items ────────────────────────────────────────────────────────
 
