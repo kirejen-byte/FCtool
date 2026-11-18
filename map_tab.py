@@ -1792,18 +1792,15 @@ class MapTab:
         # this point). No-op when nothing is pending.
         self._apply_pending_focus()
 
-    def on_hidden(self) -> None:
-        self._hover_cancel()                 # never leave a tooltip over a hidden tab
-        if not self._visible:
-            return       # not the tab being left: a switch between two OTHER tabs
+    def save_state(self) -> None:
+        """Persist the camera, bloom, zoom animation and layer toggles through
+        ``save_cfg`` - the persistence half of ``on_hidden``, with no teardown,
+        so the app's close path can call it (MAP-3) without paying the thread
+        joins ``on_hidden`` does. A no-op before the first show: the camera is
+        still at fresh defaults and saving it would clobber restore_camera's
+        fit-universe sentinel."""
         if self.renderer is None:
-            # Hidden before the first show: the camera is still at fresh
-            # defaults (the fit-universe sentinel hasn't been applied yet).
-            # Persisting it now would clobber restore_camera's fit sentinel and
-            # reopen the map at max zoom on empty space -- save nothing.
-            self._visible = False
             return
-        self._visible = False
         cam = dict(self.state.camera.to_dict())
         merged = dict(self.cfg)
         merged["camera"] = cam
@@ -1817,6 +1814,20 @@ class MapTab:
         merged["layers"] = layers
         self.cfg.update(merged)
         self.save_cfg(merged)
+
+    def on_hidden(self) -> None:
+        self._hover_cancel()                 # never leave a tooltip over a hidden tab
+        if not self._visible:
+            return       # not the tab being left: a switch between two OTHER tabs
+        if self.renderer is None:
+            # Hidden before the first show: the camera is still at fresh
+            # defaults (the fit-universe sentinel hasn't been applied yet).
+            # Persisting it now would clobber restore_camera's fit sentinel and
+            # reopen the map at max zoom on empty space -- save nothing.
+            self._visible = False
+            return
+        self._visible = False
+        self.save_state()
         # Stop the immortal render worker so a hidden tab does not leak a
         # map-render daemon (Task 22). renderer/model/_worker_cache and the last
         # frame on the canvas all survive; on_shown restarts the thread.

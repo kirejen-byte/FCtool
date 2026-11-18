@@ -40947,6 +40947,32 @@ $bmp.Dispose()
 
     def _on_close(self):
         self._running = False
+        # Save BEFORE anything is torn down. The map's camera / layer state is
+        # otherwise persisted only when the Map tab is LEFT, so closing from
+        # the map lost it (MAP-3). save_state(), never on_hidden(): on_hidden
+        # also joins up to three worker threads (2 s each) for a process that
+        # is about to end. Guarded like every close step: never block shutdown.
+        try:
+            map_tab = getattr(self, "map_tab", None)
+            if map_tab is not None:
+                map_tab.save_state()
+        except Exception:
+            log.exception("[map] state save at shutdown failed")
+        # An infra scan pass writes the store ONCE, when the pass ends, on the
+        # scan worker - and the process ends with os._exit, so a close mid-pass
+        # lost the whole pass (INFRA-3). The deferral is per thread, so a save
+        # from here writes everything merged so far (the store's RLock
+        # serialises it with the worker). Only while a pass runs: nothing else
+        # leaves a write pending, and an unreadable store loads EMPTY - an
+        # unconditional save would write that over the user's file.
+        try:
+            store = getattr(self, "_infra_store", None)
+            scanner = getattr(self, "_infra_scanner", None)
+            if (store is not None and scanner is not None
+                    and scanner.is_running()):
+                store.save()
+        except Exception:
+            log.exception("[INFRA] store save at shutdown failed")
         self._stop_monitoring()
         # Stop the region-map prewarm's ESI fan-out. Unlike every thread we
         # start ourselves, ThreadPoolExecutor workers are NON-daemon, and
