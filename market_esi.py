@@ -568,17 +568,37 @@ class AuthMarketAdapter:
         (``system_id``). Upwell structure (id >= 1e12) → authed
         ``/universe/structures/`` (``solar_system_id``; scope already granted, 403
         on no docking access → None). Ids outside both ranges → None."""
+        return self.resolve_location_system_ex(location_id)[0]
+
+    def resolve_location_system_ex(self, location_id: int) -> "tuple[int | None, str]":
+        """``resolve_location_system`` plus WHY a miss missed: ``(sysid, kind)``.
+
+        ``kind`` is ``"ok"`` (``sysid`` set), ``"not_found"`` (404/410, or an id
+        outside both ranges), ``"forbidden"`` (403: no docking access for THIS
+        character) or ``"transient"`` (no response, no character bound, 5xx,
+        420/429, 401, any other non-OK, or an unusable body). The scanner
+        persists the definitive kinds and keeps a transient one for the pass."""
         if _STATION_ID_MIN <= location_id < _STATION_ID_MAX:
             resp = self._get_page(
                 f"{ESI_BASE}/universe/stations/{location_id}/", authed=False
             )
-            return _extract_system(resp, "system_id")
-        if location_id >= _STRUCTURE_ID_MIN:
+            key = "system_id"
+        elif location_id >= _STRUCTURE_ID_MIN:
             resp = self._get_page(
                 f"{ESI_BASE}/universe/structures/{location_id}/", authed=True
             )
-            return _extract_system(resp, "solar_system_id")
-        return None
+            key = "solar_system_id"
+        else:
+            return None, "not_found"
+        if resp is None:
+            return None, "transient"
+        code = getattr(resp, "status_code", None)
+        if code == 403:
+            return None, "forbidden"
+        if code in (404, 410):
+            return None, "not_found"
+        sysid = _extract_system(resp, key)
+        return (sysid, "ok") if sysid is not None else (None, "transient")
 
 
 def _extract_system(resp, key: str) -> int | None:
