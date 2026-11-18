@@ -174,12 +174,21 @@ def compose(template, live_members, live_structure, *, doctrine=None,
         # adds `assigned_here[key]` on top of this base. That split keeps every
         # occupant counted exactly once: physical-and-staying via base, and
         # assigned-this-compose (Pass 1 pins + Pass 2 routes) via assigned_here.
-        def _staying_count(wname, sname):
+        def _in_squad(m, wname, sname):
+            cur_w, cur_s, _ = _current_placement(m, id_to_names)
+            return (_clamp(cur_w), _clamp(cur_s)) == (_clamp(wname), _clamp(sname))
+
+        def _staying_count(wname, sname, exclude=()):
+            # Pilots physically in the squad and not reassigned this compose,
+            # minus `exclude` (ids of this rule's still-undecided candidates:
+            # each is judged on its own turn, so an over-cap squad sheds only
+            # its overflow instead of every occupant seeing a "full" squad).
             n = 0
             for m in pool:
-                cur_w, cur_s, _ = _current_placement(m, id_to_names)
-                if (cur_w, cur_s) == (wname, sname) \
-                        and m["character_id"] not in assignment:
+                if m["character_id"] in assignment \
+                        or m["character_id"] in exclude:
+                    continue
+                if _in_squad(m, wname, sname):
                     n += 1
             return n
 
@@ -193,7 +202,10 @@ def compose(template, live_members, live_structure, *, doctrine=None,
                 continue   # single-squad targets only
             key = (wname, sname)
             cap = squad_caps.get(key)
-            base = _staying_count(wname, sname) if cap is not None else 0
+            pending = {m["character_id"] for m in pool
+                       if m["character_id"] not in claimed
+                       and _pilot_matches(rule.condition, m, tag_index)} \
+                if cap is not None else set()
             for m in pool:
                 if m["character_id"] in claimed:
                     continue
@@ -203,7 +215,12 @@ def compose(template, live_members, live_structure, *, doctrine=None,
                     # base (physical stayers) + every pilot this compose has
                     # already assigned into the squad (Pass 1 pins + earlier
                     # Pass 2 routes) — so a named pin cannot be overfilled past.
-                    used = base + assigned_here.get(key, 0)
+                    # The pilot being placed is never its own occupant: it is
+                    # dropped from `pending`, then subtracted if it sits here.
+                    pending.discard(m["character_id"])
+                    used = (_staying_count(wname, sname, pending)
+                            - (1 if _in_squad(m, wname, sname) else 0)
+                            + assigned_here.get(key, 0))
                     if used >= cap:
                         result.unassigned_reasons[m["character_id"]] = "target full"
                         continue
