@@ -29,6 +29,16 @@ Reuses the verified repo infrastructure (design §4.1, §8):
   error budget. ``error_limited`` exposes whether the last response left the
   remaining error budget below ``ERROR_LIMIT_FLOOR``; the scanner's contract-item
   loop can poll it between calls and abort the pass (§8.2).
+* Token-bucket 429 holds. Routes on ESI's token-bucket limiter (e.g. the
+  ``corp-contract`` group) never send the legacy error-limit header, so
+  ``error_limited`` cannot see them run dry; an exhausted bucket answers 429 +
+  ``Retry-After``. ONLY a 429 response sets a hold until ``now + Retry-After``
+  (``RATE_LIMIT_DEFAULT_WAIT`` when the header is missing or unusable), keyed
+  by the response's ``X-Ratelimit-Group`` and by the route path (numeric
+  segments folded to ``{id}``). ``rate_limited(key)`` reads it; the scanner's
+  contract-item pass consults it for ``contract_items_groups`` and clears every
+  hold at scan start (``clear_rate_limits``). ``error_limited`` - and so the
+  order walk - does NOT read the holds.
 
 Auth model:
 
@@ -43,6 +53,12 @@ Auth model:
 
 from __future__ import annotations
 
+import math
+import re
+import threading
+import time
+from urllib.parse import urlsplit
+
 from app_log import get_logger
 from esi_constants import ESI_BASE, ESI_HEADERS
 
@@ -50,6 +66,16 @@ log = get_logger(__name__)
 
 # Below this remaining error-budget the scanner should stop the pass (§8.2).
 ERROR_LIMIT_FLOOR = 20
+
+# Seconds a 429 holds its route / group when ``Retry-After`` is missing or
+# unusable (ESI documents a deeper limiter that can 429 without the headers).
+RATE_LIMIT_DEFAULT_WAIT = 60.0
+
+# The hold clock. A module-level name so tests can swap it.
+_now = time.monotonic
+
+# A numeric path segment, folded to ``{id}`` for the route key of a hold.
+_ID_SEGMENT = re.compile(r"/\d+(?=/|$)")
 
 # NPC station id range (design §7) — resolve via the public /universe/stations/
 # endpoint. Upwell structures (id >= 1e12) resolve via the authed
@@ -98,6 +124,15 @@ class AuthMarketAdapter:
     # (which lack the kwarg) are still called the classic way.
     supports_progress = True
 
+    # The hold keys (route paths, see ``_route_key``) of the two contract-items
+    # routes. The scanner's contract pass stops while ``rate_limited`` holds any
+    # of them. Every 429 is held under its route key, so these match whatever
+    # (or no) ``X-Ratelimit-Group`` the route answers with.
+    contract_items_groups = (
+        "/contracts/public/items/{id}/",
+        "/corporations/{id}/contracts/{id}/items/",
+    )
+
     def __init__(self, auth, *, public_session=None, timeout: int = 15) -> None:
         self._auth = auth
         self._timeout = timeout
@@ -125,6 +160,12 @@ class AuthMarketAdapter:
         # lost pages reading as absent. Cleared by the scanner at the start of
         # every ``scan_market`` pass (duck-typed), like ``last_forbidden``.
         self.last_incomplete: set[str] = set()
+        # 429 holds: hold key (a ``X-Ratelimit-Group`` name or a route path) ->
+        # ``_now()`` deadline. Written by whichever thread saw the 429 (the
+        # contract-items pool included), hence the lock; read via
+        # ``rate_limited``; cleared by the scanner at scan start.
+        self._limited_until: dict[str, float] = {}
+        self._limited_lock = threading.Lock()
         # Contract-items disposition (for the scanner's negative cache) is NOT
         # stashed on the adapter: ``contract_items`` / ``corp_contract_items``
         # RETURN it as ``(items, status)``. Returning it per call — rather than
@@ -170,6 +211,43 @@ class AuthMarketAdapter:
         rh = getattr(resp, "headers", {}) or {}
         self.last_headers = {k: rh[k] for k in _CAPTURED_HEADERS if k in rh}
 
+    # ── Token-bucket 429 holds ────────────────────────────────────────────────
+
+    def rate_limited(self, group: str) -> bool:
+        """True while a 429 hold on ``group`` (an ``X-Ratelimit-Group`` name or
+        a route key such as ``contract_items_groups``) has not run out."""
+        with self._limited_lock:
+            until = self._limited_until.get(group)
+        return until is not None and _now() < until
+
+    def clear_rate_limits(self) -> None:
+        """Drop every 429 hold (the scanner calls this at scan start, beside
+        clearing ``last_headers``, so one 429 never stops the next scan)."""
+        with self._limited_lock:
+            self._limited_until.clear()
+
+    @staticmethod
+    def _route_key(url) -> str:
+        """The URL's path with every numeric segment folded to ``{id}``."""
+        return _ID_SEGMENT.sub("/{id}", urlsplit(str(url)).path)
+
+    def _note_429(self, url, resp) -> None:
+        """Hold the 429's group (when named) and its route until ``now +
+        Retry-After``. A later, shorter 429 never shortens a hold."""
+        wait = _retry_after_seconds(_header(resp, "Retry-After"))
+        until = _now() + wait
+        keys = [self._route_key(url)]
+        group = _header(resp, "X-Ratelimit-Group")
+        if group:
+            keys.append(str(group))
+        with self._limited_lock:
+            for k in keys:
+                prev = self._limited_until.get(k)
+                if prev is None or until > prev:
+                    self._limited_until[k] = until
+        log.warning("[market-esi] 429 on %s (group %s): held %.0f s",
+                    keys[0], group or "-", wait)
+
     # ── Low-level GET helpers ─────────────────────────────────────────────────
 
     def _headers(self, *, authed: bool) -> dict:
@@ -206,6 +284,8 @@ class AuthMarketAdapter:
             log.warning("[market-esi] GET %s failed: %s", url, e)
             return None
         self._capture(resp)
+        if getattr(resp, "status_code", None) == 429:
+            self._note_429(url, resp)
         return resp
 
     # Per-page failure kinds that earn ONE immediate retry on a tagged (order)
@@ -599,6 +679,34 @@ class AuthMarketAdapter:
             return None, "not_found"
         sysid = _extract_system(resp, key)
         return (sysid, "ok") if sysid is not None else (None, "transient")
+
+
+def _header(resp, name: str):
+    """A response header by name, case-insensitively (``requests`` headers
+    already are; a plain dict is scanned)."""
+    rh = getattr(resp, "headers", None) or {}
+    try:
+        val = rh.get(name)
+    except Exception:
+        return None
+    if val is None and isinstance(rh, dict):
+        low = name.lower()
+        for k, v in rh.items():
+            if isinstance(k, str) and k.lower() == low:
+                return v
+    return val
+
+
+def _retry_after_seconds(raw) -> float:
+    """``Retry-After`` as seconds; ``RATE_LIMIT_DEFAULT_WAIT`` when it is
+    missing, an HTTP date, negative or not finite."""
+    try:
+        val = float(str(raw).strip())
+    except (TypeError, ValueError):
+        return RATE_LIMIT_DEFAULT_WAIT
+    if not math.isfinite(val) or val < 0:
+        return RATE_LIMIT_DEFAULT_WAIT
+    return val
 
 
 def _extract_system(resp, key: str) -> int | None:
