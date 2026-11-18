@@ -6639,6 +6639,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # the same system is named repeatedly during a spike.
         self._cyno_beacon_cache: dict[int, tuple[bool, float]] = {}
         self._intel_find_var = tk.StringVar(value="")
+        # The pending debounced Find re-render (see _on_intel_find_write).
+        self._intel_find_after_id = None
 
         # One checkbox per tracked intel channel (user-configurable, sourced
         # from the Intel-TAGGED subset of config["channels"] via the derived
@@ -6704,8 +6706,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                               font=("Consolas", 9), width=18, bg=BG_ENTRY,
                               fg=FG_WHITE, insertbackground=FG_WHITE)
         find_entry.pack(side=tk.LEFT, padx=(4, 8))
-        self._intel_find_var.trace_add(
-            "write", lambda *a: self._intel_rerender_from_buffer())
+        # INTEL-6 (1): debounced -- one pending after() id, re-armed per write.
+        self._intel_find_var.trace_add("write", self._on_intel_find_write)
         self._intel_pause_var = tk.BooleanVar(value=False)
         tk.Checkbutton(
             controls, text="Pause", variable=self._intel_pause_var,
@@ -38328,9 +38330,40 @@ $bmp.Dispose()
         if hasattr(self, "_intel_buffer"):
             self._intel_rerender_from_buffer()
 
+    _INTEL_FIND_DEBOUNCE_MS = 250
+
+    def _on_intel_find_write(self, *_):
+        """Find-box write trace (INTEL-6 (1)): re-render once the typing pauses.
+        Each write cancels the one pending ``after`` id and arms a new one, so
+        a burst of keystrokes costs one full re-render instead of one each."""
+        pending = getattr(self, "_intel_find_after_id", None)
+        self._intel_find_after_id = None
+        if pending is not None:
+            try:
+                self.root.after_cancel(pending)
+            except tk.TclError:
+                pass
+
+        def _due():
+            self._intel_find_after_id = None
+            if hasattr(self, "_intel_buffer"):
+                try:
+                    self._intel_rerender_from_buffer()
+                except tk.TclError:
+                    pass                    # widget gone (window closing)
+
+        self._intel_find_after_id = self.root.after(
+            self._INTEL_FIND_DEBOUNCE_MS, _due)
+
     def _intel_rerender_from_buffer(self):
         """Clear the Text and re-render every buffered entry that passes the
-        current view filter. The deque is never mutated -- no data is lost."""
+        current view filter. The deque is never mutated -- no data is lost.
+
+        INTEL-6 (3): each re-rendered line gets the standing colours of the
+        names the resolver ALREADY has cached, scoped to that line's range.
+        Cache only (no request, no network), and never a negative-cache entry:
+        the live path never delivers those, and applying one would dim a name
+        that renders untagged today."""
         log = self._intel_log
         log.config(state=tk.NORMAL)
         log.delete("1.0", tk.END)
@@ -38338,10 +38371,25 @@ $bmp.Dispose()
         # channel toggle / find-filter re-render doesn't leak the old span tags.
         self._intel_sweep_dynamic_tags(log)
         log.config(state=tk.DISABLED)
+        resolver = getattr(self, "_intel_resolver", None)
         for entry in list(self._intel_buffer):
             msg = entry[0]
             if self._passes_view_filter(msg):
-                self._render_line(entry)
+                rendered_range = self._render_line(entry)
+                if resolver is None:
+                    continue
+                try:
+                    cached = {}
+                    for name in intel_stream.candidate_names(msg.message):
+                        res = resolver.lookup_cached(name)
+                        if (res is None or res.character_id is None
+                                or res.standing == "unknown"):
+                            continue
+                        cached[name] = res
+                    if cached:
+                        self._intel_apply_resolutions(cached, rendered_range)
+                except Exception:
+                    pass
         self._intel_new_count = 0
         self._intel_update_new_button()
 
