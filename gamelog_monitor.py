@@ -78,7 +78,7 @@ import os
 import re
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace as _dc_replace
 
 from app_io import atomic_write_json
 from app_log import get_logger
@@ -503,6 +503,9 @@ def compute_status(logs_dir, positions, listeners, tracked, *,
                          active_count=active, unmatched=unmatched)
 
 
+_UNSET = object()
+
+
 def probe_status(logs_dir):
     """Static (monitor-not-running) snapshot: folder existence only, no scan."""
     return compute_status(logs_dir, {}, {}, None, scanning=False)
@@ -640,6 +643,51 @@ class GamelogMonitor:
         # Tk thread reads it without a lock. Seeded here so a reader before the
         # first poll gets a valid (idle) snapshot rather than None.
         self._status = probe_status(self._logs_dir)
+        # The O(files) status aggregation (compute_status) is cached against
+        # this generation: every mutation of the key set of _positions, the
+        # values of _listeners, _tracked or _logs_dir goes through a helper
+        # that calls _bump_status(), and poll_once re-aggregates only when the
+        # generation moved. (gen, GamelogStatus) or None.
+        self._status_gen = 0
+        self._status_cache = None
+
+    def _bump_status(self) -> None:
+        """Mark the cached status aggregate stale (any thread)."""
+        self._status_gen += 1
+
+    def _set_position(self, path, value) -> None:
+        """Store a tail offset. Only a NEW key changes the status (it counts
+        files); an offset update for a known key never does."""
+        if path not in self._positions:
+            self._bump_status()
+        self._positions[path] = value
+
+    def _set_listener(self, path, listener) -> None:
+        """Store a listener; a changed value (or new key) stales the status."""
+        if self._listeners.get(path, _UNSET) != listener:
+            self._bump_status()
+        self._listeners[path] = listener
+
+    def _refresh_status(self) -> None:
+        """Publish the status snapshot. The one cheap isdir runs every call;
+        the loop over every known file runs only when the generation moved."""
+        gen = self._status_gen          # read BEFORE aggregating (race-safe)
+        d = self._logs_dir
+        try:
+            exists = bool(d) and os.path.isdir(d)
+        except OSError:
+            exists = False
+        cache = self._status_cache
+        if cache is None or cache[0] != gen:
+            status = compute_status(d, self._positions, self._listeners,
+                                    self._tracked, scanning=True,
+                                    dir_exists=exists)
+        else:
+            status = cache[1]
+            if status.dir_exists != exists:
+                status = _dc_replace(status, dir_exists=exists)
+        self._status_cache = (gen, status)
+        self._status = status
 
     # --- public interface --------------------------------------------------
 
@@ -661,6 +709,7 @@ class GamelogMonitor:
         if new == self._logs_dir:
             return
         self._logs_dir = new
+        self._bump_status()
         # The cut-off FIRST: the poll thread keeps running through this method,
         # and a read landing just after _positions.clear() starts from byte 0.
         # Were its path still in the set, the whole file would arrive as news
@@ -668,9 +717,11 @@ class GamelogMonitor:
         self._caught_up.clear()
         self._last_look.clear()
         self._positions.clear()
+        self._bump_status()
         self._fingerprints.clear()
         self._buffers.clear()
         self._listeners.clear()
+        self._bump_status()
         # _known_players is deliberately NOT cleared: player names are not
         # path-scoped, and it is poll-thread-owned (this runs on the Tk thread).
         self._last_dir_mtime = None
@@ -684,9 +735,12 @@ class GamelogMonitor:
         Pass None to track every discovered character.
         """
         if names is None:
-            self._tracked = None
+            new = None
         else:
-            self._tracked = {str(n).strip().lower() for n in names if str(n).strip()}
+            new = {str(n).strip().lower() for n in names if str(n).strip()}
+        if new != self._tracked:
+            self._bump_status()
+        self._tracked = new
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
@@ -748,7 +802,7 @@ class GamelogMonitor:
         if cached is not None:          # "" is a REAL answer (headerless file)
             return cached
         listener = self._read_listener(path)
-        self._listeners[path] = listener
+        self._set_listener(path, listener)
         return listener
 
     def _within_tail_window(self, mtime) -> bool:
@@ -859,7 +913,7 @@ class GamelogMonitor:
             return
         if (st.st_size > self._positions.get(path, 0)
                 or self._within_tail_window(st.st_mtime)):
-            self._listeners[path] = self._read_listener(path)
+            self._set_listener(path, self._read_listener(path))
 
     def discover_files(self):
         """Register any new Gamelog files (seed to EOF). Constant-rotation safe:
@@ -960,11 +1014,11 @@ class GamelogMonitor:
                 saved = 0
             if 0 <= saved <= size:
                 resume = saved
-        self._positions[path] = resume
+        self._set_position(path, resume)
         self._fingerprints[path] = b""
         self._buffers[path] = ""
         eager = resume < size or self._within_tail_window(mtime)
-        self._listeners[path] = self._read_listener(path) if eager else None
+        self._set_listener(path, self._read_listener(path) if eager else None)
         # The EWAR cut-off: only a file that really resumes at EOF starts out
         # caught up. `size` cannot answer that. `st` is normally a directory
         # enumeration entry, and that LAGS a file a writer holds open (measured
@@ -1012,9 +1066,7 @@ class GamelogMonitor:
         self._maybe_flush_state()
         # Refresh the diagnostic snapshot from the just-updated in-memory state
         # (one cheap isdir, no glob). Runs on the poll thread — never the Tk one.
-        self._status = compute_status(self._logs_dir, self._positions,
-                                      self._listeners, self._tracked,
-                                      scanning=True)
+        self._refresh_status()
 
     def _remember_player(self, name: str) -> None:
         """Record a casefolded bracket-confirmed player name (poll thread only).
@@ -1101,7 +1153,7 @@ class GamelogMonitor:
             self._caught_up.discard(path)
 
         if size <= read_start:
-            self._positions[path] = read_start
+            self._set_position(path, read_start)
             if not check_failed:                     # a failed open is no look
                 self._mark_caught_up(path)           # nothing left unread
             return
@@ -1183,7 +1235,7 @@ class GamelogMonitor:
                                         hit=ewar_hit))
 
         new_pos = read_start + len(raw)              # raw byte length; no *2
-        self._positions[path] = new_pos
+        self._set_position(path, new_pos)
         self._mark_caught_up(path)                   # the file is consumed
         # Record a tail fingerprint of what we just consumed (up to 64 bytes) so
         # a truncate-then-rewrite with unchanged size is still caught next poll.
