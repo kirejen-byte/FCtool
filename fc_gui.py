@@ -37614,6 +37614,13 @@ $bmp.Dispose()
         if self.zkill_monitor:
             self.zkill_monitor.set_friendly_ids(
                 set(self._standings_cache.friendly_ids))
+        # And into the intel stream's name resolver (INTEL-9): a locked set
+        # swap + cache clear. friendly_ids already holds the own corp/alliance.
+        resolver = getattr(self, "_intel_resolver", None)
+        if resolver is not None:
+            resolver.set_standings(
+                self._standings_cache.friendly_ids,
+                self._standings_cache.hostile_ids)
         self._push_standings_to_battle_ledger()
         self._update_standings_label()
         # The own alliance may have changed -> which Ansiblexes are usable did.
@@ -37660,6 +37667,13 @@ $bmp.Dispose()
                     if self.zkill_monitor:
                         self.zkill_monitor.set_friendly_ids(
                             set(self._standings_cache.friendly_ids))
+                    # Same argument for the intel resolver (INTEL-9): its
+                    # set_standings is a locked swap + cache clear, no Tk.
+                    resolver = getattr(self, "_intel_resolver", None)
+                    if resolver is not None:
+                        resolver.set_standings(
+                            self._standings_cache.friendly_ids,
+                            self._standings_cache.hostile_ids)
                     # Same argument for the battle ledger's ours/allies split.
                     self._push_standings_to_battle_ledger()
                     # Update label on the Tk thread (FCToolGUI uses self.root,
