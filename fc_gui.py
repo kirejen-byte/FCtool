@@ -552,6 +552,20 @@ def high_priority(report, min_reported: int) -> bool:
     return False
 
 
+def intel_min_reported_from(cfg) -> int:
+    """The saved intel "Min Reported" value: top-level
+    ``config["intel_min_reported"]``, clamped to the spinbox's 0..500. A
+    missing key or garbage reads as 0, the value every launch started at before
+    it was saved. Deliberately NOT in DEFAULT_CONFIG (the release gates pin its
+    top-level key set) and NOT inside ``intel_filter`` (a group-config import
+    target)."""
+    try:
+        val = int(cfg.get("intel_min_reported", 0))
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        return 0
+    return max(0, min(500, val))
+
+
 def add_filter_item(items: list, item: dict) -> tuple[list, bool]:
     """Append ``item`` ({"id", "name"}) to a copy of ``items``, de-duped by id.
 
@@ -6488,18 +6502,27 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # Min reported filter
         tk.Label(intel_row, text="  Min Reported:", font=("Consolas", 9),
                  fg=FG_TEXT, bg=BG_PANEL).pack(side=tk.LEFT, padx=(10, 0))
-        self._intel_min_reported_var = tk.StringVar(value="0")
+        # Saved since build 2: starts at the persisted value (0 when absent).
+        self._intel_min_reported_var = tk.StringVar(
+            value=str(intel_min_reported_from(self.config)))
         # Mirror the min-reported filter into a plain int read by the off-main
         # intel message callback (Class B fix). The trace fires on the main
         # thread whenever the spinbox value changes; the worker reads the int.
         self._intel_min_reported_var.trace_add(
             "write", self._mirror_intel_min_reported)
-        tk.Spinbox(
+        self._mirror_intel_min_reported()
+        _min_rep_spin = tk.Spinbox(
             intel_row, from_=0, to=500, textvariable=self._intel_min_reported_var,
             font=("Consolas", 10), width=4, bg=BG_ENTRY, fg=FG_WHITE,
             insertbackground=FG_WHITE, buttonbackground=BG_PANEL,
             borderwidth=1, relief=tk.RIDGE,
-        ).pack(side=tk.LEFT, padx=(4, 10))
+            command=self._on_intel_min_reported_change,
+        )
+        _min_rep_spin.pack(side=tk.LEFT, padx=(4, 10))
+        _min_rep_spin.bind(
+            "<Return>", lambda e: self._on_intel_min_reported_change())
+        _min_rep_spin.bind(
+            "<FocusOut>", lambda e: self._on_intel_min_reported_change())
 
         # Opt-in audio ping for high-priority intel lines (default off; this is
         # the intel stream's own toggle, distinct from the global zkill mute).
@@ -37795,6 +37818,24 @@ $bmp.Dispose()
             self._intel_min_reported = int(self._intel_min_reported_var.get())
         except (ValueError, AttributeError):
             self._intel_min_reported = 0
+
+    def _on_intel_min_reported_change(self):
+        """Persist the Min Reported spinbox (arrow / Return / FocusOut) as the
+        top-level ``config["intel_min_reported"]``, clamped 0..500, writing
+        config.json only when the value actually changed. Mid-typing garbage
+        is ignored, like ``_on_min_pilots_change``."""
+        try:
+            val = int(self._intel_min_reported_var.get())
+        except (TypeError, ValueError):
+            return
+        val = max(0, min(500, val))
+        if val == intel_min_reported_from(self.config):
+            return
+        self.config["intel_min_reported"] = val
+        try:
+            self._save_config()
+        except Exception:
+            pass
 
     def _mirror_zkill_min_pilots(self, *_):
         """Main-thread Var-trace: mirror the zKill display Min Pilots spinbox
