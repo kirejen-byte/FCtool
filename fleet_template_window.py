@@ -222,6 +222,11 @@ class FleetTemplateWindow:
         # FLEET-2: (pilot_id, wing, squad, role) targets already logged as
         # unresolvable, so a 10 s auto-move tick does not repeat the line.
         self._skip_logged: set = set()
+        # FLEET-10: the state the live tree was last rebuilt from by a sync
+        # (None = unknown, rebuild next time) and a rebuild held back while a
+        # drag was pending (run on the button release).
+        self._tree_key = None
+        self._tree_rebuild_deferred = False
 
         self.win = tk.Toplevel(root)
         self.win.title("Fleet Templates")
@@ -537,6 +542,10 @@ class FleetTemplateWindow:
         return f"○ (empty){suffix}"
 
     def _reload_tree(self):
+        # FLEET-10: any rebuild outside the sync path invalidates the sync key
+        # (the sync path re-stamps it right after its own rebuild).
+        self._tree_key = None
+        self._tree_rebuild_deferred = False
         self._tree.delete(*self._tree.get_children())
         self._node_meta.clear()
         t = self.current_template()
@@ -1037,6 +1046,17 @@ class FleetTemplateWindow:
         self._move_drag_ghost(event.x_root, event.y_root)
 
     def _on_drag_drop(self, event):
+        try:
+            return self._handle_drag_drop(event)
+        finally:
+            # FLEET-10: run the rebuild a sync held back during the drag, now
+            # that the drop has used the old item ids.
+            if self._tree_rebuild_deferred and not self._drag_pending:
+                self._tree_rebuild_deferred = False
+                if self.mode == "live":
+                    self._sync_rebuild_tree()
+
+    def _handle_drag_drop(self, event):
         pending = self._drag_pending
         self._drag_pending = None
         self._destroy_drag_ghost()
@@ -1846,10 +1866,43 @@ class FleetTemplateWindow:
         # boss_lost abort. A 4xx abort waits for a manual action.
         self._clear_executor_abort(only="boss_lost")
         self._status.config(text="● Synced", fg=FG_GREEN)
-        self._reload_tree()
+        # FLEET-10: rebuild only when what the tree shows changed (a rebuild
+        # loses selection, collapsed state and any drag in progress), and never
+        # under a pending drag - the release runs it.
+        if self._drag_pending:
+            self._tree_rebuild_deferred = True
+        else:
+            self._sync_rebuild_tree()
         self._refresh_members_tab()
         self._on_sync_complete(events)   # Task 7: auto-sort tick hook
         return True
+
+    def _tree_state_key(self):
+        """FLEET-10: everything a live-tree rebuild renders - structure ids +
+        names, member placement + roles (+ name / ship, shown on the row), the
+        move-id set, pins, the selected template and the mode."""
+        preview = self._compose_preview()
+        move_ids = (frozenset(mv.pilot_id for mv in preview.executable)
+                    if preview is not None else frozenset())
+        wings = tuple(
+            (w.get("id"), w.get("name"),
+             tuple((s.get("id"), s.get("name")) for s in w.get("squads", [])))
+            for w in self._live_structure.get("wings", []))
+        members = tuple(
+            (m.get("character_id"), m.get("name"), m.get("ship_type_id"),
+             m.get("ship_type_name"), m.get("wing_id"), m.get("squad_id"),
+             m.get("role"))
+            for m in self._live_members)
+        pins = tuple(sorted(self._pins.items(), key=repr))
+        return (self.mode, self._current_template_id, wings, members, move_ids,
+                pins)
+
+    def _sync_rebuild_tree(self):
+        """FLEET-10: rebuild the tree only when its state key changed."""
+        key = self._tree_state_key()
+        if key != self._tree_key:
+            self._reload_tree()
+            self._tree_key = key
 
     def _on_sync_complete(self, events):
         if self._auto_sort_on and self.mode == "live":
