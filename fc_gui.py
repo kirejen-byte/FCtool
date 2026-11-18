@@ -796,6 +796,16 @@ def _motd_link_initial_state(config) -> bool:
         return False
 
 
+# Auto-update MOTD: a push ESI rejects for good (403 / 404) disarms the live
+# session at once; any other failure (5xx, timeout, no token) keeps the link and
+# is retried on the next tick, and only this many CONSECUTIVE failures disarm.
+_MOTD_AUTOPUSH_MAX_FAILURES = 5
+
+# A logi/cap channel whose id could not be read from the chat logs is asked
+# again after this many seconds (a hit is kept for the session).
+_MOTD_CHANNEL_MISS_RETRY_S = 120
+
+
 # The Role Tracker's preset helpers live in ``role_presets`` (moved verbatim);
 # these five private names are the SAME objects. ``_ROLE_BUILTIN_PRESETS`` holds
 # the built-in preset buttons (row 1), each ``(label, letter, title, cap)``. The
@@ -14403,6 +14413,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._motd_last_check_ts = None
         self._motd_last_pushed_markup = None
         self._motd_link_state = "off"
+        self._motd_autopush_failures = 0      # consecutive transient failures
+        self._motd_autopush_inflight = False  # one autopush worker at a time
+        self._motd_preview_sig = None         # what the preview shows (gate)
         # A group import applied at this start added or updated a doctrine
         # (its fits) or a MOTD template (boot flag) -- either changes what
         # the next push would send: a remembered ON starts OFF. SESSION ONLY,
@@ -16582,8 +16595,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 the two windows must stay honest.
 
         Always clears the scan's in-flight flag, so a failed/empty scan cannot
-        wedge the guard shut."""
+        wedge the guard shut. Drops every remembered channel-id MISS, so the
+        next preview reads those channels' ids again at once."""
         self._motd_channel_scan_inflight = False
+        misses = getattr(self, "_motd_channel_id_misses", None)
+        if misses:
+            misses.clear()
         ic = self.config.setdefault("intel_channels", {})
         ic["cached_discovered"] = list(names)
         self._save_config()
@@ -16675,7 +16692,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         Returns the id as a string (leading minus preserved) or ``None`` when
         the channel is blank, no matching log exists, or no id could be read
-        (in which case the caller falls back to a plain-text channel)."""
+        (in which case the caller falls back to a plain-text channel).
+
+        A HIT is cached for the session. A MISS is remembered with its time
+        (``self._motd_channel_id_misses``) and read again only after
+        ``_MOTD_CHANNEL_MISS_RETRY_S`` (each read globs the Chatlogs folder on a
+        worker); "Rescan channels" drops every miss."""
         name = (channel_name or "").strip()
         if not name:
             return None
@@ -16684,6 +16706,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             cache = self._motd_channel_id_cache = {}
         if name in cache:
             return cache[name]
+        misses = getattr(self, "_motd_channel_id_misses", None)
+        if misses is None:
+            misses = self._motd_channel_id_misses = {}
+        missed_at = misses.get(name)
+        if (missed_at is not None
+                and time.monotonic() - missed_at < _MOTD_CHANNEL_MISS_RETRY_S):
+            return None
         # Not cached: resolving reads chat-log headers off disk, which can be
         # slow on a large Chatlogs folder — NEVER do it on the Tk thread (that
         # froze the UI for ~30s). Kick off a one-shot background resolution and
@@ -16707,9 +16736,15 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     cid = None
 
                 def done():
-                    self._motd_channel_id_cache[n] = cid
                     self._motd_channel_id_pending.discard(n)
-                    self._rebuild_motd_preview()
+                    prev = self._motd_channel_id_cache.get(n)
+                    if cid is None:
+                        self._motd_channel_id_misses[n] = time.monotonic()
+                    else:
+                        self._motd_channel_id_cache[n] = cid
+                        self._motd_channel_id_misses.pop(n, None)
+                    if cid != prev:     # a still-None retry has nothing to redraw
+                        self._rebuild_motd_preview()
 
                 try:
                     self._post_ui(done)
@@ -16848,7 +16883,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         Meter color: green < 80% of budget, yellow < 100%, red >= 100%. Warns
         (non-blocking) if any single ``<url=fitting:...>`` attribute exceeds
-        ``_MOTD_LINK_ATTR_WARN`` chars (spec §3.5)."""
+        ``_MOTD_LINK_ATTR_WARN`` chars (spec §3.5).
+
+        Change gate: the widget writes are skipped when the markup, the warning
+        text, the budget and the meter canvas width all equal the last render
+        (``_motd_preview_sig``; None until the first render, which therefore
+        always draws). The context build and ``refresh_pills()`` stay
+        unconditional — the deltas they resolve feed the markup."""
         self._motd_preview_job = None
         preview = getattr(self, "_motd_preview", None)
         if preview is None:
@@ -16866,16 +16907,6 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             budget = self._motd_budget()
             markup, compacted = self._motd_output_markup()
 
-            # Raw pane: the built markup verbatim.
-            preview.config(state=tk.NORMAL)
-            preview.delete("1.0", tk.END)
-            preview.insert("1.0", markup)
-            preview.config(state=tk.DISABLED)
-
-            # Rendered pane: parse the markup into styled segments and lay them
-            # out with Tk tags (colours/bold/italic/underline/size + link style).
-            self._render_motd_markup(markup)
-
             length = motd_builder.estimate_length(markup)
             frac = (length / budget) if budget else 0.0
             if frac < 0.8:
@@ -16884,18 +16915,6 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 color = FG_YELLOW
             else:
                 color = FG_RED
-
-            canvas = self._motd_meter_canvas
-            canvas.delete("all")
-            try:
-                w = canvas.winfo_width() or 1
-            except Exception:
-                w = 1
-            fill_w = int(min(frac, 1.0) * w)
-            if fill_w > 0:
-                canvas.create_rectangle(0, 0, fill_w, 14, fill=color, width=0)
-            self._motd_meter_label.config(
-                text=f"{length} / {budget}", fg=color)
 
             # Non-blocking warnings: the resolver's warnings (stale/omitted pills,
             # unresolvable staging) plus the compaction / over-budget / long-link
@@ -16918,7 +16937,37 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     f"{len(long_links)} fit link(s) exceed "
                     f"{self._MOTD_LINK_ATTR_WARN} chars in their DNA — these may "
                     f"not render in-game.")
-            self._motd_warn_label.config(text="  ".join(warns))
+            warn_text = "  ".join(warns)
+
+            canvas = self._motd_meter_canvas
+            try:
+                w = canvas.winfo_width() or 1
+            except Exception:
+                w = 1
+            sig = (markup, warn_text, budget, w)
+            if sig == getattr(self, "_motd_preview_sig", None):
+                return                      # nothing the preview shows changed
+
+            # Raw pane: the built markup verbatim.
+            preview.config(state=tk.NORMAL)
+            preview.delete("1.0", tk.END)
+            preview.insert("1.0", markup)
+            preview.config(state=tk.DISABLED)
+
+            # Rendered pane: parse the markup into styled segments and lay them
+            # out with Tk tags (colours/bold/italic/underline/size + link style).
+            self._render_motd_markup(markup)
+
+            canvas.delete("all")
+            fill_w = int(min(frac, 1.0) * w)
+            if fill_w > 0:
+                canvas.create_rectangle(0, 0, fill_w, 14, fill=color, width=0)
+            self._motd_meter_label.config(
+                text=f"{length} / {budget}", fg=color)
+            self._motd_warn_label.config(text=warn_text)
+            # Recorded only after every write succeeded, so a failed render is
+            # redrawn on the next rebuild rather than gated away.
+            self._motd_preview_sig = sig
         finally:
             self._motd_ctx = None
 
@@ -16963,6 +17012,16 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         for tag in rendered.tag_names():
             if tag.startswith("lnk"):
                 rendered.tag_delete(tag)
+        # ``tag delete`` drops the Tcl bindings but not the Tcl commands (and
+        # the Python lambdas) ``tag_bind`` registered for them: free those by
+        # funcid. AFTER the delete, and never ``tag_unbind`` after it (that
+        # would re-create the tag).
+        for fid in getattr(self, "_motd_link_funcids", None) or ():
+            try:
+                rendered.deletecommand(fid)
+            except tk.TclError:
+                pass
+        self._motd_link_funcids = []
         self._motd_link_seq = 0
         rendered.delete("1.0", tk.END)
 
@@ -16992,11 +17051,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 self._motd_link_seq += 1
                 rendered.insert(tk.END, shown, (tag, link_tag))
                 target = seg.link
-                rendered.tag_bind(
-                    link_tag, "<Enter>",
-                    lambda e, t=target: self._show_tooltip(e, t))
-                rendered.tag_bind(
-                    link_tag, "<Leave>", lambda e: self._hide_tooltip())
+                for fid in (
+                        rendered.tag_bind(
+                            link_tag, "<Enter>",
+                            lambda e, t=target: self._show_tooltip(e, t)),
+                        rendered.tag_bind(
+                            link_tag, "<Leave>", lambda e: self._hide_tooltip())):
+                    if fid:
+                        self._motd_link_funcids.append(fid)
             else:
                 rendered.insert(tk.END, shown, (tag,))
 
@@ -17261,6 +17323,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         do not change what the owner asked for."""
         self._motd_link_enabled = bool(self._motd_link_var.get())
         self._motd_link_state = "waiting" if self._motd_link_enabled else "off"
+        self._motd_autopush_failures = 0
         self.config.setdefault("fittings", {})["motd_link"] = self._motd_link_enabled
         try:
             self._save_config()
@@ -17308,10 +17371,15 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         unchanged = (markup == self._motd_last_pushed_markup)
         if unchanged and not guard_active:
             return  # unchanged and no staging guard → no redundant ESI write
+        # One worker at a time: a slow PUT overlapped by the next tick would read
+        # the same stale baseline and push twice. Cleared by _done, which every
+        # worker exit posts (the quiet guard-only tick included).
+        if getattr(self, "_motd_autopush_inflight", False):
+            return
 
         def worker():
             ok = False
-            reason = None
+            reason = "quiet"
             try:
                 # Staging guard runs first: a departed FC disarms the link and
                 # skips the push this tick. Fail-open — get_location raising or
@@ -17324,29 +17392,46 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     cur_sid = (loc.get("solar_system_id")
                                if isinstance(loc, dict) else None)
                     if cur_sid is not None and cur_sid != staging_sid:
-                        self._post_ui(_done, False, "left_staging", markup)
+                        reason = "left_staging"
                         return
                 if unchanged:
                     return  # guard passed, nothing changed → no push, no state change
+                reason = None
                 info = auth.get_fleet_info()
                 fid = info["fleet_id"] if info else None
                 is_boss = bool(info and auth.is_boss(info, auth.character_id))
                 if not fid or not is_boss:
                     reason = "not_boss"
                 else:
-                    ok = auth.set_fleet_motd(fid, markup)
+                    ok, status, _detail = auth.set_fleet_motd_ex(fid, markup)
                     if not ok:
-                        reason = "error"
-            except Exception as e:
-                reason = str(e) or "error"
-            self._post_ui(_done, ok, reason, markup)
+                        # ESI said no for good (not the boss / no such fleet):
+                        # a "rejected" failure. Anything else (5xx, timeout, no
+                        # token) is transient and retried on the next tick.
+                        reason = ("rejected" if status in (403, 404)
+                                  else "transient")
+            except Exception:
+                reason = "transient"
+            finally:
+                self._post_ui(_done, ok, reason, markup)
 
         def _done(ok, reason, pushed):
             import time
+            self._motd_autopush_inflight = False
+            if reason == "quiet":
+                return
             if ok:
                 self._motd_last_push_ts = time.monotonic()
                 self._motd_last_pushed_markup = pushed
                 self._motd_link_state = "ok"
+                self._motd_autopush_failures = 0
+            elif reason == "transient" and (
+                    getattr(self, "_motd_autopush_failures", 0) + 1
+                    < _MOTD_AUTOPUSH_MAX_FAILURES):
+                # Keep the link and the baseline: the next tick pushes again.
+                self._motd_autopush_failures = (
+                    getattr(self, "_motd_autopush_failures", 0) + 1)
+                self._motd_link_state = "retrying"
             elif reason == "not_boss":
                 self._motd_link_state = "not_boss"   # keep linked, just can't push
             elif reason == "left_staging":
@@ -17360,7 +17445,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     self._motd_link_var.set(False)
                 self._motd_link_state = "left_staging"
             else:
-                # Hard failure (e.g. 403) — drop the link so we stop hammering ESI.
+                # Hard failure (ESI answered 403 / 404, or the
+                # _MOTD_AUTOPUSH_MAX_FAILURES-th consecutive transient failure)
+                # — drop the link so we stop hammering ESI.
                 # SESSION ONLY — do NOT persist False here. The remembered
                 # config["fittings"]["motd_link"] is the owner's LAST EXPLICIT
                 # toggle; an automatic disarm must not rewrite their choice.
@@ -17370,7 +17457,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 self._motd_link_state = "error"
             self._motd_update_link_indicator()
 
-        threading.Thread(target=worker, daemon=True).start()
+        self._motd_autopush_inflight = True
+        try:
+            threading.Thread(target=worker, daemon=True).start()
+        except Exception:
+            # A thread that never started will never clear the flag.
+            self._motd_autopush_inflight = False
+            raise
 
     def _motd_update_link_indicator(self):
         ind = getattr(self, "_motd_link_indicator", None)
@@ -17399,6 +17492,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             return
         if state == "not_boss":
             ind.config(text="🔗 linked (not boss)", fg=FG_YELLOW)
+            return
+        if state == "retrying":
+            ind.config(text=chr(0x1F517) + " push failed " + chr(0x2022)
+                       + " retrying", fg=FG_YELLOW)
             return
         ts = getattr(self, "_motd_last_check_ts", None)
         if ts is None:
