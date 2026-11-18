@@ -210,6 +210,12 @@ class ESIAuth:
         # within the access_token property (which also acquires).
         self._refresh_lock = threading.RLock()
 
+        # SSO refresh backoff (ESI-3): a failed _do_refresh stamps the
+        # monotonic time and a growing delay; the access_token property does
+        # not POST again until the delay has passed. Cleared by a success.
+        self._refresh_failed_at: float | None = None
+        self._refresh_backoff: float = 0.0
+
         # Cache for the sibling ESIAuth delegate resolved by
         # _any_authenticated_auth() when *this* instance is unauthenticated.
         # Constructing a sibling ESIAuth fires a live SSO refresh that rotates
@@ -282,9 +288,39 @@ class ESIAuth:
                 # Another thread refreshed while we waited.
                 return self._access_token
             if self._refresh_token:
+                if self._in_refresh_backoff():
+                    # A recent refresh failed: no SSO POST until the
+                    # backoff window has passed (ESI-3).
+                    return None
                 self._do_refresh()
                 return self._access_token
             return None
+
+    # SSO refresh backoff: first delay, doubling per failure, capped.
+    _REFRESH_BACKOFF_FIRST = 60.0
+    _REFRESH_BACKOFF_MAX = 300.0
+
+    def _in_refresh_backoff(self) -> bool:
+        """True while a failed refresh's backoff window is still open."""
+        failed_at = getattr(self, "_refresh_failed_at", None)
+        if failed_at is None:
+            return False
+        delay = getattr(self, "_refresh_backoff", 0.0) or 0.0
+        return time.monotonic() - failed_at < delay
+
+    def _note_refresh_failure(self) -> None:
+        """Stamp a failed refresh: 60 s, then doubling, capped at 300 s."""
+        prev = getattr(self, "_refresh_backoff", 0.0) or 0.0
+        if prev <= 0:
+            delay = self._REFRESH_BACKOFF_FIRST
+        else:
+            delay = min(prev * 2, self._REFRESH_BACKOFF_MAX)
+        self._refresh_backoff = delay
+        self._refresh_failed_at = time.monotonic()
+
+    def _clear_refresh_backoff(self) -> None:
+        self._refresh_failed_at = None
+        self._refresh_backoff = 0.0
 
     # ── PKCE Helpers ──────────────────────────────────────────────────────────
 
@@ -441,6 +477,7 @@ class ESIAuth:
                 SSO_TOKEN_URL,
                 headers=headers,
                 data=data,
+                timeout=15,
             )
             if not resp.ok:
                 print(f"[ESI Auth] Token exchange failed: {resp.status_code} {resp.text}")
@@ -452,6 +489,8 @@ class ESIAuth:
             self._expires_at = datetime.now(timezone.utc) + timedelta(
                 seconds=data.get("expires_in", 1199)
             )
+            # A fresh login is a fresh credential: no refresh backoff left.
+            self._clear_refresh_backoff()
 
             # Verifier is single-use; drop it once the code is redeemed.
             self._code_verifier = None
@@ -473,6 +512,10 @@ class ESIAuth:
         (HTTP 400 invalid_grant — EVE SSO revoked the refresh token),
         clears all token state and persists an empty token file so the
         class cannot linger in a zombie-authenticated state.
+
+        Every failure stamps the refresh backoff (_note_refresh_failure) and a
+        success clears it. Only the access_token property honours the window;
+        a direct call here always POSTs.
 
         RLock guards the body so concurrent callers (access_token property,
         _load_tokens) don't race on the refresh-token rotation that SSO
@@ -518,10 +561,12 @@ class ESIAuth:
                 # Transient: network didn't reach SSO. Keep refresh token.
                 print(f"[ESI Auth] Token refresh transient network error: {e}")
                 self._access_token = None
+                self._note_refresh_failure()
                 return False
             except Exception as e:
                 print(f"[ESI Auth] Refresh error: {e}")
                 self._access_token = None
+                self._note_refresh_failure()
                 return False
 
             if not resp.ok:
@@ -545,6 +590,7 @@ class ESIAuth:
                     self._access_token = None
                     self._refresh_token = None
                     self._expires_at = None
+                    self._note_refresh_failure()
                     # Persist an empty token file so on next start we don't
                     # silently "restore" a dead session.
                     try:
@@ -563,6 +609,7 @@ class ESIAuth:
                     f"{resp.status_code}"
                 )
                 self._access_token = None
+                self._note_refresh_failure()
                 return False
 
             try:
@@ -572,11 +619,13 @@ class ESIAuth:
                 self._expires_at = datetime.now(timezone.utc) + timedelta(
                     seconds=data.get("expires_in", 1199)
                 )
+                self._clear_refresh_backoff()
                 self._save_tokens()
                 return True
             except Exception as e:
                 print(f"[ESI Auth] Refresh response parse error: {e}")
                 self._access_token = None
+                self._note_refresh_failure()
                 return False
 
     @staticmethod
