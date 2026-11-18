@@ -652,21 +652,28 @@ class GamelogMonitor:
         self._status_cache = None
 
     def _bump_status(self) -> None:
-        """Mark the cached status aggregate stale (any thread)."""
+        """Mark the cached status aggregate stale (any thread).
+
+        INVARIANT: mutate FIRST, then bump. The reader (_refresh_status)
+        snapshots the generation before aggregating, so a bump that lands
+        before its mutation lets a status built from the old state be cached
+        under the new generation and stick."""
         self._status_gen += 1
 
     def _set_position(self, path, value) -> None:
         """Store a tail offset. Only a NEW key changes the status (it counts
         files); an offset update for a known key never does."""
-        if path not in self._positions:
-            self._bump_status()
+        is_new = path not in self._positions
         self._positions[path] = value
+        if is_new:
+            self._bump_status()
 
     def _set_listener(self, path, listener) -> None:
         """Store a listener; a changed value (or new key) stales the status."""
-        if self._listeners.get(path, _UNSET) != listener:
-            self._bump_status()
+        changed = self._listeners.get(path, _UNSET) != listener
         self._listeners[path] = listener
+        if changed:
+            self._bump_status()
 
     def _refresh_status(self) -> None:
         """Publish the status snapshot. The one cheap isdir runs every call;
@@ -738,9 +745,10 @@ class GamelogMonitor:
             new = None
         else:
             new = {str(n).strip().lower() for n in names if str(n).strip()}
-        if new != self._tracked:
-            self._bump_status()
+        changed = new != self._tracked
         self._tracked = new
+        if changed:
+            self._bump_status()
 
     def start(self) -> None:
         if self._thread and self._thread.is_alive():
