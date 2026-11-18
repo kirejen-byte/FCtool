@@ -28466,6 +28466,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             return {"layouts": {}, "focus_hotkeys": {}, "cycle_order": [],
                     "errors": [f"could not parse EVE-O config: {e}"]}
 
+        def _dict_or_empty(value):
+            return value if isinstance(value, dict) else {}
+
         def _char_key(title: str):
             # Reuse the tracker's own title parser for exact prefix parity.
             char = eve_client_tracker._char_from_title(
@@ -28475,7 +28478,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             return char.strip().lower()
 
         layouts: dict = {}
-        for title, point in (data.get("FlatLayout") or {}).items():
+        for title, point in _dict_or_empty(data.get("FlatLayout")).items():
             key = _char_key(title)
             if key is None:
                 continue
@@ -28486,7 +28489,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 errors.append(f"bad layout point for {title!r}: {point!r}")
 
         focus_hotkeys: dict = {}
-        for title, hk in (data.get("ClientHotkey") or {}).items():
+        for title, hk in _dict_or_empty(data.get("ClientHotkey")).items():
             key = _char_key(title)
             if key is None:
                 continue
@@ -28501,7 +28504,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             focus_hotkeys[key] = text
 
         order_pairs = []
-        for title, idx in (data.get("CycleGroup1ClientsOrder") or {}).items():
+        for title, idx in _dict_or_empty(data.get("CycleGroup1ClientsOrder")).items():
             key = _char_key(title)
             if key is None:
                 continue
@@ -28655,6 +28658,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             return
         parsed = self.parse_eveo_config(text)
         summary = self._preview_merge_eveo(parsed)
+        # The merge wrote cfg only; re-register the live hotkeys so the imported
+        # focus/cycle keys work now, not after a restart.
+        if getattr(self, "_preview_hotkeys", None) is not None:
+            try:
+                self._preview_restart_hotkeys()
+            except Exception:
+                log.exception("[preview] hotkey re-register after EVE-O import failed")
         lines = [
             f"Imported from:\n{path}\n",
             f"Layouts added: {summary['added_layouts']}",
