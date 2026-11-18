@@ -11438,11 +11438,17 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             prior = cached[2]
             for k in ("fax", "dreads", "blops", "titans"):
                 info[k] = list(prior.get(k, []))
-            if prior.get("ship_type_id") == info["ship_type_id"]:
-                for k in ("cyno", "cyno_ozone", "cyno_lights", "cyno_text",
-                          "cyno_low", "dictor"):
-                    if k in prior:
-                        info[k] = prior[k]
+            if prior.get("ship_type_id") == info["ship_type_id"] \
+                    and "dictor" in prior:
+                info["dictor"] = prior["dictor"]
+            # Cyno state is per HULL (item), not per type: restore it only from
+            # the check recorded for the ship flown now, as the cache-hit path does.
+            if cyno_hull:
+                ship_check = (prior.get("cyno_check") or {}).get(
+                    str(info["ship_item_id"]))
+                if ship_check and "gen" in ship_check:
+                    _ozone_fill_cyno(info, ship_check.get("gen"),
+                                     ship_check.get("ozone", 0), ozone_cfg)
             self._inject_piloted_capital(info)
             return info
 
@@ -36520,11 +36526,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                         getattr(auth, "character_id", None))
                 except Exception:
                     log.exception("Kick Pods: the kick run failed")
-                    res = (0, 0, 0, False)
-                self._post_ui(_done, *res)
+                    res = None
+                self._post_ui(_done, *(res or (0, 0, 0, None)))
             threading.Thread(target=worker, daemon=True).start()
 
         def _done(kicked, failed, skipped=0, reread_ok=True):
+            if reread_ok is None:
+                self._themed_modal(
+                    "Kick Pods",
+                    "The kick run failed; some pilots may already have been "
+                    "kicked. See fctool.log.",
+                    buttons=[("OK", "Dark.TButton", None)], accent=FG_RED)
+                return
             if not reread_ok:
                 self._themed_modal(
                     "Kick Pods",
