@@ -911,6 +911,23 @@ def _remove_exemption_entry(entries: list[dict], index: int) -> list[dict]:
     return out
 
 
+def _linux_status_text(backend, text: str) -> str:
+    """Prefix `text` with the Linux/X11 helper state. No backend (every Windows
+    run) returns `text` untouched. Total: a raising snapshot reads "unknown".
+    ASCII prefix only."""
+    if backend is None:
+        return text
+    try:
+        snap = backend.supervisor.status_snapshot()
+        state, last_error = snap.state, snap.last_error
+    except Exception:
+        state, last_error = "unknown", None
+    text = "Linux/X11 previews (%s) - %s" % (state, text)
+    if state == "failed" and last_error:
+        text += " - " + str(last_error)[:80]
+    return text
+
+
 def _read_text_file_for_import(path: str) -> str:
     """Read a text file for one-time import (EVE-O config). Split out so tests
     can stub it without touching the real filesystem. EVE-O writes UTF-8."""
@@ -24734,10 +24751,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             self._preview_after_id = None
             return
         status = self._preview_native_tick_body()
-        self._preview_status = status
+        self._preview_status = status       # bare: the prefix is label-only
         if getattr(self, "_preview_status_label", None) is not None:
             try:
-                self._preview_status_label.config(text=status)
+                self._preview_status_label.config(text=_linux_status_text(
+                    getattr(self, "_preview_thumb_backend", None), status))
             except tk.TclError:
                 pass
         # Heartbeat the Gamelogs diagnostic from the monitor's cached snapshot
@@ -27951,18 +27969,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # Linux/X11: name the backend and its helper state in FRONT of the
         # tick's own status, so "0 tiles" is never mute about why. No backend
         # (every Windows run) leaves the string untouched. ASCII only.
-        be = getattr(self, "_preview_thumb_backend", None)
-        if be is None:
-            return text
-        try:
-            snap = be.supervisor.status_snapshot()
-            state, last_error = snap.state, snap.last_error
-        except Exception:
-            state, last_error = "unknown", None
-        text = "Linux/X11 previews (%s) - %s" % (state, text)
-        if state == "failed" and last_error:
-            text += " - " + str(last_error)[:80]
-        return text
+        return _linux_status_text(
+            getattr(self, "_preview_thumb_backend", None), text)
 
     def _preview_set_mode(self, new_mode: str):
         """Switch preview mode: tear down the old mode, persist, boot the new one.
@@ -28458,6 +28466,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             return {"layouts": {}, "focus_hotkeys": {}, "cycle_order": [],
                     "errors": [f"could not parse EVE-O config: {e}"]}
 
+        def _dict_or_empty(value):
+            return value if isinstance(value, dict) else {}
+
         def _char_key(title: str):
             # Reuse the tracker's own title parser for exact prefix parity.
             char = eve_client_tracker._char_from_title(
@@ -28467,7 +28478,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             return char.strip().lower()
 
         layouts: dict = {}
-        for title, point in (data.get("FlatLayout") or {}).items():
+        for title, point in _dict_or_empty(data.get("FlatLayout")).items():
             key = _char_key(title)
             if key is None:
                 continue
@@ -28478,7 +28489,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 errors.append(f"bad layout point for {title!r}: {point!r}")
 
         focus_hotkeys: dict = {}
-        for title, hk in (data.get("ClientHotkey") or {}).items():
+        for title, hk in _dict_or_empty(data.get("ClientHotkey")).items():
             key = _char_key(title)
             if key is None:
                 continue
@@ -28493,7 +28504,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             focus_hotkeys[key] = text
 
         order_pairs = []
-        for title, idx in (data.get("CycleGroup1ClientsOrder") or {}).items():
+        for title, idx in _dict_or_empty(data.get("CycleGroup1ClientsOrder")).items():
             key = _char_key(title)
             if key is None:
                 continue
@@ -28647,6 +28658,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             return
         parsed = self.parse_eveo_config(text)
         summary = self._preview_merge_eveo(parsed)
+        # The merge wrote cfg only; re-register the live hotkeys so the imported
+        # focus/cycle keys work now, not after a restart.
+        if getattr(self, "_preview_hotkeys", None) is not None:
+            try:
+                self._preview_restart_hotkeys()
+            except Exception:
+                log.exception("[preview] hotkey re-register after EVE-O import failed")
         lines = [
             f"Imported from:\n{path}\n",
             f"Layouts added: {summary['added_layouts']}",
