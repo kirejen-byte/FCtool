@@ -117,6 +117,33 @@ def clamp_name(name) -> str:
     return (name or "")[:_NAME_MAX]
 
 
+def clamp_collisions(wanted) -> list:
+    """Names that become ONE live wing/squad after the 10-character clamp.
+
+    wanted: [(wing_name, [squad_name, ...]), ...] (FULL template names, the
+    `ensure_structure` shape). Returns [(first, second), ...]: two wings, or
+    two squads of one wing (written "Wing/Squad"), whose clamp_name is equal;
+    exact duplicates included. Each later clash pairs with the first holder
+    of that clamped name. Empty list = safe to materialize. Pure."""
+    pairs: list = []
+    first_wing: dict = {}
+    for wing_name, squad_names in wanted:
+        wkey = clamp_name(wing_name)
+        if wkey in first_wing:
+            pairs.append((first_wing[wkey], wing_name))
+        else:
+            first_wing[wkey] = wing_name
+        first_squad: dict = {}
+        for sn in squad_names:
+            skey = clamp_name(sn)
+            label = f"{wing_name}/{sn}"
+            if skey in first_squad:
+                pairs.append((first_squad[skey], label))
+            else:
+                first_squad[skey] = label
+    return pairs
+
+
 def ensure_structure(session, fleet_id, wanted, live_wings):
     """Materialize every wing/squad in `wanted` in the live fleet, reconciling
     EVE's auto-created default squad (reuse/rename instead of leaving a stray).

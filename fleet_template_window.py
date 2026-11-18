@@ -148,6 +148,41 @@ def member_matches_filter(member: dict, query: str) -> bool:
     return q in hay
 
 
+def _real_fleet_id(value) -> bool:
+    """A live wing/squad id: present and not ESI's -1 "none" sentinel."""
+    return value is not None and not (isinstance(value, int) and value < 0)
+
+
+def target_resolvable(role, wing_id, squad_id) -> bool:
+    """FLEET-2: can ESI place a pilot with this role at these ids? A fleet
+    commander needs no ids, a wing commander needs the wing, a squad commander
+    or member (or an unknown role) needs both. Pure - no Tk."""
+    if role == "fleet_commander":
+        return True
+    if role == "wing_commander":
+        return _real_fleet_id(wing_id)
+    return _real_fleet_id(wing_id) and _real_fleet_id(squad_id)
+
+
+def unresolved_target_text(wing_name, squad_name, role, wing_id) -> str:
+    """Why a move's target is not resolvable, for the log and status line."""
+    if wing_name and not _real_fleet_id(wing_id):
+        return f"{wing_name} is not in the live fleet"
+    if squad_name:
+        return f"{wing_name}/{squad_name} is not in the live fleet"
+    need = "wing" if role == "wing_commander" else "squad"
+    what = (role or "squad_member").replace("_", " ")
+    return f"a {what} needs a {need} to move into"
+
+
+def skipped_moves_status(count, reason) -> str:
+    """Status line for moves held back by the FLEET-2 guard."""
+    noun = "move" if count == 1 else "moves"
+    hint = ("; Apply the template first" if reason.endswith("live fleet")
+            else "")
+    return f"{count} {noun} skipped: {reason}{hint}"
+
+
 class FleetTemplateWindow:
     def __init__(self, root, *, store, fittings, config, esi_session_provider,
                  fleet_info_provider, doctrine_provider, character_names_provider,
@@ -184,6 +219,14 @@ class FleetTemplateWindow:
         self._last_preview = None                 # cached ComposeResult (Tasks D5/D10)
         self._undo_stack: list[dict] = []         # template-mode undo (Task D9)
         self._log_buffer: deque = deque(maxlen=500)   # internal executor/sort log
+        # FLEET-2: (pilot_id, wing, squad, role) targets already logged as
+        # unresolvable, so a 10 s auto-move tick does not repeat the line.
+        self._skip_logged: set = set()
+        # FLEET-10: the state the live tree was last rebuilt from by a sync
+        # (None = unknown, rebuild next time) and a rebuild held back while a
+        # drag was pending (run on the button release).
+        self._tree_key = None
+        self._tree_rebuild_deferred = False
 
         self.win = tk.Toplevel(root)
         self.win.title("Fleet Templates")
@@ -499,6 +542,10 @@ class FleetTemplateWindow:
         return f"○ (empty){suffix}"
 
     def _reload_tree(self):
+        # FLEET-10: any rebuild outside the sync path invalidates the sync key
+        # (the sync path re-stamps it right after its own rebuild).
+        self._tree_key = None
+        self._tree_rebuild_deferred = False
         self._tree.delete(*self._tree.get_children())
         self._node_meta.clear()
         t = self.current_template()
@@ -999,6 +1046,17 @@ class FleetTemplateWindow:
         self._move_drag_ghost(event.x_root, event.y_root)
 
     def _on_drag_drop(self, event):
+        try:
+            return self._handle_drag_drop(event)
+        finally:
+            # FLEET-10: run the rebuild a sync held back during the drag, now
+            # that the drop has used the old item ids.
+            if self._tree_rebuild_deferred and not self._drag_pending:
+                self._tree_rebuild_deferred = False
+                if self.mode == "live":
+                    self._sync_rebuild_tree()
+
+    def _handle_drag_drop(self, event):
         pending = self._drag_pending
         self._drag_pending = None
         self._destroy_drag_ghost()
@@ -1013,6 +1071,10 @@ class FleetTemplateWindow:
             return
         if self.mode == "live":
             if kind not in ("livepilot", "unassigned"):
+                return
+            if dst in ids:
+                # A plain click (press + release on the same row) is not a
+                # drop: no move, no pin, no abort clear.
                 return
             char_ids = []
             for i in ids:
@@ -1166,8 +1228,10 @@ class FleetTemplateWindow:
                                      target_squad_name=squad.name,
                                      target_role=self._current_role_of(cid))
                  for cid in char_ids]
-        self._pin_dragged(char_ids)
-        self._enqueue_moves_sync(moves, wing_ids, squad_ids, "drag")
+        # Pin only what was actually queued: a refused drag (FLEET-2) changes
+        # nothing.
+        self._pin_dragged(self._enqueue_moves_sync(moves, wing_ids, squad_ids,
+                                                   "drag"))
 
     def _name_of(self, cid):
         return next((m["name"] for m in self._live_members
@@ -1194,8 +1258,8 @@ class FleetTemplateWindow:
                                      target_squad_name=sname,
                                      target_role=self._current_role_of(cid))
                  for cid in char_ids]
-        self._pin_dragged(char_ids)
-        self._enqueue_moves_sync(moves, wing_ids, squad_ids, "drag")
+        self._pin_dragged(self._enqueue_moves_sync(moves, wing_ids, squad_ids,
+                                                   "drag"))
 
     def _pin_dragged(self, char_ids):
         """Record each dragged pilot's current ship as a pin (pilot -> ship_type_id)
@@ -1802,11 +1866,50 @@ class FleetTemplateWindow:
         self._live_structure = structure
         self._live_members = members          # already enriched on the worker
         self._prev_members = members
+        # FLEET-3: a good sync proves the boss session is back, so it lifts a
+        # boss_lost abort. A 4xx abort waits for a manual action.
+        self._clear_executor_abort(only="boss_lost")
         self._status.config(text="● Synced", fg=FG_GREEN)
-        self._reload_tree()
+        # FLEET-10: rebuild only when what the tree shows changed (a rebuild
+        # loses selection, collapsed state and any drag in progress), and never
+        # under a pending drag - the release runs it.
+        if self._drag_pending:
+            self._tree_rebuild_deferred = True
+            # Keep the shared preview current for the Members tab below; it is
+            # an in-memory compose and touches no tree item.
+            self._compose_preview()
+        else:
+            self._sync_rebuild_tree()
         self._refresh_members_tab()
         self._on_sync_complete(events)   # Task 7: auto-sort tick hook
         return True
+
+    def _tree_state_key(self):
+        """FLEET-10: everything a live-tree rebuild renders - structure ids +
+        names, member placement + roles (+ name / ship, shown on the row), the
+        move-id set, pins, the selected template and the mode."""
+        preview = self._compose_preview()
+        move_ids = (frozenset(mv.pilot_id for mv in preview.executable)
+                    if preview is not None else frozenset())
+        wings = tuple(
+            (w.get("id"), w.get("name"),
+             tuple((s.get("id"), s.get("name")) for s in w.get("squads", [])))
+            for w in self._live_structure.get("wings", []))
+        members = tuple(
+            (m.get("character_id"), m.get("name"), m.get("ship_type_id"),
+             m.get("ship_type_name"), m.get("wing_id"), m.get("squad_id"),
+             m.get("role"))
+            for m in self._live_members)
+        pins = tuple(sorted(self._pins.items(), key=repr))
+        return (self.mode, self._current_template_id, wings, members, move_ids,
+                pins)
+
+    def _sync_rebuild_tree(self):
+        """FLEET-10: rebuild the tree only when its state key changed."""
+        key = self._tree_state_key()
+        if key != self._tree_key:
+            self._reload_tree()
+            self._tree_key = key
 
     def _on_sync_complete(self, events):
         if self._auto_sort_on and self.mode == "live":
@@ -1817,9 +1920,30 @@ class FleetTemplateWindow:
         impl carries the <Destroy> cleanup this window's bespoke copy lacked)."""
         return attach_tooltip(widget, text)
 
+    def _clamp_collision_text(self):
+        """FLEET-5: why the current template cannot be materialized (two wings,
+        or two squads of a wing, that share a name after ESI's 10-character
+        clamp), or None when it can."""
+        t = self.current_template()
+        if t is None:
+            return None
+        pairs = fleet_esi.clamp_collisions(
+            [(w.name, [s.name for s in w.squads]) for w in t.wings])
+        if not pairs:
+            return None
+        a, b = pairs[0]
+        more = f" (+{len(pairs) - 1} more)" if len(pairs) > 1 else ""
+        return (f'"{a}" and "{b}" are the same name in EVE (first 10 '
+                f'characters); rename one{more}.')
+
     def _toggle_auto_sort(self):
         if self.mode != "live":
             return
+        if not self._auto_sort_on:
+            clash = self._clamp_collision_text()
+            if clash:
+                self._status.config(text=f"Auto-move refused: {clash}", fg=FG_RED)
+                return
         self._auto_sort_on = not self._auto_sort_on
         self._auto_sort_btn.config(
             text=f"Auto-move: {'ON' if self._auto_sort_on else 'OFF'}")
@@ -1830,6 +1954,17 @@ class FleetTemplateWindow:
     def _auto_sort_tick(self):
         t = self.current_template()
         if t is None:
+            return
+        clash = self._clamp_collision_text()
+        if clash:                              # FLEET-5: would merge in EVE
+            self._status.config(text=f"Auto-move refused: {clash}", fg=FG_RED)
+            return
+        if getattr(self._executor, "abort_reason", None) == "4xx":
+            # FLEET-3: every job would be dropped until a manual action, so
+            # queue nothing and say so once per tick (no per-pilot lines).
+            self._status.config(
+                text="Auto-move paused: 3 ESI errors in a row. A drag, menu "
+                     "move or Apply resumes it.", fg=FG_YELLOW)
             return
         res = fleet_composer.compose(
             t, self._live_members, self._live_structure,
@@ -1845,6 +1980,7 @@ class FleetTemplateWindow:
                      for s in w.get("squads", [])}
         import time
         enqueued = 0
+        skipped = []
         for mv in res.executable:              # already-correct already filtered
             if mv.pilot_id in self._pins:      # never move a pinned pilot
                 continue
@@ -1863,6 +1999,10 @@ class FleetTemplateWindow:
             wid = wing_ids.get(wkey) if wkey else None
             sid = squad_ids.get((wkey, fleet_esi.clamp_name(mv.target_squad_name))) \
                 if mv.target_squad_name and wid is not None else None
+            reason = self._unresolved_reason(mv, wid, sid, "autosort")
+            if reason is not None:             # FLEET-2: never send an id-less move
+                skipped.append(reason)
+                continue
             self._executor.submit(MoveJob(
                 pilot_id=mv.pilot_id, pilot_name=mv.pilot_name,
                 wing_id=wid, squad_id=sid, role=mv.target_role, source="autosort"))
@@ -1871,6 +2011,31 @@ class FleetTemplateWindow:
             enqueued += 1
         if enqueued:
             self._last_write_wall = time.time()
+        self._report_skipped(skipped)
+
+    def _unresolved_reason(self, mv, wing_id, squad_id, source):
+        """FLEET-2: None when `mv` may be submitted at these ids; otherwise the
+        reason text (logged once per pilot + target)."""
+        if target_resolvable(mv.target_role, wing_id, squad_id):
+            return None
+        reason = unresolved_target_text(mv.target_wing_name, mv.target_squad_name,
+                                        mv.target_role, wing_id)
+        key = (mv.pilot_id, mv.target_wing_name, mv.target_squad_name,
+               mv.target_role)
+        if key not in self._skip_logged:
+            self._skip_logged.add(key)
+            self._log_line(f"[{source}] skipped {mv.pilot_name}: {reason}")
+        return reason
+
+    def _report_skipped(self, reasons):
+        """FLEET-2: one status line for the moves the guard held back."""
+        if not reasons:
+            return
+        try:
+            self._status.config(text=skipped_moves_status(len(reasons), reasons[0]),
+                                fg=FG_YELLOW)
+        except tk.TclError:
+            pass
 
     def _read_members(self, session):
         """GET /fleets/{id}/members/ via the session adapter."""
@@ -1898,6 +2063,7 @@ class FleetTemplateWindow:
         import time
         self._ensure_executor()
         role = self._current_role_of(char_id)
+        self._clear_executor_abort()          # FLEET-3: a manual action resumes
         self._executor.submit(MoveJob(
             pilot_id=char_id, pilot_name=self._name_of(char_id),
             wing_id=wing_id, squad_id=squad_id, role=role, source="menu"))
@@ -1909,6 +2075,14 @@ class FleetTemplateWindow:
 
     def _apply(self):
         if self.mode != "live":
+            return
+        clash = self._clamp_collision_text()
+        if clash:
+            # FLEET-5: ensure_structure would merge the pair into one live
+            # wing/squad and add a duplicate on every Apply.
+            messagebox.showwarning("Apply", f"Cannot apply this template: {clash}",
+                                   parent=self.win)
+            self._status.config(text=f"Apply refused: {clash}", fg=FG_RED)
             return
         # _esi_session_provider() does a SYNCHRONOUS ESI round-trip (get_fleet_info
         # + a possible token refresh), so fetch it off the Tk thread and open the
@@ -2035,10 +2209,28 @@ class FleetTemplateWindow:
             raise fleet_esi.FleetESIError("no_token")
         # Point the executor at the freshest session each write.
         self._executor.session = session
-        fleet_esi.move_member(session, self._fleet_id, job.pilot_id,
-                              wing_id=job.wing_id, squad_id=job.squad_id,
-                              role=job.role)
+        try:
+            fleet_esi.move_member(session, self._fleet_id, job.pilot_id,
+                                  wing_id=job.wing_id, squad_id=job.squad_id,
+                                  role=job.role)
+        except fleet_esi.FleetESIError as e:
+            # FLEET-1: hand a plain 4xx HTTP failure (420 / 429 / 422 ...) back
+            # as its STATUS so the executor's freeze and 3x4xx abort can see
+            # it. A 5xx still failing after _call's retry keeps raising: the
+            # executor would read a returned non-4xx status as a success.
+            # not_found / boss_lost / network / no_token keep raising too.
+            if (e.reason == "http_error" and isinstance(e.status, int)
+                    and 400 <= e.status < 500):
+                return e.status
+            raise
         return 204
+
+    def _clear_executor_abort(self, only=None):
+        """FLEET-3: lift the executor's abort (any reason, or only `only`).
+        Tk thread only. Logs one line when something was actually cleared."""
+        clear = getattr(self._executor, "clear_abort", None)
+        if callable(clear) and clear(only=only):
+            self._log_line("Fleet move queue resumed.")
 
     def _job_still_needed(self, job):
         """After a burst re-poll, is this pilot still not where the job wants?"""
@@ -2119,8 +2311,14 @@ class FleetTemplateWindow:
 
     def _enqueue_moves_sync(self, moves, wing_ids, squad_ids, source):
         """Build + submit MoveJobs on the Tk thread. Used directly by drag/drop
-        (ids known up front) and by the Apply worker's _post callback."""
+        (ids known up front) and by the Apply worker's _post callback.
+
+        A move whose target does not resolve for its role is refused (FLEET-2).
+        Returns the pilot ids actually submitted."""
         import time
+        cleared = source == "autosort"
+        submitted = []
+        skipped = []
         for mv in moves:
             wkey = (fleet_esi.clamp_name(mv.target_wing_name)
                     if mv.target_wing_name is not None else None)
@@ -2129,12 +2327,25 @@ class FleetTemplateWindow:
             if mv.target_squad_name is not None and wing_id is not None:
                 squad_id = squad_ids.get(
                     (wkey, fleet_esi.clamp_name(mv.target_squad_name)))
+            reason = self._unresolved_reason(mv, wing_id, squad_id, source)
+            if reason is not None:
+                skipped.append(reason)
+                continue
+            if not cleared:
+                self._clear_executor_abort()   # FLEET-3: a manual action resumes
+                cleared = True
             self._executor.submit(MoveJob(
                 pilot_id=mv.pilot_id, pilot_name=mv.pilot_name,
                 wing_id=wing_id, squad_id=squad_id, role=mv.target_role,
                 source=source))
-        self._last_write_wall = time.time()   # go active-cadence after a write
-        self._schedule_reconcile_poll()
+            submitted.append(mv.pilot_id)
+        # An Apply wrote structure (wings/squads) even when it queued no move:
+        # keep its active cadence + reconcile poll so the new rows show soon.
+        if submitted or source == "apply":
+            self._last_write_wall = time.time()   # go active-cadence after a write
+            self._schedule_reconcile_poll()
+        self._report_skipped(skipped)
+        return submitted
 
     def _schedule_reconcile_poll(self):
         """Fire one sync ~(settle_s + 3)s after enqueue so the tree reflects the
