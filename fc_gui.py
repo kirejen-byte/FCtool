@@ -32413,6 +32413,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # the range check dead until the next Settings->Save.
             if getattr(self, "_range_monitor", None) is None:
                 self._build_range_monitor(logs_path, channel)
+            # Record what the tails now stand on, in _setup_modules' shape, so
+            # the Settings->Save that may follow keeps them instead of
+            # rebuilding both for a character it has already applied.
+            self._chat_tail_sig = FCToolGUI._chat_tail_signature(
+                self.config, logs_path, channel, tracked_char)
             # New listener = a new log universe, so the backfill budget charges
             # (and records the key, so the Save that may follow does not).
             key = (logs_path, channel, tracked_char)
@@ -33082,8 +33087,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._save_config()
         self._save_status.config(text="Saved!", fg=FG_GREEN)
 
-        # Restart modules
-        self._stop_monitoring()
+        # Restart modules. A running zKill monitor whose inputs this Save did
+        # not change stays up: a new one replays ~30 min and re-announces every
+        # fight in it. Decided BEFORE the reload below replaces self.config;
+        # _setup_modules re-checks it against the reloaded dict.
+        keep_zkill = FCToolGUI._zkill_keepable(
+            getattr(self, "zkill_monitor", None), self.config,
+            getattr(self, "_zkill_sig", None))
+        self._stop_monitoring(keep_zkill=keep_zkill)
         self.config = self._load_config()
         # The config OBJECT was just replaced, so the registry must be rebuilt
         # against the new dict — otherwise every later _save_channels() would
@@ -33103,8 +33114,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             self._hud_host.config = self.config
         self._refresh_channel_rows()
         self._rebuild_intel_channel_checkboxes()
-        self._setup_modules()
-        self._start_monitoring()
+        self._setup_modules(keep_zkill=keep_zkill)
+        self._start_monitoring(keep_zkill=keep_zkill)
         # Both of intel ingest's inputs live in this dialog (the logs path and,
         # via the Channels registry, the Intel-tagged set), so re-point it here.
         # Idempotent: unchanged inputs cost one dict read.
@@ -33233,6 +33244,54 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
     # ── Module Setup ──────────────────────────────────────────────────────────
 
+    @staticmethod
+    def _chat_tail_signature(config, logs_path, channel, tracked_char):
+        """The inputs both fleet tails are built from. ONE shape for both
+        writers of ``_chat_tail_sig`` (_setup_modules and the tracked-character
+        change), so a Settings->Save that changed none of them keeps the live
+        monitors instead of re-discovering every log."""
+        return (logs_path, channel, tracked_char,
+                config.get("poll_interval_seconds", 1.0))
+
+    @staticmethod
+    def _zkill_signature(config):
+        """The zKill config the running ZKillMonitor was built from. Equal
+        before and after a Settings->Save = keep the live monitor (its alert
+        history and sequence position), see _save_settings."""
+        zk = config.get("zkillboard", {})
+        if not isinstance(zk, dict):
+            zk = {}
+
+        def _frozen(value):
+            try:
+                return tuple(value or ())
+            except TypeError:
+                return (value,)
+
+        return (bool(zk.get("enabled")),
+                _frozen(zk.get("watch_regions", [])),
+                _frozen(zk.get("watch_alliances", [])),
+                _frozen(zk.get("watch_systems", [])),
+                zk.get("min_kill_value_millions", 0),
+                zk.get("alert_window_seconds", 300))
+
+    @staticmethod
+    def _zkill_is_running(monitor):
+        """True when ``monitor``'s poll thread is alive (a kept monitor needs
+        no start(), and its replay cutoffs must not move)."""
+        thread = getattr(monitor, "_thread", None)
+        return thread is not None and thread.is_alive()
+
+    @staticmethod
+    def _zkill_keepable(monitor, config, built_sig):
+        """Settings->Save's keep decision: True only for a RUNNING monitor
+        whose build signature equals the one ``config`` (the dict about to be
+        saved) describes. Anything else rebuilds exactly as before."""
+        return bool(monitor is not None
+                    and FCToolGUI._zkill_is_running(monitor)
+                    and built_sig is not None
+                    and FCToolGUI._zkill_signature(config) == built_sig)
+
     def _build_range_monitor(self, logs_path, channel):
         """Build (and hook up) the range check's own fleet tail.
 
@@ -33273,13 +33332,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         )
         self._range_monitor.on_message(self._range_check_observe)
 
-    def _setup_modules(self):
+    def _setup_modules(self, keep_zkill=False):
         # Fleet Management
         xup_cfg = self.config.get("xup", {})
         # Read BEFORE the counter is replaced: a tied target with no aggregate
         # to re-tie to carries across a Settings->Save (see below).
         prev_xup_threshold = getattr(
             getattr(self, "xup_counter", None), "threshold", None)
+        # ...and its live roster: a Save pressed during a form-up must not
+        # throw the x-ups away (the chat tail resumes past them, so they would
+        # never be re-read). None on the startup pass.
+        prev_xup_state = getattr(
+            getattr(self, "xup_counter", None), "state", None)
         self.xup_counter = XUpCounter(
             trigger_word=xup_cfg.get("trigger_word", "x"),
             fire_word=xup_cfg.get("fire_word", "FIRE"),
@@ -33289,13 +33353,21 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             on_fire=self._on_xup_fire,
             on_update=self._on_xup_update,
         )
+        if isinstance(prev_xup_state, XUpState):
+            # Carry the roster, then re-judge READY against the threshold the
+            # new counter was BUILT with, before the re-tie below (which only
+            # recomputes when the threshold moves). A READY flip caused by the
+            # carry fires no on_ready sound: no x-up arrived.
+            self.xup_counter.state = prev_xup_state
+            prev_xup_state.is_ready = (
+                prev_xup_state.count >= self.xup_counter.threshold)
         # A Settings->Save rebuilds the counter at the MANUAL threshold; while
         # "= DPS" is ticked, re-tie it to the last aggregate straight away.
         self._xup_retie_rebuilt_counter(prev_xup_threshold)
 
         # Chat Monitor
         logs_path = self.config.get("eve_logs_path", "")
-        # This also runs on every Settings->Save, which REPLACES the monitor:
+        # This also runs on every Settings->Save, which may REPLACE the monitor:
         # flush the outgoing one's tail positions first (the per-pass flush is
         # throttled), or its successor re-tails what it already delivered.
         # Guarded — there is no monitor yet on the __init__ pass.
@@ -33310,17 +33382,32 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         if logs_path and os.path.isdir(logs_path):
             channel = xup_cfg.get("channel_name", "Fleet")
             tracked_char = self.config.get("tracked_character", "") or None
-            self.chat_monitor = ChatMonitor(
-                logs_path=logs_path,
-                poll_interval=self.config.get("poll_interval_seconds", 1.0),
-                channel_filter=channel,
-                listener_filter=tracked_char,
-            )
-            self.chat_monitor.on_message(self._on_chat_message)
-            # The range check's own listener-agnostic tail beside it -- see
-            # _build_range_monitor for why it is a second monitor and why its
-            # kwargs are what they are.
-            self._build_range_monitor(logs_path, channel)
+            # A Settings->Save that changed none of the tails' inputs keeps
+            # BOTH live monitors: a fresh ChatMonitor re-globs the folder and
+            # re-reads the header of every candidate log (seconds of work).
+            # Not while a poll thread outlived its join (a wedged pass): it may
+            # still be inside these objects, so build new ones as before.
+            tail_sig = FCToolGUI._chat_tail_signature(
+                self.config, logs_path, channel, tracked_char)
+            poller = getattr(self, "_chat_thread", None)
+            keep_tails = (
+                tail_sig == getattr(self, "_chat_tail_sig", None)
+                and getattr(self, "chat_monitor", None) is not None
+                and getattr(self, "_range_monitor", None) is not None
+                and not (poller is not None and poller.is_alive()))
+            if not keep_tails:
+                self.chat_monitor = ChatMonitor(
+                    logs_path=logs_path,
+                    poll_interval=self.config.get("poll_interval_seconds", 1.0),
+                    channel_filter=channel,
+                    listener_filter=tracked_char,
+                )
+                self.chat_monitor.on_message(self._on_chat_message)
+                # The range check's own listener-agnostic tail beside it --
+                # see _build_range_monitor for why it is a second monitor and
+                # why its kwargs are what they are.
+                self._build_range_monitor(logs_path, channel)
+                self._chat_tail_sig = tail_sig
             # This method also runs on every Settings->Save, so charge the
             # one-shot backfill budget only when the log universe actually
             # changed — see _links_backfill_key in __init__.
@@ -33333,6 +33420,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         else:
             self.chat_monitor = None
             self._range_monitor = None
+            self._chat_tail_sig = None
             # No readable logs path: a budget charged by the PREVIOUS config
             # must not outlive it, or the poller reads a log the settings in
             # force say nothing about.
@@ -33351,11 +33439,30 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # PICKED while a different one was actually in force.
         if hasattr(self, "_loss_source_var"):
             self._loss_source_var.set(self._loss_reconciler.source)
-        if zk_cfg.get("enabled"):
+        # keep_zkill: _save_settings found the zKill inputs unchanged and left
+        # the monitor running. Re-check against the RELOADED config; on a
+        # mismatch stop it here and build a new one exactly as before.
+        zk_sig = FCToolGUI._zkill_signature(self.config)
+        kept_zkill = getattr(self, "zkill_monitor", None) if keep_zkill else None
+        if kept_zkill is not None and (
+                not zk_cfg.get("enabled")
+                or zk_sig != getattr(self, "_zkill_sig", None)):
+            kept_zkill.stop()
+            kept_zkill = None
+        if zk_cfg.get("enabled") and kept_zkill is not None:
+            # The live monitor keeps its alert history and sequence position
+            # (a new one replays ~30 min and re-announces every fight in it);
+            # refresh the two inputs that do not live in its signature.
+            kept_zkill.set_friendly_ids(set(self._standings_cache.friendly_ids))
+            kept_zkill.on_killmail = self._killmail_hook()
+            self.zkill_monitor = kept_zkill
+            self._zkill_status.config(text="ZKILL: ON", fg=FG_GREEN)
+        elif zk_cfg.get("enabled"):
             # Monitor runs with watch_all=True and min_pilots=1 to capture
             # everything; GUI-only filters (All K-Space, min pilots, max jumps)
             # are applied at display time so they don't affect what the
             # monitor captures.
+            self._zkill_sig = zk_sig
             self.zkill_monitor = ZKillMonitor(
                 watch_regions=zk_cfg.get("watch_regions", []),
                 watch_alliances=zk_cfg.get("watch_alliances", []),
@@ -33374,6 +33481,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             self._zkill_status.config(text="ZKILL: ON", fg=FG_GREEN)
         else:
             self.zkill_monitor = None
+            self._zkill_sig = None
             self._zkill_status.config(text="ZKILL: OFF", fg=FG_DIM)
         # No monitor => no killmails at all. The ledger must SAY so, not render
         # an empty table that reads as "no losses".
@@ -33389,7 +33497,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
     # ── Monitoring ────────────────────────────────────────────────────────────
 
-    def _start_monitoring(self):
+    def _start_monitoring(self, keep_zkill=False):
         self._running = True
         if self.chat_monitor:
             # Restart-safe spawn (the ZKillMonitor.start / GamelogMonitor.start
@@ -33417,7 +33525,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     target=self._chat_poll_loop, args=(stop,),
                     name=CHAT_POLL_THREAD_NAME, daemon=True)
                 self._chat_thread.start()
-        if self.zkill_monitor:
+        if self.zkill_monitor and keep_zkill and FCToolGUI._zkill_is_running(
+                self.zkill_monitor):
+            # A Settings->Save kept the live monitor (unchanged zKill config):
+            # it replays nothing, so the replay cutoffs stay where its own
+            # start put them; moving them would drop kills that happened
+            # before the Save but reach zKill after it.
+            pass
+        elif self.zkill_monitor:
             # A starting monitor replays ~200 sequences (~30 min) of backlog, so
             # move both engines' replay cutoffs to NOW — that history is not
             # this session's fleet losses, and it must not ARM a phantom fight.
@@ -33425,7 +33540,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             self._battle_ledger.set_started_at()
             self.zkill_monitor.start()
 
-    def _stop_monitoring(self):
+    def _stop_monitoring(self, keep_zkill=False):
         self._running = False
         # Wake the chat poll thread out of its interval wait, then wait for it
         # to actually exit, so a caller can rely on at most one poller existing
@@ -33464,7 +33579,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             if callable(range_flush):
                 range_flush()
             range_monitor.stop()
-        if self.zkill_monitor:
+        # keep_zkill: only Settings->Save passes it, when the zKill config is
+        # unchanged (see _save_settings). Shutdown stops everything.
+        if self.zkill_monitor and not keep_zkill:
             self.zkill_monitor.stop()
         if hasattr(self, '_intel_monitor') and self._intel_monitor:
             # Deliberately NOT _intel_stop: this also runs on Settings->Save,
@@ -33497,6 +33614,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     monitor.poll()
             except Exception:
                 pass
+            # A successor generation already owns the tails (this thread
+            # outlived its join mid-poll): leave the range tail to it rather
+            # than poll it concurrently. _running covers the window between a
+            # Save's _setup_modules (a fresh range tail) and _start_monitoring
+            # (the successor's event). Identity, not stop.is_set(): one
+            # is_set() per pass is the loop's contract with its callers.
+            if not self._running or getattr(self, "_chat_stop", stop) is not stop:
+                break
             try:
                 # The range check's listener-agnostic twin, polled from this
                 # same thread so nothing new is spawned — and polled on EVERY
@@ -34595,7 +34720,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         except tk.TclError:
             pass
 
-    def _xup_apply_dps_tie(self, vm):
+    def _xup_apply_dps_tie(self, vm, alert=True):
         """Follow the fleet's DPS-ship count while tied. Tk thread only.
 
         ``vm.modeled`` is the fleet_stats rule-4 pilot count — the SAME number
@@ -34610,6 +34735,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         True, so without this the READY is silent for the rest of the round.
         True->False (the fleet grew) needs no alert.
 
+        ``alert=False`` (the re-tie of a counter _setup_modules just rebuilt)
+        moves the target silently: a Settings->Save during a READY tied
+        form-up re-judged READY against the MANUAL target first, so the
+        False->True seen here is the Save, not the fleet.
+
         Returns True when the vm carried a usable count (the target now equals
         it), False when the tie is off or there was no data to tie to."""
         if not self._xup_tie_enabled() or vm is None:
@@ -34622,7 +34752,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             return False
         counter = getattr(self, "xup_counter", None)
         was_ready = bool(counter is not None and counter.state.is_ready)
-        if (self._xup_set_threshold(n) and not was_ready
+        if (self._xup_set_threshold(n) and alert and not was_ready
                 and counter.state.is_ready
                 and getattr(self, "_xup_status", None) is not None):
             self._flash_ready(counter.state)
@@ -34639,7 +34769,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         value, spinner synced to it."""
         if not self._xup_tie_enabled():
             return
-        if self._xup_apply_dps_tie(getattr(self, "_fleet_stats_vm", None)):
+        if self._xup_apply_dps_tie(getattr(self, "_fleet_stats_vm", None),
+                                   alert=False):
             return
         carry = self._xup_manual_threshold()
         if prev_threshold is not None:
