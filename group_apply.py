@@ -249,6 +249,8 @@ _MSG_RESTORED = "Your previous settings were restored."
 _MSG_RESTORE_UNRECORDED = ("Your previous settings were restored, but that could not be "
                            "recorded yet - it will be finished at the next start.")
 _MSG_RESTORED_UNSAVED = "Your previous settings were restored, but that could not be recorded."
+_MSG_NO_COPY = ("A copy of your settings as they were before this restore could not be kept "
+                "in the backups folder.")
 _MSG_NO_BACKUP = "The backup to restore no longer exists; nothing was changed."
 _MSG_BAD_BACKUP = ("This backup is damaged or was made by another FCTool version; nothing "
                    "was changed.")
@@ -1675,6 +1677,10 @@ def _restore(app_dir, protocol, txn, side) -> dict:
 
     An import that changed no file - a tag alone - has no backup and is never restored.
 
+    Before any file goes back, today's versions of the backup's files are copied aside
+    (``group_state.copy_before_restore``, ``backups/before-restore-...``): the way back from
+    a restore of whole files. Best effort - a copy that fails adds a sentence to the message.
+
     A backup that is damaged (``_put_back``) is not restored in part: nothing is changed,
     and the report says so."""
     token = _token(protocol)
@@ -1689,6 +1695,14 @@ def _restore(app_dir, protocol, txn, side) -> dict:
     meta = _meta_dict(entry.get("bundle")) if entry is not None \
         and isinstance(entry.get("bundle"), dict) else _no_meta()
     txn["meta"] = meta
+    # A restore puts back WHOLE files: today's versions of them are copied first (once per
+    # staged restore - a repeated attempt keeps the first copy). A copy that cannot be made
+    # does not stop the restore the user asked for; the report says so.
+    try:
+        group_state.copy_before_restore(app_dir, name, token=token)
+        no_copy = ""
+    except Exception:
+        no_copy = " " + _MSG_NO_COPY
     outcome, missing, files = _put_back(app_dir, name)
     if outcome in ("gone", "damaged"):  # nothing was touched, and no later start can do it
         return _finish(app_dir, _report(
@@ -1699,7 +1713,7 @@ def _restore(app_dir, protocol, txn, side) -> dict:
                            "Your previous settings could not be restored completely",
                            outcome, missing, side=side)
     txn.update(committed=True, backup=name)
-    report = _report("restored", "restore", _MSG_RESTORED, meta=meta, backup=name)
+    report = _report("restored", "restore", _MSG_RESTORED + no_copy, meta=meta, backup=name)
 
     def change(side, _kept):
         config_back = _CONFIG_FILE in files
@@ -1727,10 +1741,10 @@ def _restore(app_dir, protocol, txn, side) -> dict:
     tried = protocol.get("restore_attempts")
     tried = tried + 1 if type(tried) is int and tried >= 0 else 1
     if tried >= RESTORE_ATTEMPTS:
-        report["message"] = _MSG_RESTORED_UNSAVED
+        report["message"] = _MSG_RESTORED_UNSAVED + no_copy
         return _clean_up(app_dir, report)
     _quiet(group_state.update_applying, app_dir, dict(protocol, restore_attempts=tried))
-    report["message"] = _MSG_RESTORE_UNRECORDED
+    report["message"] = _MSG_RESTORE_UNRECORDED + no_copy
     return report
 
 

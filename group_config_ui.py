@@ -1418,8 +1418,11 @@ MSG_DISCARD = ("Going back to a copy of your settings discards the values you ed
 MSG_DISCARD_CLOSE = "Close the window and discard what you edited for this group file?"
 MSG_REPLACE = ("{what} is already waiting for the next start of FCTool.\n\n"
                "Replace it with this one?")
-MSG_RESTORE = ("Put back the settings from before the import of {when}?\n\nEvery change made "
-               "to those settings since then is lost. FCTool restarts to do it.")
+MSG_RESTORE = ("Put back the settings from before the import of {when}?\n\nThe files that "
+               "import changed go back whole: every setting in them returns to that day, not "
+               "only the ones the group file set, and every change made to them since then "
+               "is lost. A copy of them as they are today is kept in the backups folder "
+               "in FCTool's folder (before-restore-...). FCTool restarts to do it.")
 MSG_NAMES = ("The file would contain: {names}.\n\nThose are your own character names. Go "
              "back and take them out of the text they stand in (a MOTD, the name of a "
              "template, a tag), or save the file as it is.")
