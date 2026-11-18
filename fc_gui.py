@@ -38598,11 +38598,23 @@ $bmp.Dispose()
         """Clear the Text and re-render every buffered entry that passes the
         current view filter. The deque is never mutated -- no data is lost.
 
-        INTEL-6 (3): each re-rendered line gets the standing colours of the
-        names the resolver ALREADY has cached, scoped to that line's range.
-        Cache only (no request, no network), and never a negative-cache entry:
-        the live path never delivers those, and applying one would dim a name
-        that renders untagged today."""
+        INTEL-6 (3): the LAST ``INTEL_RESOLVE_TAIL_LINES`` re-rendered lines
+        get the standing colours of the names the resolver ALREADY has cached,
+        each scoped to its own line's range, once every line is written (older
+        lines stay uncoloured, as before). Colouring all of them measured ~2x
+        the re-render on a mapped widget: every later line's yview / see slows
+        under thousands of new tags. Cache only (no request, no network), and
+        never a negative-cache entry (``standing == "unknown"`` / no character
+        id): a re-render must not dim a name the live path would leave
+        untagged."""
+        # This re-render supersedes a pending debounced Find re-render.
+        try:
+            pending = getattr(self, "_intel_find_after_id", None)
+            if pending is not None:
+                self._intel_find_after_id = None
+                self.root.after_cancel(pending)
+        except Exception:
+            pass
         log = self._intel_log
         log.config(state=tk.NORMAL)
         log.delete("1.0", tk.END)
@@ -38611,24 +38623,41 @@ $bmp.Dispose()
         self._intel_sweep_dynamic_tags(log)
         log.config(state=tk.DISABLED)
         resolver = getattr(self, "_intel_resolver", None)
+        # (msg, start mark, end mark) of the newest rendered lines. The ranges
+        # ride left-gravity Text MARKS because a later line's trim can
+        # renumber them; the mark names cycle, so an evicted entry's slot is
+        # simply re-set by the entry that evicted it.
+        tail = collections.deque(maxlen=INTEL_RESOLVE_TAIL_LINES)
+        seq = 0
         for entry in list(self._intel_buffer):
             msg = entry[0]
             if self._passes_view_filter(msg):
-                rendered_range = self._render_line(entry)
-                if resolver is None:
-                    continue
-                try:
-                    cached = {}
-                    for name in intel_stream.candidate_names(msg.message):
-                        res = resolver.lookup_cached(name)
-                        if (res is None or res.character_id is None
-                                or res.standing == "unknown"):
-                            continue
-                        cached[name] = res
-                    if cached:
-                        self._intel_apply_resolutions(cached, rendered_range)
-                except Exception:
-                    pass
+                start, end = self._render_line(entry)
+                if resolver is not None:
+                    slot = seq % INTEL_RESOLVE_TAIL_LINES
+                    seq += 1
+                    s_mark, e_mark = f"intel_rr_s{slot}", f"intel_rr_e{slot}"
+                    log.mark_set(s_mark, start)
+                    log.mark_gravity(s_mark, "left")
+                    log.mark_set(e_mark, end)
+                    log.mark_gravity(e_mark, "left")
+                    tail.append((msg, s_mark, e_mark))
+        for msg, s_mark, e_mark in tail:
+            try:
+                cached = {}
+                for name in intel_stream.candidate_names(msg.message):
+                    res = resolver.lookup_cached(name)
+                    if (res is None or res.character_id is None
+                            or res.standing == "unknown"):
+                        continue
+                    cached[name] = res
+                if cached:
+                    self._intel_apply_resolutions(
+                        cached, (log.index(s_mark), log.index(e_mark)))
+            except Exception:
+                pass
+        for _msg, s_mark, e_mark in tail:
+            log.mark_unset(s_mark, e_mark)
         self._intel_new_count = 0
         self._intel_update_new_button()
 
@@ -41294,6 +41323,14 @@ $bmp.Dispose()
             if poll_id is not None:
                 self.root.after_cancel(poll_id)
                 self._fleet_refresh_after_id = None
+        except Exception:
+            pass
+        # And the debounced intel Find re-render, if a keystroke armed one.
+        try:
+            find_id = getattr(self, "_intel_find_after_id", None)
+            if find_id is not None:
+                self.root.after_cancel(find_id)
+                self._intel_find_after_id = None
         except Exception:
             pass
         self.root.destroy()
