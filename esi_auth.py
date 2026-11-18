@@ -326,6 +326,18 @@ class ESIAuth:
         self._refresh_failed_at = None
         self._refresh_backoff = 0.0
 
+    def adopt_tokens(self, other: "ESIAuth") -> None:
+        """Take over a fresh login's tokens (re-authorizing a character that is
+        already in the account list). Runs under this account's refresh lock,
+        so an in-flight refresh of the OLD token finishes first and cannot
+        wipe the fresh one afterwards; the refresh backoff is cleared."""
+        with self._refresh_lock:
+            self._refresh_token = other._refresh_token
+            self._access_token = other._access_token
+            self._expires_at = other._expires_at
+            self._last_scopes = getattr(other, "_last_scopes", None)
+            self._clear_refresh_backoff()
+
     # ── PKCE Helpers ──────────────────────────────────────────────────────────
 
     @staticmethod
@@ -684,13 +696,17 @@ class ESIAuth:
         With no token in memory (a failed refresh dropped it) an account that
         still holds its refresh token answers from the set cached at the last
         decode, so this does no network I/O then; only with no cached set does
-        it fall back to the lazy access_token read, which posts nothing while
-        the refresh backoff is open."""
+        it fall back to the lazy access_token read. That read is skipped
+        entirely once a refresh has failed (until a success clears the stamp),
+        even past the backoff window: scope checks run on the Tk thread and
+        must not wait on a 15 s SSO POST."""
         token = getattr(self, "_access_token", None)
         if not token:
             cached = getattr(self, "_last_scopes", None)
             if cached is not None and getattr(self, "_refresh_token", None):
                 return set(cached)
+            if getattr(self, "_refresh_failed_at", None) is not None:
+                return set()
             # Lazily obtain a valid access token (may refresh) so a freshly
             # loaded account still reports its scopes. Never raises.
             try:
