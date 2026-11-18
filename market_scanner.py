@@ -55,6 +55,7 @@ Tk thread via the app's ``after()`` marshalling.
 from __future__ import annotations
 
 import concurrent.futures
+import math
 import os
 import statistics
 import threading
@@ -134,6 +135,73 @@ _ITEM_FLUSH_EVERY = 25
 # contracts so the tight in-memory filter loop stays cheap on a huge region
 # contract book (a busy trade hub region can list thousands of contracts).
 _FILTER_PROGRESS_STRIDE = 25
+
+# Pass-1 VOLUME pre-filter: ship groupID -> a LOWER BOUND (m3) on the PACKAGED
+# volume of every hull in that group. A contract can only match a fit if it
+# carries the fit's hull, so its ESI summary ``volume`` (m3 of its items) is at
+# least that hull's packaged volume (an assembled hull is larger still); a
+# contract below the smallest floor across the scan's fits is dropped before the
+# location resolve and the item fetch. Every value here MUST stay <= the true
+# packaged volume of every hull in the group: too low only filters less, too
+# HIGH silently drops real matches. Values = 80% of the minimum
+# ``min(packagedVolume, volume)`` in the local SDE (build 3494416,
+# tools/_cache/sde.zip) over every hull the bundled fit_types.json lists in the
+# group (the table's keys are exactly its category-6 groups). Only a bundled
+# hull can resolve a group offline, so only those hulls bind. Hulls added after
+# that SDE build (Herald 893, Penitence 906, the Navy-Issue attack
+# battlecruisers + Akoman 1201) were not in it and are assumed to follow their
+# group's packaging size. A group missing from this table disables the filter
+# for the whole scan (fail open) - see ``_contract_volume_floor``.
+_HULL_GROUP_MIN_PACKAGED_M3: dict[int, float] = {
+    25: 2_000,          # Frigate                      (SDE min 2,500)
+    26: 8_000,          # Cruiser                      (10,000)
+    27: 40_000,         # Battleship                   (50,000)
+    28: 16_000,         # Hauler                       (20,000)
+    29: 400,            # Capsule                      (500)
+    30: 8_000_000,      # Titan                        (10,000,000)
+    31: 400,            # Shuttle                      (500)
+    237: 2_000,         # Corvette                     (2,500)
+    324: 2_000,         # Assault Frigate              (2,500)
+    358: 8_000,         # Heavy Assault Cruiser        (10,000)
+    380: 16_000,        # Deep Space Transport         (20,000)
+    419: 12_000,        # Combat Battlecruiser         (15,000)
+    420: 4_000,         # Destroyer                    (5,000)
+    463: 3_000,         # Mining Barge                 (3,750)
+    485: 1_000_000,     # Dreadnought                  (1,300,000)
+    513: 1_000_000,     # Freighter                    (1,300,000)
+    540: 12_000,        # Command Ship                 (15,000)
+    541: 4_000,         # Interdictor                  (5,000)
+    543: 3_000,         # Exhumer                      (3,750)
+    547: 1_000_000,     # Carrier                      (1,300,000)
+    659: 1_000_000,     # Supercarrier                 (1,300,000)
+    830: 2_000,         # Covert Ops                   (2,500)
+    831: 2_000,         # Interceptor                  (2,500)
+    832: 8_000,         # Logistics                    (10,000)
+    833: 8_000,         # Force Recon Ship             (10,000)
+    834: 2_000,         # Stealth Bomber               (2,500)
+    883: 1_000_000,     # Capital Industrial Ship      (1,300,000)
+    893: 2_000,         # Electronic Attack Ship       (2,500)
+    894: 8_000,         # Heavy Interdiction Cruiser   (10,000)
+    898: 40_000,        # Black Ops                    (50,000)
+    900: 40_000,        # Marauder                     (50,000)
+    902: 1_000_000,     # Jump Freighter               (1,300,000)
+    906: 8_000,         # Combat Recon Ship            (10,000)
+    941: 40_000,        # Industrial Command Ship      (50,000; Orca 500,000)
+    963: 4_000,         # Strategic Cruiser            (5,000 - not 10,000)
+    1022: 400,          # Prototype Exploration Ship   (500)
+    1201: 12_000,       # Attack Battlecruiser         (15,000)
+    1202: 16_000,       # Blockade Runner              (20,000)
+    1283: 2_000,        # Expedition Frigate           (2,500)
+    1305: 4_000,        # Tactical Destroyer           (5,000)
+    1527: 2_000,        # Logistics Frigate            (2,500)
+    1534: 4_000,        # Command Destroyer            (5,000)
+    1538: 1_000_000,    # Force Auxiliary              (1,300,000)
+    1972: 8_000,        # Flag Cruiser                 (10,000)
+    4594: 1_000_000,    # Lancer Dreadnought           (1,300,000)
+    4902: 40_000,       # Expedition Command Ship      (50,000)
+    5087: 8_000,        # Special Edition Yachts       (10,000)
+    5120: 1_000_000,    # Command Carrier              (1,300,000)
+}
 
 # The contract-similarity threshold (design §5): a contract matches a doctrine
 # fit iff same hull AND similarity >= this.
@@ -1070,7 +1138,14 @@ class MarketScanner:
         contract that a cheap filter would drop:
 
         * **Pass 1 — cheap pre-filters only, zero item fetches.** Drop non
-          ``item_exchange`` types and missing ids, then (when a ``system_id``
+          ``item_exchange`` types, missing ids and non-outstanding (corp history)
+          rows; then drop every contract whose summary ``volume`` (m3) is below
+          the hull-size floor - the smallest ``_HULL_GROUP_MIN_PACKAGED_M3``
+          packaged-volume lower bound across the fits' hull groups, since a match
+          must carry its fit's hull. The floor is looked up OFFLINE and fails
+          open: any fit with an unknown hull group disables it for the scan, and
+          a contract with a missing / garbage / non-positive ``volume`` is kept.
+          Then (when a ``system_id``
           filter is active) resolve each survivor's ``start_location_id`` → system
           via the *cached* resolver and drop out-of-staging contracts. Location
           resolves are memoised per ``location_id``, so the hundreds of contracts
@@ -1138,6 +1213,8 @@ class MarketScanner:
 
         # Pre-compute each fit's scored BoM (hull gate + module multiset) once.
         fit_specs = [(f, _contract_scoring_spec(f, self._catalog)) for f in fits]
+        # Pass-1 volume floor (None = filter disabled; see _contract_volume_floor).
+        volume_floor = _contract_volume_floor(fits, self._catalog)
 
         try:
             public = self._contract_list(self._adapter.public_contracts, region_id, progress) or []
@@ -1163,6 +1240,7 @@ class MarketScanner:
         n_listed = len(contract_source)
         n_item_exchange = 0
         n_status_dropped = 0
+        n_volume_dropped = 0
 
         # Hold the cache in memory for the whole pass (one disk read up front) and
         # flush it back periodically + at the end (see the finally). This kills the
@@ -1197,6 +1275,17 @@ class MarketScanner:
                 if status is not None and str(status) != "outstanding":
                     n_status_dropped += 1
                     continue
+
+                # -- Volume guard (hull-size floor). ----------------------------
+                # A match must carry the fit's hull, so the contract's summary
+                # ``volume`` is at least that hull's packaged volume. Below the
+                # smallest floor across the fits -> it cannot match any of them.
+                # An unusable volume (missing / garbage / <= 0) is KEPT.
+                if volume_floor is not None:
+                    vol = _contract_volume(contract)
+                    if vol is not None and vol < volume_floor:
+                        n_volume_dropped += 1
+                        continue
 
                 loc_id = int(contract.get("start_location_id", 0) or 0)
                 # Only resolve the contract's system when it is actually needed: a
@@ -1371,10 +1460,11 @@ class MarketScanner:
         )
         log.info(
             "[market] contract scan: region=%s listed=%d (corp=%d) item_exchange=%d "
-            "status_dropped=%d outstanding=%d fetched=%d (live=%d cache=%d) "
-            "matches=%d elapsed=%.1fs",
+            "status_dropped=%d outstanding=%d volume_dropped=%d (floor=%s) "
+            "fetched=%d (live=%d cache=%d) matches=%d elapsed=%.1fs",
             region_id, n_listed, n_corp, n_item_exchange, n_status_dropped,
-            n_item_exchange - n_status_dropped, scanned,
+            n_item_exchange - n_status_dropped, n_volume_dropped,
+            "off" if volume_floor is None else "%.0f" % volume_floor, scanned,
             scanned - from_cache, from_cache, total_matches, time.monotonic() - t0,
         )
 
@@ -2088,6 +2178,48 @@ def _contract_scoring_spec(fit, catalog) -> _ScoringSpec:
     return _ScoringSpec(
         hull_type_id=fit.hull_type_id, module_multiset=multiset, total_units=total
     )
+
+
+def _contract_volume_floor(fits, catalog) -> "float | None":
+    """The Pass-1 volume floor (m3) for a contract scan over ``fits``: the
+    SMALLEST ``_HULL_GROUP_MIN_PACKAGED_M3`` floor across every fit's hull group,
+    or ``None`` = filter disabled.
+
+    Fail open: no fits, no catalog, a catalog that cannot answer a group, or ANY
+    fit whose hull group is unknown / absent from the table disables the filter
+    for the whole scan. The group is asked OFFLINE only
+    (``group_of(..., offline=True)`` - bundled table + disk cache, never ESI); a
+    catalog whose ``group_of`` does not take that flag raises ``TypeError`` and
+    therefore also disables the filter rather than risk a network lookup."""
+    if catalog is None or not fits:
+        return None
+    group_of = getattr(catalog, "group_of", None)
+    if not callable(group_of):
+        return None
+    floor = None
+    for fit in fits:
+        try:
+            gid = group_of(fit.hull_type_id, offline=True)
+        except Exception:
+            return None
+        value = _HULL_GROUP_MIN_PACKAGED_M3.get(gid) if isinstance(gid, int) else None
+        if value is None:
+            return None
+        floor = value if floor is None else min(floor, value)
+    return float(floor) if floor is not None else None
+
+
+def _contract_volume(contract: dict) -> "float | None":
+    """A contract summary row's ``volume`` (m3) when it is a usable positive,
+    finite number; ``None`` (= keep the contract) for a missing, non-numeric
+    (strings and bools included), zero, negative or NaN value."""
+    v = contract.get("volume")
+    if isinstance(v, bool) or not isinstance(v, (int, float)):
+        return None
+    v = float(v)
+    if not math.isfinite(v) or v <= 0:
+        return None
+    return v
 
 
 def _included_for_match(items: list[dict], catalog) -> "dict[int, int]":
