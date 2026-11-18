@@ -11392,8 +11392,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         cyno_check_data: dict = {}
 
+        assets_complete = False
         try:
-            assets = acct.get_assets()
+            assets, assets_complete = acct.get_assets(with_status=True)
 
             # Filter: assembled ships in personal hangars only
             _PERSONAL_FLAGS = {"Hangar", "AutoFit"}
@@ -11444,6 +11445,29 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 }
         except Exception as e:
             print(f"[Characters] Asset fetch error for {acct.character_name}: {e}")
+            assets_complete = False
+
+        # A failed or truncated pull reads as "owns nothing": keep the last good
+        # capital lists and do NOT restamp the cache, so the next fetch retries
+        # and the empty result is never persisted. With no prior entry there is
+        # nothing better to show, so today's behaviour stands.
+        if not assets_complete and cached:
+            prior = cached[2]
+            for k in ("fax", "dreads", "blops", "titans"):
+                info[k] = list(prior.get(k, []))
+            if prior.get("ship_type_id") == info["ship_type_id"] \
+                    and "dictor" in prior:
+                info["dictor"] = prior["dictor"]
+            # Cyno state is per HULL (item), not per type: restore it only from
+            # the check recorded for the ship flown now, as the cache-hit path does.
+            if cyno_hull:
+                ship_check = (prior.get("cyno_check") or {}).get(
+                    str(info["ship_item_id"]))
+                if ship_check and "gen" in ship_check:
+                    _ozone_fill_cyno(info, ship_check.get("gen"),
+                                     ship_check.get("ozone", 0), ozone_cfg)
+            self._inject_piloted_capital(info)
+            return info
 
         # Deduplicate: group identical (ship, location) entries with counts
         from collections import Counter
@@ -36475,12 +36499,15 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             err = None
             try:
                 from zkill_monitor import resolve_name
-                members = auth.get_fleet_members(fleet_id=fleet_id) or []
+                members = auth.get_fleet_members(fleet_id=fleet_id)
+                if not isinstance(members, list):
+                    raise RuntimeError("the fleet roster did not load")
+                import kick_pods
+                own = getattr(auth, "character_id", None)
                 for m in members:
-                    if m.get("ship_type_id") in ship_classes.CAPSULE_TYPE_IDS:
-                        cid = m.get("character_id")
-                        if cid:
-                            pods.append((cid, resolve_name(cid, "character") or str(cid)))
+                    cid = m.get("character_id")
+                    if cid in kick_pods.pod_ids([m], ship_classes.CAPSULE_TYPE_IDS, own):
+                        pods.append((cid, resolve_name(cid, "character") or str(cid)))
             except Exception as e:
                 err = str(e)
             self._post_ui(_confirm, pods, err)
@@ -36509,18 +36536,38 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         def _do_kick(pods):
             def worker():
-                kicked = failed = 0
-                for cid, _name in pods:
-                    if auth.esi_delete(f"/fleets/{fleet_id}/members/{cid}/"):
-                        kicked += 1
-                    else:
-                        failed += 1
-                self._post_ui(_done, kicked, failed)
+                try:
+                    import kick_pods
+                    res = kick_pods.kick_confirmed(
+                        auth, fleet_id, [c for c, _n in pods],
+                        ship_classes.CAPSULE_TYPE_IDS,
+                        getattr(auth, "character_id", None))
+                except Exception:
+                    log.exception("Kick Pods: the kick run failed")
+                    res = None
+                self._post_ui(_done, *(res or (0, 0, 0, None)))
             threading.Thread(target=worker, daemon=True).start()
 
-        def _done(kicked, failed):
+        def _done(kicked, failed, skipped=0, reread_ok=True):
+            if reread_ok is None:
+                self._themed_modal(
+                    "Kick Pods",
+                    "The kick run failed; some pilots may already have been "
+                    "kicked. See fctool.log.",
+                    buttons=[("OK", "Dark.TButton", None)], accent=FG_RED)
+                return
+            if not reread_ok:
+                self._themed_modal(
+                    "Kick Pods",
+                    "Could not re-read the fleet members, so nobody was kicked.",
+                    buttons=[("OK", "Dark.TButton", None)], accent=FG_RED)
+                return
             msg = f"Kicked {kicked} pod(s) from the fleet."
             accent = FG_GREEN
+            if skipped:
+                msg += (f"\n{skipped} not kicked (no longer in a pod, left the "
+                        "fleet, or the run stopped after repeated failures).")
+                accent = FG_YELLOW
             if failed:
                 msg += (f"\n{failed} could not be kicked (they may have left, "
                         "swapped ship, or you lost the boss role).")
