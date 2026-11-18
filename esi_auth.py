@@ -1196,6 +1196,28 @@ class ESIAuth:
             return None
         return self.esi_get(f"/fleets/{fleet_id}/members/")
 
+    def get_fleet_members_ex(self, fleet_id=None) -> tuple:
+        """Like get_fleet_members but tells a definite answer from "could not
+        ask".
+
+        Returns (members, 200) on a roster list, (None, 403) when ESI refuses
+        (not the fleet boss), (None, 404) when the fleet is gone, and
+        (None, status) otherwise (status 0 = no token / no fleet id / the
+        request raised / a 200 whose body was not a list). With no fleet_id
+        the id is resolved through get_fleet_info_ex first, and its status is
+        returned when that fails."""
+        if fleet_id is None:
+            info, status = self.get_fleet_info_ex()
+            if info is None:
+                return None, status
+            fleet_id = info["fleet_id"]
+        if not fleet_id:
+            return None, 0
+        data, status, _hdrs = self.esi_get_ex(f"/fleets/{fleet_id}/members/")
+        if status == 200 and isinstance(data, list):
+            return data, 200
+        return None, (status if status != 200 else 0)
+
     def get_fleet_member_locations(self, members=None) -> dict[str, tuple[str, str, str]]:
         """Get a map of character_name -> (system_name, region_name, ship_name).
         Accepts optional pre-fetched members list to avoid duplicate ESI calls."""

@@ -971,10 +971,12 @@ FLEET_POLL_MISS = "miss"           # no usable answer -> grace counter / clear
 def classify_fleet_poll(info, polled_is_boss, members) -> str:
     """Decide what one ``_refresh_fleet_locations`` poll result means. Pure.
 
-    The load-bearing case is the third one. ``ESIAuth.esi_get`` flattens EVERY
-    failure to ``None`` -- 404 "fleet does not exist", 403, 5xx, a network
-    error, even a missing token -- so a caller cannot tell a disbanded fleet
-    from a transient blip by return shape. That matters because
+    The load-bearing case is the third one. The poll reads the status-keeping
+    ``_ex`` routes and filters out transient failures (0 / 420 / 429 / 5xx;
+    see ``fleet_poll_is_transient``) BEFORE calling this, so ``info`` /
+    ``members`` arrive here as definite answers -- except when an unbroken
+    transient run outlived ``FLEET_TRANSIENT_MAX_S``, which is then fed in as
+    a miss on purpose. That matters because
     ``/characters/{id}/fleet/`` is cached (and is famously stale after a
     disband) while ``/fleets/{id}/members/`` 404s the instant the fleet is
     gone: "I am the boss, and the boss-only roster route answered nothing" is
@@ -984,10 +986,10 @@ def classify_fleet_poll(info, polled_is_boss, members) -> str:
     kept the last roster -- so for as long as ESI kept serving the stale
     fleet_id, the Fleet tab and the HUD tile showed a fleet that no longer
     existed (owner-reported 2026-08-03). It is a MISS instead: the grace
-    counter absorbs a transient failure, and a fleet that really is gone
-    clears once the grace expires.
+    counter absorbs flicker, and a fleet that really is gone clears once the
+    grace expires.
 
-    ``members`` is the raw ``get_fleet_members`` answer: a non-empty list, or
+    ``members`` is the ``get_fleet_members_ex`` body: a non-empty list, or
     None/[] for "nothing came back". An empty list is a miss too -- a live
     fleet always contains its boss.
     """
@@ -1001,6 +1003,32 @@ def classify_fleet_poll(info, polled_is_boss, members) -> str:
         # the not-boss branch hands it to _process_nonboss_losses.
         return FLEET_POLL_NOT_BOSS
     return FLEET_POLL_MISS
+
+
+# An unbroken run of "could not ask" fleet polls this old counts as a miss:
+# status 0 is also "no token", so a revoked token must not keep a dead fleet
+# on screen forever.
+FLEET_TRANSIENT_MAX_S = 600.0
+
+
+def fleet_poll_is_transient(status, *, members=False) -> bool:
+    """True when an ESI status on the fleet poll means "could not ask". Pure.
+
+    Definite answers: 200, and 404 ("not in a fleet" on the character route,
+    "fleet gone" on the members route). On the boss-only members route a 403
+    is definite too (we are not the boss). Everything else -- 0 (no token /
+    raised), 403 on the CHARACTER route, 420, 429, 5xx, an uncached 304 -- is
+    transient and must not count toward the no-fleet grace."""
+    if status in (200, 404):
+        return False
+    return not (members and status == 403)
+
+
+def fleet_transient_run_expired(since, now,
+                                limit=FLEET_TRANSIENT_MAX_S) -> bool:
+    """True once a transient run that began at monotonic ``since`` has lasted
+    ``limit`` seconds. No run (``since`` None) never expires. Pure."""
+    return since is not None and now - since >= limit
 
 
 def _resolve_reinforced_id_pairs(store, entries=None):
@@ -8486,6 +8514,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # quietly replaces this 100 ms one and the click buys a minute of
         # stale data instead of a fresh poll.
         self._no_fleet_misses = 0
+        self._fleet_transient_since = None   # the old primary's failed asks
         self._fleet_refresh_asap = True
         self._arm_fleet_refresh(100)
 
@@ -8579,6 +8608,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # esi_auth is now (another account, or None).
             self._own_location_sid = None
             self._own_location_mono = 0.0
+            # Fleet poll state belongs to the departing primary -- reset it as
+            # _esi_set_primary does.
+            self._no_fleet_misses = 0
+            self._fleet_transient_since = None
             # Persist the new primary choice
             if self.esi_auth and self.esi_auth.character_id:
                 self.config["primary_character_id"] = self.esi_auth.character_id
@@ -35522,7 +35555,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         The poll is a self-rescheduling ``after`` chain armed from every arm
         site: startup, its own re-arms (30s not-auth / 15s in-flight / 60s
-        not-boss / 60s miss / 15s normal / 15s spawn-failure), and
+        not-boss / 60s miss / 60s transient ESI failure / 15s normal / 15s
+        spawn-failure), and
         ``_esi_set_primary``'s "poll again now, with the new primary" nudge.
         None of them stored an id and nothing ever cancelled, so every Set
         Primary click left the live chain running and started another one
@@ -35572,6 +35606,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # this 30s arm to 100 ms for as long as the user stays that way —
             # a 10 Hz spin with nothing to poll.
             self._fleet_refresh_asap = False
+            # No ESI = no fleet answer: drop the poll's cached fleet id / boss
+            # flag (the MOTD Set button and the HUD relevance gate read them).
+            # A revoked token never reaches the transient bound in do_fetch,
+            # so without this a dead fleet would be held forever.
+            self._last_polled_fleet_id = None
+            self._last_polled_fleet_is_boss = False
+            self._fleet_transient_since = None
             self._arm_fleet_refresh(30000)
             return
 
@@ -35597,22 +35638,52 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         def do_fetch():
             try:
-                info = self.esi_auth.get_fleet_info()
+                # The _ex routes keep the HTTP status: only a 404 is "not in a
+                # fleet". 0 / 420 / 429 / 5xx / a character-route 403 mean "could
+                # not ask" and must not feed the no-fleet grace below.
+                info, info_status = self.esi_auth.get_fleet_info_ex()
+                transient = None            # (route, status) of a failed ask
+                if fleet_poll_is_transient(info_status):
+                    transient, info = ("fleet", info_status), None
                 fleet_id = info["fleet_id"] if info else None
                 # Only the fleet boss may read /fleets/{id}/members/ (others get
                 # a guaranteed 403); non-boss falls into the existing back-off.
                 polled_is_boss = bool(
                     info and self.esi_auth.is_boss(
                         info, self.esi_auth.character_id))
-                # Cache the primary character's fleet/boss state so the MOTD tab
-                # can give instant Set-button feedback without re-querying ESI
-                # (see _motd_refresh_fleet_status).
-                self._last_polled_fleet_id = fleet_id if info else None
-                self._last_polled_fleet_is_boss = polled_is_boss
-                if polled_is_boss:
-                    members = self.esi_auth.get_fleet_members(fleet_id=fleet_id)
+                members = None
+                if transient is None:
+                    # Cache the primary character's fleet/boss state so the MOTD
+                    # tab can give instant Set-button feedback without
+                    # re-querying ESI (see _motd_refresh_fleet_status). Only an
+                    # ANSWER is cached: a blip must not drop the Set button or
+                    # the HUD relevance gate.
+                    self._last_polled_fleet_id = fleet_id if info else None
+                    self._last_polled_fleet_is_boss = polled_is_boss
+                    if polled_is_boss:
+                        members, m_status = self.esi_auth.get_fleet_members_ex(
+                            fleet_id=fleet_id)
+                        if fleet_poll_is_transient(m_status, members=True):
+                            transient, members = ("members", m_status), None
+                if transient is not None:
+                    # Bounded: the run's start is kept until a definite answer,
+                    # so once it is FLEET_TRANSIENT_MAX_S old every further
+                    # failed poll counts as a miss (status 0 = no token too).
+                    now = time.monotonic()
+                    since = getattr(self, "_fleet_transient_since", None)
+                    if since is None:
+                        self._fleet_transient_since = since = now
+                    if not fleet_transient_run_expired(since, now):
+                        print(f"[Fleet] ESI {transient[0]} poll answered "
+                              f"{transient[1]} - transient, keeping previous "
+                              f"state")
+                        self._post_ui(self._arm_fleet_refresh, 60000)
+                        return
+                    print(f"[Fleet] ESI {transient[0]} poll answered "
+                          f"{transient[1]}; unanswered for "
+                          f"{int(now - since)}s - counting it as a miss")
                 else:
-                    members = None
+                    self._fleet_transient_since = None
                 verdict = classify_fleet_poll(info, polled_is_boss, members)
                 if verdict == FLEET_POLL_ROSTER:
                     # Got a real fleet — reset miss counter
@@ -35683,8 +35754,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     # No usable fleet answer: either ESI says we are in no fleet,
                     # or we ARE the boss and the boss-only members route gave us
                     # nothing (a disbanded fleet, once /characters/{id}/fleet/'s
-                    # cached id outlives it — see classify_fleet_poll). Both could
-                    # equally be a transient ESI error, so only clear after
+                    # cached id outlives it — see classify_fleet_poll). A failed
+                    # ask (5xx / 420 / no token) never gets here unless its run
+                    # outlived FLEET_TRANSIENT_MAX_S; still, only clear after
                     # NO_FLEET_GRACE consecutive misses to avoid flicker.
                     self._no_fleet_misses += 1
                     if self._no_fleet_misses >= NO_FLEET_GRACE:
