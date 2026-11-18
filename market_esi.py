@@ -70,6 +70,8 @@ ERROR_LIMIT_FLOOR = 20
 # Seconds a 429 holds its route / group when ``Retry-After`` is missing or
 # unusable (ESI documents a deeper limiter that can 429 without the headers).
 RATE_LIMIT_DEFAULT_WAIT = 60.0
+# The shortest hold a 429 sets (``Retry-After: 0`` included).
+RATE_LIMIT_MIN_WAIT = 1.0
 
 # The hold clock. A module-level name so tests can swap it.
 _now = time.monotonic
@@ -124,13 +126,17 @@ class AuthMarketAdapter:
     # (which lack the kwarg) are still called the classic way.
     supports_progress = True
 
-    # The hold keys (route paths, see ``_route_key``) of the two contract-items
-    # routes. The scanner's contract pass stops while ``rate_limited`` holds any
-    # of them. Every 429 is held under its route key, so these match whatever
-    # (or no) ``X-Ratelimit-Group`` the route answers with.
+    # The hold keys the scanner's contract pass stops on (``rate_limited`` over
+    # any of them): the two contract-items routes, plus the corp contract LIST
+    # route and its ``corp-contract`` bucket, which the list shares with the
+    # corp items route - a 429 on the list leaves every corp contract missing.
+    # Every 429 is held under its route key (see ``_route_key``), so the route
+    # keys match whatever (or no) ``X-Ratelimit-Group`` the route answers with.
     contract_items_groups = (
         "/contracts/public/items/{id}/",
         "/corporations/{id}/contracts/{id}/items/",
+        "/corporations/{id}/contracts/",
+        "corp-contract",
     )
 
     def __init__(self, auth, *, public_session=None, timeout: int = 15) -> None:
@@ -699,14 +705,16 @@ def _header(resp, name: str):
 
 def _retry_after_seconds(raw) -> float:
     """``Retry-After`` as seconds; ``RATE_LIMIT_DEFAULT_WAIT`` when it is
-    missing, an HTTP date, negative or not finite."""
+    missing, an HTTP date, negative or not finite. Floored at
+    ``RATE_LIMIT_MIN_WAIT``: a 429 always holds long enough to stop and flag the
+    pass (a zero-length hold would leave its contract missing, unflagged)."""
     try:
         val = float(str(raw).strip())
     except (TypeError, ValueError):
         return RATE_LIMIT_DEFAULT_WAIT
     if not math.isfinite(val) or val < 0:
         return RATE_LIMIT_DEFAULT_WAIT
-    return val
+    return max(val, RATE_LIMIT_MIN_WAIT)
 
 
 def _extract_system(resp, key: str) -> int | None:
