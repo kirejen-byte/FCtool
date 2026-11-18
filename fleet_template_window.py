@@ -1860,9 +1860,30 @@ class FleetTemplateWindow:
         impl carries the <Destroy> cleanup this window's bespoke copy lacked)."""
         return attach_tooltip(widget, text)
 
+    def _clamp_collision_text(self):
+        """FLEET-5: why the current template cannot be materialized (two wings,
+        or two squads of a wing, that share a name after ESI's 10-character
+        clamp), or None when it can."""
+        t = self.current_template()
+        if t is None:
+            return None
+        pairs = fleet_esi.clamp_collisions(
+            [(w.name, [s.name for s in w.squads]) for w in t.wings])
+        if not pairs:
+            return None
+        a, b = pairs[0]
+        more = f" (+{len(pairs) - 1} more)" if len(pairs) > 1 else ""
+        return (f'"{a}" and "{b}" are the same name in EVE (first 10 '
+                f'characters); rename one{more}.')
+
     def _toggle_auto_sort(self):
         if self.mode != "live":
             return
+        if not self._auto_sort_on:
+            clash = self._clamp_collision_text()
+            if clash:
+                self._status.config(text=f"Auto-move refused: {clash}", fg=FG_RED)
+                return
         self._auto_sort_on = not self._auto_sort_on
         self._auto_sort_btn.config(
             text=f"Auto-move: {'ON' if self._auto_sort_on else 'OFF'}")
@@ -1873,6 +1894,10 @@ class FleetTemplateWindow:
     def _auto_sort_tick(self):
         t = self.current_template()
         if t is None:
+            return
+        clash = self._clamp_collision_text()
+        if clash:                              # FLEET-5: would merge in EVE
+            self._status.config(text=f"Auto-move refused: {clash}", fg=FG_RED)
             return
         res = fleet_composer.compose(
             t, self._live_members, self._live_structure,
@@ -1983,6 +2008,14 @@ class FleetTemplateWindow:
 
     def _apply(self):
         if self.mode != "live":
+            return
+        clash = self._clamp_collision_text()
+        if clash:
+            # FLEET-5: ensure_structure would merge the pair into one live
+            # wing/squad and add a duplicate on every Apply.
+            messagebox.showwarning("Apply", f"Cannot apply this template: {clash}",
+                                   parent=self.win)
+            self._status.config(text=f"Apply refused: {clash}", fg=FG_RED)
             return
         # _esi_session_provider() does a SYNCHRONOUS ESI round-trip (get_fleet_info
         # + a possible token refresh), so fetch it off the Tk thread and open the
