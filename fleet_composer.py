@@ -206,7 +206,12 @@ def compose(template, live_members, live_structure, *, doctrine=None,
                        if m["character_id"] not in claimed
                        and _pilot_matches(rule.condition, m, tag_index)} \
                 if cap is not None else set()
-            for m in pool:
+            # Occupants are judged first (stable: join order inside each
+            # group) so an exactly-full squad keeps its pilots and outsiders
+            # only fill free seats.
+            order = (sorted(pool, key=lambda p: not _in_squad(p, wname, sname))
+                     if cap is not None else pool)
+            for m in order:
                 if m["character_id"] in claimed:
                     continue
                 if not _pilot_matches(rule.condition, m, tag_index):
