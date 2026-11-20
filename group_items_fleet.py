@@ -23,11 +23,14 @@ uses is reported.
     The fleet templates in ``fleet_templates.json`` -> ``templates``. A template travels
     WITHOUT its pilots: ``scrub_template`` nulls every slot ``character`` /
     ``character_id``, drops every ``character`` rule, nulls ``doctrine_id`` and removes the
-    ``id`` - on export, again in ``validate``, and once more in ``apply``, so that no caller
-    can land a named pilot by skipping a step. An export also leaves out every rule whose
-    VALUE is a pilot's name my own file knows (a ``character`` rule retyped in the editor
-    keeps the name as its value). ``cached_characters`` is read for that one comparison
-    only; it and ``ui`` never go into a group file and are never written.
+    ``id`` and ``free_move`` - on export, again in ``validate``, and once more in ``apply``,
+    so that no caller can land a named pilot by skipping a step. An export also leaves out
+    every rule whose VALUE is a pilot's name my own file knows (a ``character`` rule retyped
+    in the editor keeps the name as its value). ``cached_characters`` is read for that one
+    comparison only; it and ``ui`` never go into a group file and are never written.
+    ``free_move`` (the fleet free-move a template's Apply pushes) is the importer's own
+    call, like the doctrine: it never travels, an update keeps mine and an added template
+    leaves it unset (``None``, "leave unchanged"); ``never_saved`` says so.
 
 ``fleet.specialized_roles``
     The custom Specialized Role categories, ``config["specialized_roles_custom"]``: at most
@@ -630,7 +633,8 @@ def _sane(raw, stats) -> dict:
 def _normal(raw, version, stats, scrub) -> dict:
     """One template as the store would save it after loading it from a ``version`` file,
     without its ``id``: the round trip ``template_from_dict`` -> migrations ->
-    ``template_to_dict``. With ``scrub`` it carries no pilot and no doctrine."""
+    ``template_to_dict``. With ``scrub`` it carries no pilot and no doctrine. It never
+    carries ``free_move``, scrubbed or not."""
     template = fts.template_from_dict(_sane(raw, stats))
     if version < 2:
         fts._migrate_template_v1(template)
@@ -647,7 +651,9 @@ def _normal(raw, version, stats, scrub) -> dict:
     data = fts.template_to_dict(template)
     del data["id"]
     # The template's fleet free-move is the importer's own call, like its doctrine: it
-    # never travels in a group file (an update keeps mine, see ``apply``).
+    # never travels in a group file (an update keeps mine, see ``apply``). ``_sane``
+    # already rebuilds the template without it, so ``template_to_dict`` does not write
+    # it today; this pop is defence in case ``_sane`` ever learns the key.
     data.pop("free_move", None)
     return data
 
@@ -656,8 +662,9 @@ def scrub_template(d) -> dict:
     """A copy of template ``d`` that is safe to pass around.
 
     The ``id`` is removed and ``doctrine_id`` is ``None``; every slot's ``character`` and
-    ``character_id`` are ``None``; rules whose condition type is ``character`` are gone; and
-    every key outside the store's schema is gone - the copy is the result of the store's own
+    ``character_id`` are ``None``; rules whose condition type is ``character`` are gone;
+    ``free_move`` is gone although the store's schema has it (it never travels); and every
+    key outside the store's schema is gone - the copy is the result of the store's own
     round trip. ``d`` is not modified. Total: anything that is not a template dict gives an
     empty, nameless template. Scrubbing a scrubbed template changes nothing.
     """
@@ -845,7 +852,8 @@ class _TemplatesItem(Item):
     merge only. A template is matched by NAME with my FIRST template of that name (the one
     the template selector picks). ``theirs``: its content is replaced; its ``id`` stays, so
     everything that points at it keeps working, and so does its ``doctrine_id`` (a link to
-    MY library that a file never carries). ``mine``: skipped. Content that is already the
+    MY library that a file never carries) and its ``free_move`` (my fleet setting, which a
+    file never carries either). ``mine``: skipped. Content that is already the
     same - also when mine differs only in what ``_clean_template`` takes out or repairs on
     the way into a file: named pilots and ``character`` rules (no file carries them), a role
     outside ``ROLE_VALUES`` (a squad member there) and a rule of a kind outside
@@ -864,7 +872,7 @@ class _TemplatesItem(Item):
     order = 30
     conflicts = True
     never_saved = ("Named pilots in slots", "Rules that name a character",
-                   "Your saved character list")
+                   "Your saved character list", "Each template's free-move setting")
 
     def _clean_list(self, raw, version, left=None):
         """A list of raw templates -> ``(clean templates, problems)``, one per name.

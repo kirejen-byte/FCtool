@@ -2221,6 +2221,12 @@ class FleetTemplateWindow:
         self._current_template_id = t.id
         self._refresh_template_selector()
         self.set_mode("template")            # exits live, reloads the stored tree
+        # set_mode reloads only the tree: without these the Rules tab, the
+        # pacing spinboxes and the Free-move box keep showing the PREVIOUS
+        # template, and a spinbox <FocusOut> would write its values into the
+        # imported one.
+        self._reload_rules()
+        self._reload_settings()
         self._refresh_pins_button()
         self._status.config(text=f"Imported '{t.name}'.", fg=FG_GREEN)
 
@@ -2348,9 +2354,11 @@ class FleetTemplateWindow:
                 try:
                     fleet_esi.set_free_move(session, fleet_id, free_move)
                 except fleet_esi.FleetESIError as e:
-                    if e.reason == "boss_lost":
-                        # Every later write would 403 too: stop the Apply the
-                        # way a structure error does.
+                    if e.reason in ("boss_lost", "not_found"):
+                        # 403 = no longer boss; 404 = ESI's usual answer for a
+                        # gone fleet or a non-boss caller. Every later write
+                        # would fail the same way: stop the Apply the way a
+                        # structure error does.
                         self._post(self._apply_error, e.reason)
                         return
                     # Anything else: report it, keep the structure + moves.

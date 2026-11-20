@@ -100,9 +100,16 @@ def set_free_move(session, fleet_id: int, free_move: bool) -> None:
     """PUT /fleets/{id}/ - turn the fleet's free-move on or off (boss only).
 
     The body carries ONLY is_free_move: the endpoint also takes `motd`, and
-    sending one here would overwrite the fleet MOTD."""
+    sending one here would overwrite the fleet MOTD.
+
+    ``free_move`` must be a real bool: anything else (None, 0 / 1, "true")
+    raises TypeError before any request, so "leave unchanged" can never be
+    coerced into "turn it off"."""
+    if not isinstance(free_move, bool):
+        raise TypeError(
+            f"free_move must be a bool, not {type(free_move).__name__}")
     _call(session, "PUT", f"/fleets/{fleet_id}/",
-          json={"is_free_move": bool(free_move)}, expect=(204,))
+          json={"is_free_move": free_move}, expect=(204,))
 
 
 def move_member(session, fleet_id: int, member_id: int, *, wing_id, squad_id,
