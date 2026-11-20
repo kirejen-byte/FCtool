@@ -11233,10 +11233,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             except Exception as e:
                 print(f"[Characters] Single-refresh error for "
                       f"{acct.character_name}: {e}")
+                msg = str(e)
                 def show_err():
                     if self._panel_alive(panel):
                         panel._loc_label.config(
-                            text=f"  —  ⚠ ESI error: {e}", fg=FG_RED,
+                            text=f"  —  ⚠ ESI error: {msg}", fg=FG_RED,
                         )
                 self._post_ui(show_err)
 
