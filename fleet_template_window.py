@@ -21,6 +21,7 @@ from collections import deque
 from datetime import datetime
 from tkinter import ttk, messagebox, simpledialog
 
+import app_log
 import fleet_composer
 import fleet_esi
 from fleet_executor import MoveJob
@@ -2380,8 +2381,7 @@ class FleetTemplateWindow:
                     # Not an ESI answer (a bug, a transport surprise): without
                     # this the daemon thread dies and the status sits on
                     # "Checking fleet..." for good. Stop the Apply and say why.
-                    reason = "free-move " + _short_error(e)
-                    self._post(self._apply_error, reason)
+                    self._apply_crashed("free-move", e)
                     return
                 else:
                     self._post(self._log_line, f"Free-move set {state}.")
@@ -2406,12 +2406,29 @@ class FleetTemplateWindow:
                 return
             except Exception as e:
                 # Same as the free-move step: never let the worker die silently.
-                reason = "structure " + _short_error(e)
-                self._post(self._apply_error, reason)
+                self._apply_crashed("structure", e)
                 return
             self._post(self._enqueue_moves_sync, moves, wing_ids, squad_ids, "apply")
 
         threading.Thread(target=prep, daemon=True).start()
+
+    def _apply_crashed(self, step, exc):
+        """Worker thread, called INSIDE the except block: the Apply step
+        ``step`` raised an unexpected exception. Writes the full traceback to
+        fctool.log, then posts plain strings (never a closure over ``exc``) to
+        the Log tab and the status line. A logging failure never blocks the
+        status post."""
+        try:
+            app_log.log_uncaught(type(exc), exc, exc.__traceback__,
+                                 "fleet Apply worker")
+        except Exception:
+            pass
+        reason = step + " " + _short_error(exc)
+        line = "Apply error: " + reason
+        # Log line first: _log_line also writes the status (dim), and the red
+        # _apply_error status must be the one left showing.
+        self._post(self._log_line, line)
+        self._post(self._apply_error, reason)
 
     def _apply_error(self, reason):
         """Tk-thread: the Apply worker stopped on a FleetESIError (``reason``
