@@ -105,6 +105,9 @@ class FleetTemplate:
     wings: list[Wing] = field(default_factory=list)
     rules: list[AssignmentRule] = field(default_factory=list)
     settings: RebalanceSettings = field(default_factory=RebalanceSettings)
+    # Fleet free-move pushed by the template's Apply (PUT /fleets/{id}/).
+    # None = leave the live fleet's setting unchanged; True / False = on / off.
+    free_move: bool | None = None
 
 
 # ── (de)serialization ────────────────────────────────────────────────────────
@@ -179,7 +182,7 @@ def _settings_from_dict(d: dict) -> RebalanceSettings:
 
 
 def template_to_dict(t: FleetTemplate) -> dict:
-    return {
+    d = {
         "id": t.id,
         "name": t.name,
         "doctrine_id": t.doctrine_id,
@@ -187,9 +190,15 @@ def template_to_dict(t: FleetTemplate) -> dict:
         "rules": [_rule_to_dict(r) for r in t.rules],
         "settings": _settings_to_dict(t.settings),
     }
+    # Written only when set: a template that leaves free-move alone saves exactly
+    # as it did before the key existed (and reads back as None).
+    if isinstance(t.free_move, bool):
+        d["free_move"] = t.free_move
+    return d
 
 
 def template_from_dict(d: dict) -> FleetTemplate:
+    free_move = d.get("free_move")
     return FleetTemplate(
         id=d.get("id") or uuid4().hex,
         name=d.get("name", "Untitled"),
@@ -197,6 +206,8 @@ def template_from_dict(d: dict) -> FleetTemplate:
         wings=[_wing_from_dict(w) for w in d.get("wings", [])],
         rules=[_rule_from_dict(r) for r in d.get("rules", [])],
         settings=_settings_from_dict(d.get("settings", {})),
+        # Only a real bool counts; a missing key or garbage leaves it unchanged.
+        free_move=free_move if isinstance(free_move, bool) else None,
     )
 
 

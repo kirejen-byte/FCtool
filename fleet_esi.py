@@ -96,6 +96,15 @@ def delete_squad(session, fleet_id: int, squad_id: int) -> None:
     _call(session, "DELETE", f"/fleets/{fleet_id}/squads/{squad_id}/", expect=(204,))
 
 
+def set_free_move(session, fleet_id: int, free_move: bool) -> None:
+    """PUT /fleets/{id}/ - turn the fleet's free-move on or off (boss only).
+
+    The body carries ONLY is_free_move: the endpoint also takes `motd`, and
+    sending one here would overwrite the fleet MOTD."""
+    _call(session, "PUT", f"/fleets/{fleet_id}/",
+          json={"is_free_move": bool(free_move)}, expect=(204,))
+
+
 def move_member(session, fleet_id: int, member_id: int, *, wing_id, squad_id,
                 role: str) -> None:
     """PUT /fleets/{id}/members/{member_id}/ — move a pilot to a role/position.

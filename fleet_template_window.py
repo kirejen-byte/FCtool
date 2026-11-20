@@ -96,7 +96,27 @@ def mode_banner_text(mode: str) -> str:
     return "TEMPLATE — sandbox (changes saved to the template only)"
 
 
-def build_apply_preview_rows(res, members) -> dict:
+# Settings-tab Free-move choices <-> FleetTemplate.free_move (None / True / False).
+FREE_MOVE_LABELS = {None: "Leave unchanged", True: "On", False: "Off"}
+
+
+def free_move_from_label(label):
+    """Combobox text -> template value; anything unknown leaves it unchanged."""
+    for value, text in FREE_MOVE_LABELS.items():
+        if text == label:
+            return value
+    return None
+
+
+def free_move_preview_lines(free_move) -> list:
+    """The Apply preview's fleet-settings lines (empty when Apply leaves the
+    fleet's free-move alone). Pure - no Tk."""
+    if free_move is None:
+        return []
+    return [f"Free-move: {'ON' if free_move else 'OFF'}"]
+
+
+def build_apply_preview_rows(res, members, *, free_move=None) -> dict:
     """Turn a ComposeResult + the live member dicts into display rows for the
     Apply preview dialog.
 
@@ -109,6 +129,7 @@ def build_apply_preview_rows(res, members) -> dict:
                   character_id, falling back to 'no matching rule' only when the
                   id has no entry.
     warnings   -> passed through.
+    fleet      -> fleet-wide settings the Apply also writes ('Free-move: ON').
     Pure — no Tk."""
     members_by_id = {m.get("character_id"): m for m in (members or [])}
     moves = []
@@ -134,7 +155,8 @@ def build_apply_preview_rows(res, members) -> dict:
         reason = reasons.get(cid) or "no matching rule"
         unassigned.append(f"{name} — {reason}")
     return {"moves": moves, "unassigned": unassigned,
-            "warnings": list(getattr(res, "warnings", []) or [])}
+            "warnings": list(getattr(res, "warnings", []) or []),
+            "fleet": free_move_preview_lines(free_move)}
 
 
 def member_matches_filter(member: dict, query: str) -> bool:
@@ -1541,12 +1563,28 @@ class FleetTemplateWindow:
             sb.bind("<FocusOut>", lambda e: self._on_settings_changed())
             sb.bind("<Return>", lambda e: self._on_settings_changed())
             self._settings_spinboxes[key] = sb
+        # Fleet free-move: fleet state the template's Apply pushes, not pacing.
+        fm_row = len(fields)
+        fm_label = tk.Label(self._settings_tab, text="Free-move:", bg=BG_PANEL,
+                            fg=FG_TEXT, font=("Consolas", 9))
+        fm_label.grid(row=fm_row, column=0, sticky="w", padx=8, pady=6)
+        self._free_move_var = tk.StringVar(value=FREE_MOVE_LABELS[None])
+        self._free_move_cb = ttk.Combobox(
+            self._settings_tab, textvariable=self._free_move_var,
+            values=list(FREE_MOVE_LABELS.values()), width=16, state="readonly")
+        self._free_move_cb.grid(row=fm_row, column=1, padx=8, pady=6)
+        self._free_move_cb.bind("<<ComboboxSelected>>",
+                                lambda e: self._on_free_move_changed())
+        tip = ("Apply sets the fleet's free-move to this value (fleet boss "
+               "only). 'Leave unchanged' does not touch it.")
+        self._attach_tooltip(fm_label, tip)
+        self._attach_tooltip(self._free_move_cb, tip)
         tk.Label(self._settings_tab,
                  text="Fast bursts are ESI-verified: after each burst the tool "
                       "pauses and re-checks the fleet before continuing.",
                  bg=BG_PANEL, fg=FG_DIM, font=("Consolas", 8),
                  justify=tk.LEFT, wraplength=320).grid(
-                     row=len(fields), column=0, columnspan=2,
+                     row=fm_row + 1, column=0, columnspan=2,
                      sticky="w", padx=8, pady=8)
         self._reload_settings()
 
@@ -1658,6 +1696,18 @@ class FleetTemplateWindow:
         s = t.settings
         for key, (var, _lo, _hi) in self._settings_vars.items():
             var.set(getattr(s, key))
+        fm_var = getattr(self, "_free_move_var", None)
+        if fm_var is not None:
+            fm_var.set(FREE_MOVE_LABELS.get(t.free_move, FREE_MOVE_LABELS[None]))
+
+    def _on_free_move_changed(self):
+        """Settings-tab Free-move picked: store it on the template and persist
+        (both modes - it only reaches the fleet through Apply)."""
+        t = self.current_template()
+        if t is None:
+            return
+        t.free_move = free_move_from_label(self._free_move_var.get())
+        self.store.save()
 
     def _on_settings_changed(self):
         t = self.current_template()
@@ -2132,8 +2182,9 @@ class FleetTemplateWindow:
         res = self._compose_preview()
         if res is None:
             return
-        rows = build_apply_preview_rows(res, self._live_members)
         t = self.current_template()
+        rows = build_apply_preview_rows(res, self._live_members,
+                                        free_move=t.free_move)
         threshold = t.settings.bulk_apply_threshold
         big_warning = ""
         if len(rows["moves"]) > threshold:
@@ -2284,10 +2335,28 @@ class FleetTemplateWindow:
         self._ensure_executor()
         fleet_id = self._fleet_id
         t = self.current_template()
+        # The template's free-move rides the Apply path only (never drag/drop or
+        # auto-move); read on the Tk thread, written on the worker.
+        free_move = (t.free_move if (materialize_template and t is not None)
+                     else None)
 
         # Structure creation (Apply only) still happens up front on a worker so
         # the executor jobs carry concrete wing/squad ids.
         def prep():
+            if free_move is not None:
+                state = "ON" if free_move else "OFF"
+                try:
+                    fleet_esi.set_free_move(session, fleet_id, free_move)
+                except fleet_esi.FleetESIError as e:
+                    if e.reason == "boss_lost":
+                        # Every later write would 403 too: stop the Apply the
+                        # way a structure error does.
+                        self._post(self._apply_error, e.reason)
+                        return
+                    # Anything else: report it, keep the structure + moves.
+                    self._post(self._free_move_failed, state, e)
+                else:
+                    self._post(self._log_line, f"Free-move set {state}.")
             try:
                 if materialize_template and t is not None:
                     wanted = [(w.name, [s.name for s in w.squads]) for w in t.wings]
@@ -2302,12 +2371,34 @@ class FleetTemplateWindow:
                                  for w in self._live_structure.get("wings", [])
                                  for s in w.get("squads", [])}
             except fleet_esi.FleetESIError as e:
-                self._post(lambda: self._status.config(
-                    text=f"Apply error: {e.reason}", fg=FG_RED))
+                # Pass the reason, not a lambda over `e`: Python unbinds `e`
+                # when the except block ends, so a deferred closure over it
+                # raised NameError on the Tk thread and the status never showed.
+                self._post(self._apply_error, e.reason)
                 return
             self._post(self._enqueue_moves_sync, moves, wing_ids, squad_ids, "apply")
 
         threading.Thread(target=prep, daemon=True).start()
+
+    def _apply_error(self, reason):
+        """Tk-thread: the Apply worker stopped on a FleetESIError."""
+        try:
+            self._status.config(text=f"Apply error: {reason}", fg=FG_RED)
+        except tk.TclError:
+            pass
+
+    def _free_move_failed(self, state, exc):
+        """Tk-thread: setting the fleet's free-move failed; the Apply carries
+        on with its structure and moves."""
+        reason = getattr(exc, "reason", None) or "error"
+        status = getattr(exc, "status", None)
+        msg = f"Free-move {state} failed: {reason}" + (
+            f" ({status})" if status else "")
+        self._log_line(msg)
+        try:
+            self._status.config(text=msg, fg=FG_RED)
+        except tk.TclError:
+            pass
 
     def _enqueue_moves_sync(self, moves, wing_ids, squad_ids, source):
         """Build + submit MoveJobs on the Tk thread. Used directly by drag/drop
@@ -2678,6 +2769,7 @@ class _ApplyPreviewDialog:
         box.configure(state="disabled")
 
         for label, items, colour in (
+                ("Fleet settings:", rows.get("fleet", []), FG_ACCENT),
                 ("Unassigned / unrouted:", rows.get("unassigned", []), FG_YELLOW),
                 ("Warnings:", rows.get("warnings", []), FG_YELLOW)):
             if items:

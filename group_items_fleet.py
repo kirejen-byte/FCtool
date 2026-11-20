@@ -646,6 +646,9 @@ def _normal(raw, version, stats, scrub) -> dict:
                           if rule.condition.type != "character"]
     data = fts.template_to_dict(template)
     del data["id"]
+    # The template's fleet free-move is the importer's own call, like its doctrine: it
+    # never travels in a group file (an update keeps mine, see ``apply``).
+    data.pop("free_move", None)
     return data
 
 
@@ -1034,6 +1037,9 @@ class _TemplatesItem(Item):
                           "doctrine_id": doctrine if isinstance(doctrine, str) else None}
             new[index] = {key: new[index][key]
                           for key in ("id", "name", "doctrine_id", *_CONTENT_KEYS)}
+            free_move = mine.get("free_move")
+            if isinstance(free_move, bool):     # never travels, so it is not touched
+                new[index]["free_move"] = free_move
             result.updated.append(name)
             named = _named_slots(view)
             if named:
