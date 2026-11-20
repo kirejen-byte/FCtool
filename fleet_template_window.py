@@ -116,6 +116,19 @@ def free_move_preview_lines(free_move) -> list:
     return [f"Free-move: {'ON' if free_move else 'OFF'}"]
 
 
+def _short_error(exc, limit=80) -> str:
+    """'TypeError: message' for an unexpected exception, cut to ``limit``
+    characters - a plain string, so a worker can post it to the Tk thread
+    without closing over the except-bound name. Pure - no Tk."""
+    name = type(exc).__name__
+    try:
+        text = str(exc).strip()
+    except Exception:
+        text = ""
+    out = f"{name}: {text}" if text else name
+    return out if len(out) <= limit else out[:limit - 3] + "..."
+
+
 def build_apply_preview_rows(res, members, *, free_move=None) -> dict:
     """Turn a ComposeResult + the live member dicts into display rows for the
     Apply preview dialog.
@@ -2363,6 +2376,13 @@ class FleetTemplateWindow:
                         return
                     # Anything else: report it, keep the structure + moves.
                     self._post(self._free_move_failed, state, e)
+                except Exception as e:
+                    # Not an ESI answer (a bug, a transport surprise): without
+                    # this the daemon thread dies and the status sits on
+                    # "Checking fleet..." for good. Stop the Apply and say why.
+                    reason = "free-move " + _short_error(e)
+                    self._post(self._apply_error, reason)
+                    return
                 else:
                     self._post(self._log_line, f"Free-move set {state}.")
             try:
@@ -2384,12 +2404,18 @@ class FleetTemplateWindow:
                 # raised NameError on the Tk thread and the status never showed.
                 self._post(self._apply_error, e.reason)
                 return
+            except Exception as e:
+                # Same as the free-move step: never let the worker die silently.
+                reason = "structure " + _short_error(e)
+                self._post(self._apply_error, reason)
+                return
             self._post(self._enqueue_moves_sync, moves, wing_ids, squad_ids, "apply")
 
         threading.Thread(target=prep, daemon=True).start()
 
     def _apply_error(self, reason):
-        """Tk-thread: the Apply worker stopped on a FleetESIError."""
+        """Tk-thread: the Apply worker stopped on a FleetESIError (``reason``
+        is its reason) or on an unexpected exception (a short text)."""
         try:
             self._status.config(text=f"Apply error: {reason}", fg=FG_RED)
         except tk.TclError:
