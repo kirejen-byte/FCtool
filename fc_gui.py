@@ -157,7 +157,7 @@ import window_activator
 # "Close Clients" (Fleet tab): list + slide-to-confirm dialog + watch. Imports
 # no fc_gui / ctypes -- the button's click handler injects its collaborators.
 import close_clients
-# Kick > "Disband Fleet": the slide-to-confirm question (the run is kick_pods).
+# Kick > "Disband Fleet": the whole flow + its slide question (rules: kick_pods).
 import disband_dialog
 import preview_layout
 # Cycle-group ROLES: the pure criteria vocabulary + ring resolution, plus the
@@ -362,7 +362,7 @@ from ui_theme import (
 from ui_helpers import (make_modal, attach_tooltip, update_tooltip,
                         relift_topmost_tooltips, center_over,
                         make_glyph_button, normalize_hex_color,
-                        make_color_swatch, make_split_button)
+                        make_color_swatch, make_split_button, ARROW_GLYPH)
 
 # Update awareness. app_version owns the released version string (and the one
 # tag parser); update_check owns the single GitHub /releases/latest call and the
@@ -4550,7 +4550,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                                    style="Dark.TButton",
                                    command=self._open_fleet_templates)
         # "Kick" + a down triangle: posts Kick Pods / Disband Fleet.
-        kick_btn = ttk.Button(role_header, text="Kick " + chr(0x25BE),
+        kick_btn = ttk.Button(role_header, text="Kick " + ARROW_GLYPH,
                               style="Red.TButton", width=-6,
                               command=lambda: self._post_kick_menu(kick_btn))
         attach_tooltip(kick_btn,
@@ -17534,6 +17534,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             self._motd_last_check_ts = time.monotonic()
             self._motd_maybe_autopush()   # push now if something changed
         self._motd_update_link_indicator()
+
+    def _motd_disarm_link(self):
+        """Turn Auto-update MOTD off for good (Kick > Disband Fleet), live AND
+        remembered, through the one writer above. True when it was on."""
+        was_on = bool(getattr(self, "_motd_link_enabled", False)
+                      or self.config.get("fittings", {}).get("motd_link"))
+        var = getattr(self, "_motd_link_var", None)
+        if was_on and var is not None:
+            var.set(False)
+            self._motd_toggle_link()
+        self._motd_link_enabled = False
+        return was_on
 
     def _motd_maybe_autopush(self):
         """If linked, recompute the MOTD and re-push it to the fleet when it has
@@ -36963,98 +36975,22 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                         btn.winfo_rooty() + btn.winfo_height())
 
     def _disband_fleet(self):
-        """Kick > "Disband Fleet": MOTD "Fleet is over", then kick everyone but you.
-
-        Boss-only (the Kick Pods gate), slide-confirmed (disband_dialog), and
-        the same shape as _kick_pods_from_fleet: Tk-thread gate, roster fetch
-        on a worker, the question on the Tk thread, the run
-        (kick_pods.disband, which owns the safety rules) on a worker, the
-        result modal on the Tk thread. On confirm an armed "Auto-update MOTD"
-        link is disarmed FIRST, through its one writer _motd_toggle_link, and
-        the run waits out an autopush PUT already in flight - else the
-        template would be written back over the message. ESI has no disband
-        call: the FC stays in a one-man fleet."""
-        import kick_pods
-        title = "Disband Fleet"
-        ok = [("OK", "Dark.TButton", None)]
-        fleet_id = getattr(self, "_last_polled_fleet_id", None)
-        is_boss = bool(getattr(self, "_last_polled_fleet_is_boss", False))
-        if not fleet_id or not is_boss:
-            self._themed_modal(
-                title,
-                "You must be the current fleet boss to disband the fleet.\n"
-                "Use 'Refresh fleet' after forming or joining a fleet, then try again.",
-                buttons=ok, accent=FG_YELLOW)
-            return
-        auth = self.esi_auth
-        own = getattr(auth, "character_id", None) if auth is not None else None
-        if auth is None or not auth.is_authenticated or not own:
-            self._themed_modal(title, "No authenticated character.",
-                               buttons=ok, accent=FG_YELLOW)
-            return
-
-        def fetch():
-            rows, err = [], None
-            try:
-                from zkill_monitor import resolve_name
-                members = auth.get_fleet_members(fleet_id=fleet_id)
-                if not isinstance(members, list):
-                    raise RuntimeError("the fleet roster did not load")
-                rows = sorted(
-                    ((cid, resolve_name(cid, "character") or str(cid))
-                     for cid in kick_pods.member_ids(members, own)),
-                    key=lambda r: (r[1].casefold(), r[0]))
-            except Exception as e:
-                err = str(e)
-            self._post_ui(_confirm, rows, err)
-
-        def _confirm(rows, err):
-            if err:
-                self._themed_modal(title, f"Could not read fleet members:\n{err}",
-                                   buttons=ok, accent=FG_RED)
-                return
-            if not rows:
-                self._themed_modal(title, "No one else is in the fleet.",
-                                   buttons=ok, accent=FG_ACCENT)
-                return
-            ids = [cid for cid, _n in rows]
-            try:
-                disband_dialog.open_dialog(self.root, [n for _c, n in rows],
-                                           lambda: _go(ids), log=log)
-            except Exception:
-                log.exception("Disband Fleet: the dialog could not be opened")
-                self._themed_modal(
-                    title, "The Disband Fleet dialog could not be opened. "
-                    "See fctool.log.", buttons=ok, accent=FG_RED)
-
-        def _go(ids):
-            if getattr(self, "_motd_link_enabled", False):
-                var = getattr(self, "_motd_link_var", None)
-                if var is not None:
-                    var.set(False)
-                    self._motd_toggle_link()      # the one writer; persists off
-                else:
-                    self._motd_link_enabled = False
-            threading.Thread(target=worker, args=(ids,), daemon=True).start()
-
-        def worker(ids):
-            try:
-                deadline = time.monotonic() + 15.0
-                while (getattr(self, "_motd_autopush_inflight", False)
-                       and time.monotonic() < deadline):
-                    time.sleep(0.1)
-                res = kick_pods.disband(auth, fleet_id, ids, own)
-            except Exception:
-                log.exception("Disband Fleet: the run failed")
-                res = None
-            self._post_ui(_done, res)
-
-        def _done(res):
-            text, tone = kick_pods.disband_result_text(res)
-            accent = {"ok": FG_GREEN, "warn": FG_YELLOW}.get(tone, FG_RED)
-            self._themed_modal(title, text, buttons=ok, accent=accent)
-
-        threading.Thread(target=fetch, daemon=True).start()
+        """Kick > "Disband Fleet". Wiring only: disband_dialog.DisbandFlow
+        owns the gate, roster fetch, slide question, run and result (one run
+        at a time). Hosts the worker-read ``inflight`` lambda, hence listed
+        in tests/test_no_worker_after.py::WORKER_METHODS."""
+        self._disband_flow = disband_dialog.launch(
+            getattr(self, "_disband_flow", None), self.root, self.esi_auth,
+            getattr(self, "_last_polled_fleet_id", None),
+            getattr(self, "_last_polled_fleet_is_boss", False),
+            post_ui=self._post_ui, log=log,
+            notify=lambda text, tone: self._themed_modal(
+                "Disband Fleet", text, buttons=[("OK", "Dark.TButton", None)],
+                accent={"ok": FG_GREEN, "warn": FG_YELLOW,
+                        "info": FG_ACCENT}.get(tone, FG_RED)),
+            disarm_link=self._motd_disarm_link,
+            inflight=lambda: getattr(self, "_motd_autopush_inflight", False),
+            on_motd_set=self._motd_record_manual_push)   # the new baseline
 
     def _set_all_roles_collapsed(self, collapsed: bool):
         """Expand or collapse all role slots at once."""

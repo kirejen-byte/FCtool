@@ -116,25 +116,48 @@ def pilots(n: int) -> str:
     return f"{n} pilot" if n == 1 else f"{n} pilots"
 
 
-def disband_result_text(res):
+#: Added to the result whenever Disband turned "Auto-update MOTD" off.
+LINK_OFF_LINE = ('"Auto-update MOTD" was turned off; tick it again to '
+                 "resume it.")
+#: Replaces the MOTD line when an autopush PUT was still in flight after the
+#: run, so the template may have landed AFTER the disband message.
+MOTD_RISK_LINE = ('An "Auto-update MOTD" push was still running and may have '
+                  f'written the template over "{DISBAND_MOTD}". Check the '
+                  "MOTD in game.")
+
+
+def disband_result_text(res, *, link_off=False, motd_risk=False):
     """The result modal for ``disband``'s return (None = the run raised).
 
+    ``link_off``: the run turned "Auto-update MOTD" off first (so something
+    DID change even when nothing else did). ``motd_risk``: an autopush PUT
+    was still in flight after the run - never claim the MOTD was set.
+
     Returns (text, tone) with tone "ok" / "warn" / "error"."""
+    tail = [LINK_OFF_LINE] if link_off else []
     if res is None:
-        return ("The disband run failed; the MOTD may have been set and some "
-                "pilots may already have been kicked. See fctool.log.",
-                "error")
+        return "\n".join(
+            ["The disband run failed; the MOTD may have been set and some "
+             "pilots may already have been kicked. See fctool.log."] + tail
+        ), "error"
     motd_ok, kicked, failed, skipped, reread_ok = res
     if motd_ok is None:
-        return ("Could not read the fleet members, so nothing was changed: "
-                "the MOTD was not set and nobody was kicked.", "error")
-    motd_line = (f'The fleet MOTD was set to "{DISBAND_MOTD}".' if motd_ok
-                 else "The MOTD could not be set.")
+        head = ("Could not read the fleet members: the MOTD was not set and "
+                "nobody was kicked." if link_off else
+                "Could not read the fleet members, so nothing was changed: "
+                "the MOTD was not set and nobody was kicked.")
+        return "\n".join([head] + tail), "error"
+    if motd_risk:
+        motd_line = MOTD_RISK_LINE
+    elif motd_ok:
+        motd_line = f'The fleet MOTD was set to "{DISBAND_MOTD}".'
+    else:
+        motd_line = "The MOTD could not be set."
     if not reread_ok:
-        return (motd_line + "\nCould not re-read the fleet members, so "
-                "nobody was kicked.", "error")
+        return "\n".join([motd_line, "Could not re-read the fleet members, "
+                           "so nobody was kicked."] + tail), "error"
     lines = [f"Kicked {pilots(kicked)} from the fleet.", motd_line]
-    tone = "ok" if motd_ok else "warn"
+    tone = "ok" if motd_ok and not motd_risk else "warn"
     if skipped:
         lines.append(f"{skipped} not kicked (left the fleet, or the run "
                      "stopped after repeated failures).")
@@ -143,5 +166,6 @@ def disband_result_text(res):
         lines.append(f"{failed} could not be kicked (they may have left, or "
                      "you lost the boss role).")
         tone = "warn"
+    lines += tail
     lines.append("You are still in a one-man fleet: ESI has no disband call.")
     return "\n".join(lines), tone
