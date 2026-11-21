@@ -1950,7 +1950,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._preview_pin_retries = set()
         # ── Implant-removal reminder (default ON; see implant_reminder.py) ───
         self._implant_reminder = None          # ImplantReminder (lazy, gated on config)
-        self._implant_toast = None             # the single live ClientToast, if any
+        self._implant_toasts = {}              # char key -> its live ClientToast
         # ── "Watch my ozone" (default ON; see ozone_watch.py) ────────────────
         # ONE WatchState for the whole app: the latch has to outlive the edge
         # that set it, and the gamelog decrement has to land on the SAME sample
@@ -25525,14 +25525,15 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         it; for a dock reminder that is exactly the moment it must be seen. Do
         not "fix" this into a focus check.
 
-        One toast at a time (a newer one replaces the older). With no client rect
+        One live toast per character (a newer one for the same character
+        replaces the older; other characters' toasts stay). With no client rect
         there is nothing sensible to sit over, so the toast is skipped rather
         than parked at a guessed screen position."""
         try:
-            prev = self._implant_toast
+            toasts = self._implant_toasts
+            prev = toasts.pop(key, None)
             if prev is not None:
                 prev.dismiss()
-                self._implant_toast = None
             rect = self._implant_client_rect(key)
             if rect is None:
                 # The other way this feature can "not fire": the engine did its
@@ -25548,12 +25549,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             body = (implant_reminder.login_toast_body(char_name, names)
                     if login else
                     implant_reminder.toast_body(char_name, names))
+
+            def _free_slot():
+                # Late-bound `toast`: only frees the slot it still owns.
+                if toasts.get(key) is toast:
+                    toasts.pop(key, None)
+
             toast = client_toast.ClientToast(
                 self.root, implant_reminder.TOAST_TITLE, body,
                 seconds=cfg.get("toast_seconds", 12.0),
-                on_dismiss=lambda: setattr(self, "_implant_toast", None),
+                on_dismiss=_free_slot,
                 on_snooze=(lambda: rem.snooze(key)) if rem is not None else None)
-            self._implant_toast = toast
+            toasts[key] = toast
             toast.show(rect)
         except Exception:
             log.exception("[implant] toast failed for %s", key)
@@ -25603,7 +25610,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         roster). Called once per poller pass, on the poller thread.
 
         Four dicts and a set hang off a character key, plus the engine's own
-        latch. Without this they accumulate for every character ever previewed
+        latch. (``_ozone_toasts`` is deliberately NOT pruned here: it belongs
+        to the Tk thread and frees itself on dismiss; this runs on the poller.) Without this they accumulate for every character ever previewed
         in a session and, worse, go STALE: a client closed and reopened an hour
         later would come back with its old ``(docked, online)`` sample, its old
         ship memo and its old latch, so the first poll pass could read a
