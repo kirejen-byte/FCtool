@@ -10407,8 +10407,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # value re-typed here.
         self._ozone_enabled_var = tk.BooleanVar(
             value=self._ozone_watch_enabled())
+        # "& fuel" since 2026-11-21: the same tick also watches jump fuel and
+        # siege / triage strontium (config block still `ozone_watch`).
         tk.Checkbutton(
-            implant_frame, text="Watch my ozone",
+            implant_frame, text="Watch my ozone & fuel",
             variable=self._ozone_enabled_var,
             font=("Consolas", 10, "bold"), fg=FG_TEXT, bg=BG_PANEL,
             selectcolor=BG_ENTRY, activebackground=BG_PANEL,
@@ -10723,21 +10725,30 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         move is to state the assumption rather than hide it."""
         try:
             cfg = ozone_watch.normalize_config(self.config.get("ozone_watch"))
-            need, level = cfg["min_activations"], cfg["assumed_skill_level"]
         except Exception:
             log.exception("[ozone] could not read the watch config")
-            need, level = (ozone_watch.DEFAULTS["min_activations"],
-                           ozone_watch.DEFAULTS["assumed_skill_level"])
+            cfg = ozone_watch.normalize_config(None)
+        need, level = cfg["min_activations"], cfg["assumed_skill_level"]
         # EVE writes skill levels in roman numerals; "Theory 5" would read as a
         # typo to the only person who will ever hover this.
         rank = {0: "0", 1: "I", 2: "II", 3: "III", 4: "IV", 5: "V"}.get(
             level, str(level))
+        # The fuel half (2026-11-21): one sentence per threshold that is ON.
+        fuel = []
+        if cfg["min_isotopes"] > 0:
+            fuel.append(f"A jump capital (not Black Ops) also warns with less "
+                        f"than {cfg['min_isotopes']:,} of its isotope in the "
+                        f"fuel bay and cargo.")
+        if cfg["min_strontium"] > 0:
+            fuel.append(f"A siege or triage module fitted warns with less "
+                        f"than {cfg['min_strontium']:,} Strontium aboard.")
+        fuel_text = (" " + " ".join(fuel)) if fuel else ""
         return (f"Warns when a character undocks, logs in, or lights a cyno "
                 f"with fewer than {need} lights of Liquid Ozone aboard. Cost "
                 f"uses the fitted generator and hull bonuses; skills are "
                 f"assumed at Cynosural Field Theory {rank} (ESI skills are "
-                f"not authorised). Requires native previews (the location "
-                f"poller and game-log watcher run with them).")
+                f"not authorised).{fuel_text} Requires native previews (the "
+                f"location poller and game-log watcher run with them).")
 
     def _populate_character_panels(self):
         """Build the character panels from scratch (static layout, no ESI calls)."""
@@ -25651,8 +25662,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             keeps that from firing for the whole roster at startup, which is the
             case the strict rule was protecting.
 
-        WHAT AN EDGE COSTS. A scope-less token, a non-cyno hull or an unknown
-        ship all return before /assets/ is touched. Past those, the per-ship
+        WHAT AN EDGE COSTS. A scope-less token, a hull that is neither
+        cyno-capable nor a jump capital (ozone_watch.is_watched_hull) or an
+        unknown ship all return before /assets/ is touched. Past those, the per-ship
         cache (``asset_ttl_s``, 600 s) answers a redock/undock inside ten
         minutes for free -- ESI's own cache on that endpoint is longer anyway.
 
@@ -25733,13 +25745,15 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             catalog = getattr(self, "type_catalog", None)
             group = catalog.group_of(ship_type_id) if catalog is not None else None
             # BOTH ids: a Venture lives in group 25, which is not cyno-capable
-            # at large, and is whitelisted by type instead.
-            if not ozone_watch.is_cyno_hull(group, ship_type_id):
+            # at large, and is whitelisted by type instead. Since 2026-11-21 a
+            # jump capital is watched too (its fuel), cyno or not.
+            if not ozone_watch.is_watched_hull(group, ship_type_id):
                 hull = catalog.resolve_name(ship_type_id) if catalog is not None else None
                 log.info("[ozone] %s %s edge: hull %s (type %s, group %s) "
-                         "is not cyno-capable - skipped",
+                         "is not cyno-capable or a jump capital - skipped",
                          key, edge_kind, hull or "?", ship_type_id, group)
                 return
+            fuel_type = ozone_watch.jump_fuel_type(ship_type_id, group)
             if not ship_item_id:
                 log.info("[ozone] %s %s edge: no ship_item_id - skipped",
                          key, edge_kind)
@@ -25759,15 +25773,17 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     log.info("[ozone] %s %s edge: assets pull "
                              "incomplete/empty - no sample", key, edge_kind)
                     return                      # no sample; nothing cached
-                cargo = ozone_watch.scan_ship_assets(assets, ship_item_id)
+                cargo = ozone_watch.scan_ship_assets(
+                    assets, ship_item_id, fuel_type_id=fuel_type)
                 self._ozone_asset_cache[cache_key] = (now, cargo)
 
             cost = ozone_watch.effective_ozone_cost(
                 cargo.generator_type_id, ship_type_id,
                 cfg["assumed_skill_level"])
+            fuel_short = ozone_watch.fuel_lines(cargo, fuel_type, cfg)
             verb = self._ozone_watch_state(cfg).observe_edge(
                 key, ship_item_id, cargo, cost, now,
-                disabled=key in cfg["disabled_chars"])
+                disabled=key in cfg["disabled_chars"], fuel_short=fuel_short)
             hull = ""
             if catalog is not None:
                 hull = catalog.resolve_name(ship_type_id) or ""
@@ -25776,14 +25792,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                         else "no generator fitted")
             lights = ozone_watch.lights_left(cargo.ozone, cost)
             cargo_summary = f"{gen_desc}, {cargo.ozone} ozone, {lights} lights"
+            if fuel_type in ozone_watch.ISOTOPE_NAMES:
+                cargo_summary += (f", {cargo.isotopes} "
+                                  f"{ozone_watch.ISOTOPE_NAMES[fuel_type]}")
+            if cargo.strontium_fitted:
+                cargo_summary += f", {cargo.strontium} strontium"
             log.info("[ozone] %s %s edge: %s - %s (%s)",
                      key, edge_kind, hull or "?", cargo_summary, verb)
             if verb != ozone_watch.FIRE:
                 return
-            self._post_ui(
-                self._ozone_show_toast, key, name,
-                ozone_watch.toast_body(hull, cargo, cost,
-                                       cfg["min_activations"]))
+            title, body = ozone_watch.edge_toast(
+                name, cargo, cost, fuel_short, cfg["min_activations"])
+            self._post_ui(self._ozone_show_toast, key, name, body, title)
         except Exception:
             log.exception("[ozone] watch hook failed")
 
@@ -25838,8 +25858,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         except Exception:
             log.exception("[ozone] cyno-lit hook failed")
 
-    def _ozone_show_toast(self, key, char_name, body):
+    def _ozone_show_toast(self, key, char_name, body, title=None):
         """Tk-thread: raise the transient over-client toast for ONE character.
+
+        ``title`` (2026-11-21) is the edge's own title from
+        ozone_watch.edge_toast ("Fuel - <name>" when only fuel is short); None
+        keeps the ozone title. A multi-line body (one line per shortfall) gets
+        a box tall enough for it (client_toast.height_for).
 
         Same contract as _implant_show_toast, and it shares that method's client
         lookup (_implant_client_rect is a pure read-only rect lookup keyed on a
@@ -25871,8 +25896,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 return
             cfg = ozone_watch.normalize_config(self.config.get("ozone_watch"))
             toast = client_toast.ClientToast(
-                self.root, ozone_watch.toast_title(char_name), body,
+                self.root, title or ozone_watch.toast_title(char_name), body,
                 seconds=cfg["toast_seconds"],
+                height=client_toast.height_for(str(body).count("\n") + 1),
                 on_dismiss=lambda: setattr(self, "_ozone_toast", None))
             self._ozone_toast = toast
             toast.show(rect)
