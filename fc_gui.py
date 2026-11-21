@@ -157,6 +157,8 @@ import window_activator
 # "Close Clients" (Fleet tab): list + slide-to-confirm dialog + watch. Imports
 # no fc_gui / ctypes -- the button's click handler injects its collaborators.
 import close_clients
+# Kick > "Disband Fleet": the slide-to-confirm question (the run is kick_pods).
+import disband_dialog
 import preview_layout
 # Cycle-group ROLES: the pure criteria vocabulary + ring resolution, plus the
 # cycle-groups dialog's RoleCriteriaPanel editor (pure core + Tk shell in one
@@ -4521,6 +4523,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # what REMAINS of the row, so on screen it still reads
         #   Role Tracker [+ Add Role] [Reset All] [Collapse All] [Expand All]
         #     … <status> [Close Clients] [Kick Pods] [Fleet Templates] [Screenshot]
+        # ("Kick Pods" is now the red Kick menu button: Kick Pods / Disband
+        # Fleet - same slot, same pack priority.)
         # width=-len(text) on every label shorter than ttk's 11-char default
         # is a MINIMUM, not a truncation (precedent: the x-up Reset above);
         # with the old dim "(not case sensitive)" label folded into a tooltip
@@ -4545,8 +4549,15 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         templates_btn = ttk.Button(role_header, text="Fleet Templates",
                                    style="Dark.TButton",
                                    command=self._open_fleet_templates)
-        kick_btn = ttk.Button(role_header, text="Kick Pods", style="Red.TButton",
-                              width=-9, command=self._kick_pods_from_fleet)
+        # "Kick" + a down triangle: posts Kick Pods / Disband Fleet.
+        kick_btn = ttk.Button(role_header, text="Kick " + chr(0x25BE),
+                              style="Red.TButton", width=-6,
+                              command=lambda: self._post_kick_menu(kick_btn))
+        attach_tooltip(kick_btn,
+                       "Kick Pods: kick everyone in a capsule.\n"
+                       "Disband Fleet: set the MOTD to \"Fleet is over\", then "
+                       "kick everyone but you.\nESI cannot disband a fleet, so "
+                       "you stay in a one-man fleet. Both ask first.")
         close_btn = ttk.Button(role_header, text="Close Clients", style="Red.TButton",
                                command=self._close_all_clients)
         attach_tooltip(close_btn, "Close every running EVE client (asks first).")
@@ -36938,6 +36949,110 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 accent = FG_YELLOW
             self._themed_modal("Kick Pods", msg,
                                buttons=[("OK", "Dark.TButton", None)], accent=accent)
+
+        threading.Thread(target=fetch, daemon=True).start()
+
+    def _post_kick_menu(self, btn):
+        """The red Kick button: post "Kick Pods" / "Disband Fleet" under it.
+        Built per click; ``_post_menu`` posts it and tears it down."""
+        menu = tk.Menu(btn, tearoff=0, bg=BG_PANEL, fg=FG_TEXT,
+                       activebackground=FG_ACCENT, activeforeground=BG_DARK)
+        menu.add_command(label="Kick Pods", command=self._kick_pods_from_fleet)
+        menu.add_command(label="Disband Fleet", command=self._disband_fleet)
+        self._post_menu(menu, btn.winfo_rootx(),
+                        btn.winfo_rooty() + btn.winfo_height())
+
+    def _disband_fleet(self):
+        """Kick > "Disband Fleet": MOTD "Fleet is over", then kick everyone but you.
+
+        Boss-only (the Kick Pods gate), slide-confirmed (disband_dialog), and
+        the same shape as _kick_pods_from_fleet: Tk-thread gate, roster fetch
+        on a worker, the question on the Tk thread, the run
+        (kick_pods.disband, which owns the safety rules) on a worker, the
+        result modal on the Tk thread. On confirm an armed "Auto-update MOTD"
+        link is disarmed FIRST, through its one writer _motd_toggle_link, and
+        the run waits out an autopush PUT already in flight - else the
+        template would be written back over the message. ESI has no disband
+        call: the FC stays in a one-man fleet."""
+        import kick_pods
+        title = "Disband Fleet"
+        ok = [("OK", "Dark.TButton", None)]
+        fleet_id = getattr(self, "_last_polled_fleet_id", None)
+        is_boss = bool(getattr(self, "_last_polled_fleet_is_boss", False))
+        if not fleet_id or not is_boss:
+            self._themed_modal(
+                title,
+                "You must be the current fleet boss to disband the fleet.\n"
+                "Use 'Refresh fleet' after forming or joining a fleet, then try again.",
+                buttons=ok, accent=FG_YELLOW)
+            return
+        auth = self.esi_auth
+        own = getattr(auth, "character_id", None) if auth is not None else None
+        if auth is None or not auth.is_authenticated or not own:
+            self._themed_modal(title, "No authenticated character.",
+                               buttons=ok, accent=FG_YELLOW)
+            return
+
+        def fetch():
+            rows, err = [], None
+            try:
+                from zkill_monitor import resolve_name
+                members = auth.get_fleet_members(fleet_id=fleet_id)
+                if not isinstance(members, list):
+                    raise RuntimeError("the fleet roster did not load")
+                rows = sorted(
+                    ((cid, resolve_name(cid, "character") or str(cid))
+                     for cid in kick_pods.member_ids(members, own)),
+                    key=lambda r: (r[1].casefold(), r[0]))
+            except Exception as e:
+                err = str(e)
+            self._post_ui(_confirm, rows, err)
+
+        def _confirm(rows, err):
+            if err:
+                self._themed_modal(title, f"Could not read fleet members:\n{err}",
+                                   buttons=ok, accent=FG_RED)
+                return
+            if not rows:
+                self._themed_modal(title, "No one else is in the fleet.",
+                                   buttons=ok, accent=FG_ACCENT)
+                return
+            ids = [cid for cid, _n in rows]
+            try:
+                disband_dialog.open_dialog(self.root, [n for _c, n in rows],
+                                           lambda: _go(ids), log=log)
+            except Exception:
+                log.exception("Disband Fleet: the dialog could not be opened")
+                self._themed_modal(
+                    title, "The Disband Fleet dialog could not be opened. "
+                    "See fctool.log.", buttons=ok, accent=FG_RED)
+
+        def _go(ids):
+            if getattr(self, "_motd_link_enabled", False):
+                var = getattr(self, "_motd_link_var", None)
+                if var is not None:
+                    var.set(False)
+                    self._motd_toggle_link()      # the one writer; persists off
+                else:
+                    self._motd_link_enabled = False
+            threading.Thread(target=worker, args=(ids,), daemon=True).start()
+
+        def worker(ids):
+            try:
+                deadline = time.monotonic() + 15.0
+                while (getattr(self, "_motd_autopush_inflight", False)
+                       and time.monotonic() < deadline):
+                    time.sleep(0.1)
+                res = kick_pods.disband(auth, fleet_id, ids, own)
+            except Exception:
+                log.exception("Disband Fleet: the run failed")
+                res = None
+            self._post_ui(_done, res)
+
+        def _done(res):
+            text, tone = kick_pods.disband_result_text(res)
+            accent = {"ok": FG_GREEN, "warn": FG_YELLOW}.get(tone, FG_RED)
+            self._themed_modal(title, text, buttons=ok, accent=accent)
 
         threading.Thread(target=fetch, daemon=True).start()
 
