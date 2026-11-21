@@ -8,6 +8,11 @@ a Cynosural Field Generator fitted and fewer than ``min_activations`` lights of
 Liquid Ozone aboard. This module is the whole of the decision: the ESI reads,
 the toast and the Tk plumbing live in ``fc_gui``.
 
+Since 2026-11-21 ("Watch my ozone & fuel") the same undock/login edges also
+warn a jump-drive capital short on its racial isotope and a siege / triage fit
+short on strontium -- see the "jump fuel + strontium" section. The cyno-lit
+gamelog path stays ozone-only.
+
 **Layering.** Standard library plus ``dogma_data`` (the lazy, offline reader for
 the bundled ``fit_dogma.json.gz``) and ``app_log``. No Tk, no ``requests``, no
 ``esi_auth``, no ``fc_gui`` — pinned by an AST guard in
@@ -84,6 +89,8 @@ DEFAULTS = {
     "asset_ttl_s": 600,          # per-ship assets cache (the Characters tab's precedent)
     "assumed_skill_level": 5,    # ESI skills are not authorised — see the spec's decision 1
     "disabled_chars": [],        # lowercased char keys that are never warned
+    "min_isotopes": 40000,       # jump capital: warn below this much racial isotope (0 = off)
+    "min_strontium": 1000,       # siege / triage fitted: warn below this much strontium (0 = off)
 }
 
 #: Hard floor/ceiling on the toast hold so a corrupt config can neither flash
@@ -103,6 +110,11 @@ SKILL_LEVEL_MAX = 5
 #: from hammering the (expensive, fully-paginated) assets endpoint.
 ASSET_TTL_MIN = 60
 ASSET_TTL_MAX = 3600
+
+#: Ceilings on the two fuel thresholds -- they only stop a typo from turning
+#: every capital undock into a toast forever. 0 is "never warn", preserved.
+MIN_ISOTOPES_MAX = 1_000_000
+MIN_STRONTIUM_MAX = 100_000
 
 
 def is_enabled(block) -> bool:
@@ -165,6 +177,12 @@ def normalize_config(raw) -> dict:
     out["asset_ttl_s"] = _clamped_int(
         src.get("asset_ttl_s"), DEFAULTS["asset_ttl_s"],
         ASSET_TTL_MIN, ASSET_TTL_MAX)
+    out["min_isotopes"] = _clamped_int(
+        src.get("min_isotopes"), DEFAULTS["min_isotopes"],
+        0, MIN_ISOTOPES_MAX)
+    out["min_strontium"] = _clamped_int(
+        src.get("min_strontium"), DEFAULTS["min_strontium"],
+        0, MIN_STRONTIUM_MAX)
 
     chars = src.get("disabled_chars")
     if isinstance(chars, (list, tuple)):
@@ -637,6 +655,93 @@ def generator_short(type_id) -> str:
         return GENERATOR_SHORT_DEFAULT
 
 
+# -- jump fuel + strontium (2026-11-21, "Watch my ozone & fuel") --------------
+# The same undock/login edges also warn a jump-drive capital that is short on
+# its racial isotope, and a hull with a siege / triage module fitted that is
+# short on strontium. Spec: docs/superpowers/specs/
+# 2026-11-21-kick-disband-fuel-watch-design.md, Part B. Every fact is read off
+# the bundled dogma table (which carries 866 and 713 since that date); a fact
+# the table cannot answer is "nothing to say", never a guess.
+
+ATTR_JUMP_FUEL_TYPE = 866         # jumpDriveConsumptionType: the isotope a jump burns
+ATTR_JUMP_FUEL_AMOUNT = 868       # jumpDriveConsumptionAmount (default 2000)
+ATTR_CONSUMPTION_TYPE = 713       # consumptionType: what a module burns per cycle
+
+#: Black Ops jump on covert cynos with a drive of their own, but the owner
+#: scoped them out (a Non-goal) -- they stay watched for OZONE only.
+BLACK_OPS_GROUP = 898
+
+#: Strontium Clathrates, and the "Siege Module" group (Siege / Triage, and the
+#: industrial cores and Bastion that burn something else or nothing). The
+#: strontium rule is "a group-515 module whose 713 is strontium" -- the group
+#: half is what keeps an Entosis Link (713 = strontium, 1 unit a cycle) from
+#: reading as a siege fit; the 713 half is what keeps a Rorqual's industrial
+#: core (heavy water) out.
+STRONTIUM_TYPE_ID = 16275
+SIEGE_MODULE_GROUP = 515
+
+#: ESI's ``location_flag`` for a capital's fuel bay.
+FUEL_BAY_FLAG = "SpecializedFuelBay"
+
+ISOTOPE_NAMES = {
+    16274: "Helium Isotopes",
+    17887: "Oxygen Isotopes",
+    17888: "Nitrogen Isotopes",
+    17889: "Hydrogen Isotopes",
+}
+STRONTIUM_NAME = "Strontium"
+
+
+def jump_fuel_type(hull_type_id, group_id=None, dogma=None):
+    """The isotope type id ``hull_type_id``'s jump drive burns, or ``None``.
+
+    ``None`` unless the table gives the hull a ``jumpDriveConsumptionType``
+    (866) that is one of the four isotopes, the hull is not Black Ops, and its
+    ``jumpDriveConsumptionAmount`` (868) is positive. The table OMITS
+    default-valued attributes and 868 defaults to 2000, so an absent 868 next
+    to a real 866 reads as that default -- every SDE jump hull carries both.
+    ``group_id`` is the caller's group (the type catalog's); without one the
+    table's own group is used. Never raises."""
+    try:
+        hull = _int_or_none(hull_type_id)
+        if hull is None:
+            return None
+        view = _view(dogma)
+        group = _int_or_none(group_id)
+        if group is None:
+            group = _int_or_none(view.group(hull))
+        if group == BLACK_OPS_GROUP:
+            return None
+        attrs = view.attrs(hull)
+        fuel = _int_or_none(attrs.get(ATTR_JUMP_FUEL_TYPE))
+        if fuel not in ISOTOPE_NAMES:
+            return None
+        amount = attrs.get(ATTR_JUMP_FUEL_AMOUNT)
+        if amount is not None and float(amount) <= 0:
+            return None
+        return fuel
+    except Exception:                                       # pragma: no cover
+        return None
+
+
+def is_watched_hull(group_id, type_id, dogma=None) -> bool:
+    """Is an undock/login edge in this hull worth an assets read? A cyno hull
+    (ozone) or a jump capital (fuel). Never raises."""
+    return bool(is_cyno_hull(group_id, type_id)
+                or jump_fuel_type(type_id, group_id, dogma) is not None)
+
+
+def _burns_strontium(type_id, view) -> bool:
+    """A fitted siege / triage module: group 515 and 713 = strontium."""
+    try:
+        if _int_or_none(view.group(type_id)) != SIEGE_MODULE_GROUP:
+            return False
+        burns = _int_or_none(view.attrs(type_id).get(ATTR_CONSUMPTION_TYPE))
+        return burns == STRONTIUM_TYPE_ID
+    except Exception:                                       # pragma: no cover
+        return False
+
+
 # ── asset scan ───────────────────────────────────────────────────────────────
 
 #: ESI's ``location_flag`` for a fitted high slot is ``HiSlot0`` .. ``HiSlot7``.
@@ -660,10 +765,19 @@ class ShipCargo(NamedTuple):
     still a candidate, so "no generator has a known base" falls out of the
     same tie-break rather than needing its own branch. ``generator_type_ids``
     carries every fitted generator, in asset order, so a caller that needs the
-    full fit (not just the one that decides) still has it."""
+    full fit (not just the one that decides) still has it.
+
+    The fuel half (2026-11-21): ``isotopes`` = units of the hull's OWN racial
+    isotope aboard (0 when the scan was not told which one), ``strontium`` =
+    Strontium Clathrates aboard, both summed over the cargo hold AND the fuel
+    bay; ``strontium_fitted`` = a siege / triage module sits in a high slot.
+    Appended with defaults, so positional construction is unchanged."""
     generator_type_id: int | None = None
     ozone: int = 0
     generator_type_ids: tuple[int, ...] = ()
+    isotopes: int = 0
+    strontium: int = 0
+    strontium_fitted: bool = False
 
 
 #: "Nothing aboard" — the answer for an unknown ship and every degrade path.
@@ -679,8 +793,11 @@ def _int_or_none(value):
         return None
 
 
-def scan_ship_assets(assets, ship_item_id, dogma=None) -> ShipCargo:
-    """Reduce an ESI ``/assets/`` page to ``(fitted generator, ozone units)``.
+def scan_ship_assets(assets, ship_item_id, dogma=None,
+                     fuel_type_id=None) -> ShipCargo:
+    """Reduce an ESI ``/assets/`` page to a :class:`ShipCargo`: the fitted
+    generator(s), ozone units, and the fuel half (isotopes, strontium, and
+    whether a siege / triage module is fitted).
 
     Only rows whose ``location_id`` is ``ship_item_id`` count — the payload is
     the character's WHOLE asset list, so every other hangar, container and ship
@@ -710,12 +827,22 @@ def scan_ship_assets(assets, ship_item_id, dogma=None) -> ShipCargo:
     on the same Force Recon is a real fit, not a hypothetical), the returned
     ``generator_type_id`` is the one with the largest attr-714 base
     consumption — see :class:`ShipCargo`. Every fitted generator, in asset
-    order, is still returned via ``generator_type_ids``."""
+    order, is still returned via ``generator_type_ids``.
+
+    **Fuel (2026-11-21).** ``fuel_type_id`` (the hull's ``jump_fuel_type``)
+    selects which isotope counts; ``None`` counts none. Isotopes and strontium
+    are summed over ``Cargo`` AND ``SpecializedFuelBay`` -- a capital splits
+    them freely. ``strontium_fitted`` is True when a high-slot module is a
+    siege / triage module (see ``SIEGE_MODULE_GROUP``). Ozone counting is
+    unchanged: cargo hold only."""
     ship = _int_or_none(ship_item_id)
     if not ship:
         return EMPTY_CARGO
+    fuel = _int_or_none(fuel_type_id)
     generator_ids = []
-    ozone = 0
+    ozone = isotopes = strontium = 0
+    strontium_fitted = False
+    view = None
     try:
         rows = list(assets or ())
     except TypeError:
@@ -734,12 +861,24 @@ def scan_ship_assets(assets, ship_item_id, dogma=None) -> ShipCargo:
         if flag.startswith(HISLOT_PREFIX):
             if is_generator(type_id, dogma):
                 generator_ids.append(type_id)
-        elif flag == CARGO_FLAG and type_id == LIQUID_OZONE_TYPE_ID:
+            elif not strontium_fitted:
+                if view is None:
+                    view = _view(dogma)
+                strontium_fitted = _burns_strontium(type_id, view)
+        elif flag in (CARGO_FLAG, FUEL_BAY_FLAG):
             qty = _int_or_none(row.get("quantity"))
-            if qty and qty > 0:
+            if not qty or qty <= 0:
+                continue
+            if type_id == LIQUID_OZONE_TYPE_ID and flag == CARGO_FLAG:
                 ozone += qty
+            elif type_id == STRONTIUM_TYPE_ID:
+                strontium += qty
+            elif fuel is not None and type_id == fuel:
+                isotopes += qty
     generator = _choose_generator(generator_ids, dogma) if generator_ids else None
-    return ShipCargo(generator, ozone, tuple(generator_ids))
+    return ShipCargo(generator, ozone, tuple(generator_ids),
+                     isotopes=isotopes, strontium=strontium,
+                     strontium_fitted=strontium_fitted)
 
 
 def _choose_generator(type_ids, dogma):
@@ -857,11 +996,71 @@ def toast_body(hull_name, cargo, cost, min_activations) -> str:
     return verdict(cargo, cost, min_activations).text
 
 
+#: Title prefix when the edge warns on fuel / strontium but NOT ozone.
+FUEL_TOAST_TITLE = "Fuel"
+
+
+def _titled(prefix: str, char_name) -> str:
+    try:
+        name = str(char_name or "").strip()
+    except Exception:                                       # pragma: no cover
+        name = ""
+    return f"{prefix} - {name}" if name else prefix
+
+
+def fuel_lines(cargo, fuel_type_id, cfg=None) -> tuple:
+    """Every fuel / strontium shortfall, one toast line each -- e.g.
+    ``"12,400 Helium Isotopes (need 40,000)"``, ``"400 Strontium (need
+    1,000)"`` -- isotopes first. An empty tuple means nothing is short.
+
+    Isotopes are judged only for a known isotope ``fuel_type_id`` (the hull's
+    ``jump_fuel_type``); strontium only when a siege / triage module is fitted.
+    A threshold of 0 is off. ``cfg`` is the RAW or normalised block; it is
+    normalised here. Never raises."""
+    try:
+        if not isinstance(cargo, ShipCargo):
+            return ()
+        conf = normalize_config(cfg)
+        lines = []
+        fuel = _int_or_none(fuel_type_id)
+        need = conf["min_isotopes"]
+        have = max(0, _int_or_none(cargo.isotopes) or 0)
+        if fuel in ISOTOPE_NAMES and need > 0 and have < need:
+            lines.append(f"{have:,} {ISOTOPE_NAMES[fuel]} (need {need:,})")
+        need = conf["min_strontium"]
+        have = max(0, _int_or_none(cargo.strontium) or 0)
+        if cargo.strontium_fitted is True and need > 0 and have < need:
+            lines.append(f"{have:,} {STRONTIUM_NAME} (need {need:,})")
+        return tuple(lines)
+    except Exception:                                       # pragma: no cover
+        return ()
+
+
+def edge_toast(char_name, cargo, cost, fuel_short, min_activations) -> tuple:
+    """``(title, body)`` for an undock/login FIRE.
+
+    The title is ``"Ozone - <name>"`` when the ozone verdict fires, else
+    ``"Fuel - <name>"`` (the bare prefix for a blank name). The body is the
+    ozone phrase (only when ozone is short) followed by every ``fuel_short``
+    line, newline-joined -- one toast per edge, every shortfall listed. Never
+    raises."""
+    try:
+        if not isinstance(cargo, ShipCargo):
+            cargo = EMPTY_CARGO
+        v = verdict(cargo, cost, min_activations)
+        lines = [v.text] if v.fire else []
+        lines.extend(str(x) for x in (fuel_short or ()))
+        prefix = TOAST_TITLE if v.fire else FUEL_TOAST_TITLE
+        return _titled(prefix, char_name), "\n".join(lines)
+    except Exception:                                       # pragma: no cover
+        return TOAST_TITLE, ""
+
+
 # ── per-character latch ──────────────────────────────────────────────────────
 
-FIRE = "FIRE"              # a new low-ozone sighting: warn now
-HOLD = "HOLD"              # same ship, same ozone, already warned
-CLEAR = "CLEAR"            # no generator / enough lights / unknown: latch released
+FIRE = "FIRE"              # a new low-ozone / short-fuel sighting: warn now
+HOLD = "HOLD"              # same ship, same ozone + fuel figures, already warned
+CLEAR = "CLEAR"            # nothing low (or unknown): latch released
 SUPPRESSED = "SUPPRESSED"  # per-character opt-out
 
 
@@ -880,7 +1079,8 @@ class LastSeen(NamedTuple):
 
 @dataclass
 class _CharWatch:
-    #: The ``(ship_item_id, ozone)`` the last FIRE latched on, or None.
+    #: The ``(ship_item_id, ozone, isotopes, strontium)`` the last FIRE latched
+    #: on, or None.
     latch: tuple | None = None
     #: ``now`` of the most recent observation; None until the first one.
     seen: float | None = None
@@ -905,18 +1105,21 @@ class WatchState:
 
     ``observe_edge`` is called on an UNDOCK or LOGIN edge, not on every poll,
     and returns ``FIRE`` only when the sample is new evidence of a low hold.
-    The latch is keyed on ``(ship_item_id, ozone)``, which is what makes the
-    re-arming honest:
+    The latch is keyed on ``(ship_item_id, ozone, isotopes, strontium)``
+    (the fuel figures since 2026-11-21), which is what makes the re-arming
+    honest:
 
-    * the same ship with the same ozone is the same warning — ``HOLD``. That is
-      not a theoretical case: an undock and a login edge routinely arrive as a
-      burst for the same character (logging in undocked fires both), and the
-      wiring may re-observe an edge it is unsure about. ``HOLD`` is what
-      collapses that burst into one toast.
-    * a different ship, or the same ship after the number moved (a restock, or
-      our own cyno-lit decrement), is a new fact — ``FIRE``;
-    * a generator that is gone, or enough lights, releases the latch outright —
-      ``CLEAR``, so the next dip fires again.
+    * the same ship with the same figures is the same warning -- ``HOLD``.
+      That is not a theoretical case: an undock and a login edge routinely
+      arrive as a burst for the same character (logging in undocked fires
+      both), and the wiring may re-observe an edge it is unsure about.
+      ``HOLD`` is what collapses that burst into one toast.
+    * a different ship, or the same ship after any figure moved (a restock, a
+      jump's fuel burn, or our own cyno-lit decrement), is a new fact --
+      ``FIRE``;
+    * nothing low any more (no generator or enough lights, and no fuel
+      shortfall) releases the latch outright -- ``CLEAR``, so the next dip fires
+      again.
 
     ``blind_gap_s`` is the third release, and it exists for the same reason as
     ``implant_reminder.ReminderState.blind_gap_s``: **the signal is sampled,
@@ -976,13 +1179,19 @@ class WatchState:
 
     # -- the machine --------------------------------------------------------
     def observe_edge(self, char_key, ship_item_id, cargo, cost, now, *,
-                     disabled: bool = False) -> str:
+                     disabled: bool = False, fuel_short=()) -> str:
         """Advance one character by one undock/login edge; returns one verb.
 
         ``now`` is a monotonic timestamp. ``disabled`` is the per-character
         opt-out; like the implant reminder it still LATCHES, so turning a
         character back on mid-session does not retroactively fire for a ship it
-        was already sitting in. Never raises."""
+        was already sitting in.
+
+        ``fuel_short`` (2026-11-21) is :func:`fuel_lines`' answer for this
+        sample: the edge warns when the ozone verdict fires OR anything is
+        short, and the latch identity carries ``(isotopes, strontium)`` beside
+        the ozone figure, so a moved fuel figure is new evidence exactly like a
+        moved ozone one. Never raises."""
         k = _key(char_key)
         if not k:
             return CLEAR
@@ -996,14 +1205,21 @@ class WatchState:
             previous = st.seen
             st.seen = ts
             st.last = self._sample(st.last, ship_item_id, cargo, cost)
+            held = st.last.cargo
             ident = (st.last.ship_item_id,
-                     st.last.cargo.ozone if st.last.cargo is not None else None)
+                     held.ozone if held is not None else None,
+                     held.isotopes if held is not None else None,
+                     held.strontium if held is not None else None)
 
             if disabled:
                 st.latch = ident
                 return SUPPRESSED
 
-            if not verdict(st.last.cargo, cost, self.min_activations).fire:
+            try:
+                short = bool(fuel_short)
+            except Exception:
+                short = False
+            if not (verdict(held, cost, self.min_activations).fire or short):
                 st.latch = None
                 return CLEAR
 
@@ -1048,8 +1264,8 @@ class WatchState:
             if st.last.lit_at is not None and (ts - st.last.lit_at) < window:
                 return HOLD
 
-            burnt = ShipCargo(cargo.generator_type_id, max(0, cargo.ozone - per),
-                             cargo.generator_type_ids)
+            # _replace, not a positional rebuild: the fuel figures ride along.
+            burnt = cargo._replace(ozone=max(0, cargo.ozone - per))
             if burnt.ozone <= 0:
                 # Dry. Release the latch so the re-evaluation below FIREs even
                 # though the figure did not move — being out of ozone with a

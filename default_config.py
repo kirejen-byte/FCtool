@@ -254,6 +254,11 @@ DEFAULT_CONFIG = {
         # Show-oriented UX, disabled-oriented storage (mirrors the implant
         # reminder's): a brand-new character defaults to watched.
         "disabled_chars": [],
+        # The fuel half (2026-11-21, "Watch my ozone & fuel"): a jump capital
+        # with less of its racial isotope aboard, or a siege / triage fit with
+        # less strontium, warns on the same edges. 0 = off for that half.
+        "min_isotopes": 40000,
+        "min_strontium": 1000,
     },
     # Fleet-chat "range check" (range_check.py). Typing the keyword in Fleet
     # chat pops a short-lived window over the EVE client that posted it,

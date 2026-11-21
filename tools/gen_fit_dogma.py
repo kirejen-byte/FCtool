@@ -234,6 +234,11 @@ ATTR_WHITELIST_NAMES = (
     "mass", "signatureRadius", "duration", "reloadTime",
     "launcherSlotsLeft", "turretSlotsLeft", "power", "cpu",
     "shieldRechargeRate", "techLevel", "radius",
+    # "Watch my ozone & fuel" (ozone_watch.py, 2026-11-21): READ, never
+    # modified, so no modifier reference would keep them -- a hull's racial
+    # isotope (866) and the type a module burns per cycle (713: strontium for
+    # siege / triage, heavy water for an industrial core).
+    "jumpDriveConsumptionType", "consumptionType",
 )
 
 

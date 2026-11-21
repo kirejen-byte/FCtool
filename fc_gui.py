@@ -1665,7 +1665,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # Off -- and the HUD is a feature of its own.
         self._hud_fg_win32 = None
         # The single live intel-report pop-up (a clicked intel tile row), if
-        # any. Same one-at-a-time rule as _implant_toast / _range_check_toast.
+        # any. Same one-at-a-time rule as _range_check_toast.
         self._hud_detail_toast = None
         self._own_location_sid = None        # primary char (_refresh_current_system)
         self._own_location_mono = 0.0
@@ -1952,7 +1952,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._preview_pin_retries = set()
         # ── Implant-removal reminder (default ON; see implant_reminder.py) ───
         self._implant_reminder = None          # ImplantReminder (lazy, gated on config)
-        self._implant_toast = None             # the single live ClientToast, if any
+        self._implant_toasts = {}              # char key -> its live ClientToast
         # ── "Watch my ozone" (default ON; see ozone_watch.py) ────────────────
         # ONE WatchState for the whole app: the latch has to outlive the edge
         # that set it, and the gamelog decrement has to land on the SAME sample
@@ -1964,7 +1964,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # Monotonic stamp of the first observation, so "first sighting" can be
         # told from "FCTool just started" -- see _ozone_observe's login edge.
         self._ozone_started_at = None
-        self._ozone_toast = None               # the single live ClientToast, if any
+        self._ozone_toasts = {}                # char key -> its live ClientToast
         self._ozone_prev = {}                  # char key -> (docked, online) last sample
         self._ozone_ship = {}                  # char key -> (ship_type_id, ship_item_id)
         self._ozone_asset_cache = {}           # (key, ship_item_id) -> (monotonic, ShipCargo)
@@ -10419,8 +10419,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # value re-typed here.
         self._ozone_enabled_var = tk.BooleanVar(
             value=self._ozone_watch_enabled())
+        # "& fuel" since 2026-11-21: the same tick also watches jump fuel and
+        # siege / triage strontium (config block still `ozone_watch`).
         tk.Checkbutton(
-            implant_frame, text="Watch my ozone",
+            implant_frame, text="Watch my ozone & fuel",
             variable=self._ozone_enabled_var,
             font=("Consolas", 10, "bold"), fg=FG_TEXT, bg=BG_PANEL,
             selectcolor=BG_ENTRY, activebackground=BG_PANEL,
@@ -10735,21 +10737,30 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         move is to state the assumption rather than hide it."""
         try:
             cfg = ozone_watch.normalize_config(self.config.get("ozone_watch"))
-            need, level = cfg["min_activations"], cfg["assumed_skill_level"]
         except Exception:
             log.exception("[ozone] could not read the watch config")
-            need, level = (ozone_watch.DEFAULTS["min_activations"],
-                           ozone_watch.DEFAULTS["assumed_skill_level"])
+            cfg = ozone_watch.normalize_config(None)
+        need, level = cfg["min_activations"], cfg["assumed_skill_level"]
         # EVE writes skill levels in roman numerals; "Theory 5" would read as a
         # typo to the only person who will ever hover this.
         rank = {0: "0", 1: "I", 2: "II", 3: "III", 4: "IV", 5: "V"}.get(
             level, str(level))
+        # The fuel half (2026-11-21): one sentence per threshold that is ON.
+        fuel = []
+        if cfg["min_isotopes"] > 0:
+            fuel.append(f"A jump capital (not Black Ops) also warns with less "
+                        f"than {cfg['min_isotopes']:,} of its isotope in the "
+                        f"fuel bay and cargo.")
+        if cfg["min_strontium"] > 0:
+            fuel.append(f"A siege or triage module fitted warns with less "
+                        f"than {cfg['min_strontium']:,} Strontium aboard.")
+        fuel_text = (" " + " ".join(fuel)) if fuel else ""
         return (f"Warns when a character undocks, logs in, or lights a cyno "
                 f"with fewer than {need} lights of Liquid Ozone aboard. Cost "
                 f"uses the fitted generator and hull bonuses; skills are "
                 f"assumed at Cynosural Field Theory {rank} (ESI skills are "
-                f"not authorised). Requires native previews (the location "
-                f"poller and game-log watcher run with them).")
+                f"not authorised).{fuel_text} Requires native previews (the "
+                f"location poller and game-log watcher run with them).")
 
     def _populate_character_panels(self):
         """Build the character panels from scratch (static layout, no ESI calls)."""
@@ -25530,7 +25541,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         ``login`` picks the copy -- the login trigger's "logged in - ..."
         line instead of the dock trigger's -- and nothing else: same title,
-        same placement, same duration, same one-at-a-time rule.
+        same placement, same duration, same per-character rule.
 
         DELIBERATE DIVERGENCE from _preview_on_decloak: there is NO
         foreground-suppression here. The decloak alert suppresses when the
@@ -25538,14 +25549,15 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         it; for a dock reminder that is exactly the moment it must be seen. Do
         not "fix" this into a focus check.
 
-        One toast at a time (a newer one replaces the older). With no client rect
+        One live toast per character (a newer one for the same character
+        replaces the older; other characters' toasts stay). With no client rect
         there is nothing sensible to sit over, so the toast is skipped rather
         than parked at a guessed screen position."""
         try:
-            prev = self._implant_toast
+            toasts = self._implant_toasts
+            prev = toasts.pop(key, None)
             if prev is not None:
                 prev.dismiss()
-                self._implant_toast = None
             rect = self._implant_client_rect(key)
             if rect is None:
                 # The other way this feature can "not fire": the engine did its
@@ -25561,12 +25573,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             body = (implant_reminder.login_toast_body(char_name, names)
                     if login else
                     implant_reminder.toast_body(char_name, names))
+
+            def _free_slot():
+                # Late-bound `toast`: only frees the slot it still owns.
+                if toasts.get(key) is toast:
+                    toasts.pop(key, None)
+
             toast = client_toast.ClientToast(
                 self.root, implant_reminder.TOAST_TITLE, body,
                 seconds=cfg.get("toast_seconds", 12.0),
-                on_dismiss=lambda: setattr(self, "_implant_toast", None),
+                on_dismiss=_free_slot,
                 on_snooze=(lambda: rem.snooze(key)) if rem is not None else None)
-            self._implant_toast = toast
+            toasts[key] = toast
             toast.show(rect)
         except Exception:
             log.exception("[implant] toast failed for %s", key)
@@ -25616,8 +25634,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         roster). Called once per poller pass, on the poller thread.
 
         Four dicts and a set hang off a character key, plus the engine's own
-        latch. Without this they accumulate for every character ever previewed
-        in a session and, worse, go STALE: a client closed and reopened an hour
+        latch. (``_ozone_toasts`` is deliberately NOT pruned here: it belongs
+        to the Tk thread and frees itself on dismiss; this runs on the poller.)
+        Without this they accumulate for every character ever previewed in a
+        session and, worse, go STALE: a client closed and reopened an hour
         later would come back with its old ``(docked, online)`` sample, its old
         ship memo and its old latch, so the first poll pass could read a
         phantom undock edge off a sample from the previous session -- or,
@@ -25675,8 +25695,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             keeps that from firing for the whole roster at startup, which is the
             case the strict rule was protecting.
 
-        WHAT AN EDGE COSTS. A scope-less token, a non-cyno hull or an unknown
-        ship all return before /assets/ is touched. Past those, the per-ship
+        WHAT AN EDGE COSTS. A scope-less token, a hull that is neither
+        cyno-capable nor a jump capital (ozone_watch.is_watched_hull) or an
+        unknown ship all return before /assets/ is touched. Past those, the per-ship
         cache (``asset_ttl_s``, 600 s) answers a redock/undock inside ten
         minutes for free -- ESI's own cache on that endpoint is longer anyway.
 
@@ -25757,13 +25778,15 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             catalog = getattr(self, "type_catalog", None)
             group = catalog.group_of(ship_type_id) if catalog is not None else None
             # BOTH ids: a Venture lives in group 25, which is not cyno-capable
-            # at large, and is whitelisted by type instead.
-            if not ozone_watch.is_cyno_hull(group, ship_type_id):
+            # at large, and is whitelisted by type instead. Since 2026-11-21 a
+            # jump capital is watched too (its fuel), cyno or not.
+            if not ozone_watch.is_watched_hull(group, ship_type_id):
                 hull = catalog.resolve_name(ship_type_id) if catalog is not None else None
                 log.info("[ozone] %s %s edge: hull %s (type %s, group %s) "
-                         "is not cyno-capable - skipped",
+                         "is not cyno-capable or a jump capital - skipped",
                          key, edge_kind, hull or "?", ship_type_id, group)
                 return
+            fuel_type = ozone_watch.jump_fuel_type(ship_type_id, group)
             if not ship_item_id:
                 log.info("[ozone] %s %s edge: no ship_item_id - skipped",
                          key, edge_kind)
@@ -25783,15 +25806,17 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     log.info("[ozone] %s %s edge: assets pull "
                              "incomplete/empty - no sample", key, edge_kind)
                     return                      # no sample; nothing cached
-                cargo = ozone_watch.scan_ship_assets(assets, ship_item_id)
+                cargo = ozone_watch.scan_ship_assets(
+                    assets, ship_item_id, fuel_type_id=fuel_type)
                 self._ozone_asset_cache[cache_key] = (now, cargo)
 
             cost = ozone_watch.effective_ozone_cost(
                 cargo.generator_type_id, ship_type_id,
                 cfg["assumed_skill_level"])
+            fuel_short = ozone_watch.fuel_lines(cargo, fuel_type, cfg)
             verb = self._ozone_watch_state(cfg).observe_edge(
                 key, ship_item_id, cargo, cost, now,
-                disabled=key in cfg["disabled_chars"])
+                disabled=key in cfg["disabled_chars"], fuel_short=fuel_short)
             hull = ""
             if catalog is not None:
                 hull = catalog.resolve_name(ship_type_id) or ""
@@ -25800,14 +25825,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                         else "no generator fitted")
             lights = ozone_watch.lights_left(cargo.ozone, cost)
             cargo_summary = f"{gen_desc}, {cargo.ozone} ozone, {lights} lights"
+            if fuel_type in ozone_watch.ISOTOPE_NAMES:
+                cargo_summary += (f", {cargo.isotopes} "
+                                  f"{ozone_watch.ISOTOPE_NAMES[fuel_type]}")
+            if cargo.strontium_fitted:
+                cargo_summary += f", {cargo.strontium} strontium"
             log.info("[ozone] %s %s edge: %s - %s (%s)",
                      key, edge_kind, hull or "?", cargo_summary, verb)
             if verb != ozone_watch.FIRE:
                 return
-            self._post_ui(
-                self._ozone_show_toast, key, name,
-                ozone_watch.toast_body(hull, cargo, cost,
-                                       cfg["min_activations"]))
+            title, body = ozone_watch.edge_toast(
+                name, cargo, cost, fuel_short, cfg["min_activations"])
+            self._post_ui(self._ozone_show_toast, key, name, body, title)
         except Exception:
             log.exception("[ozone] watch hook failed")
 
@@ -25862,8 +25891,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         except Exception:
             log.exception("[ozone] cyno-lit hook failed")
 
-    def _ozone_show_toast(self, key, char_name, body):
+    def _ozone_show_toast(self, key, char_name, body, title=None):
         """Tk-thread: raise the transient over-client toast for ONE character.
+
+        ``title`` (2026-11-21) is the edge's own title from
+        ozone_watch.edge_toast ("Fuel - <name>" when only fuel is short); None
+        keeps the ozone title. A multi-line body (one line per shortfall) gets
+        a box tall enough for it (client_toast.height_for).
 
         Same contract as _implant_show_toast, and it shares that method's client
         lookup (_implant_client_rect is a pure read-only rect lookup keyed on a
@@ -25871,8 +25905,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         suppression, for the same reason: a pilot staring at the client he is
         about to undock is exactly who this is for.
 
-        One ozone toast at a time, tracked separately from the implant one so
-        neither feature can dismiss the other's window. With no client rect
+        One ozone toast per CHARACTER (2026-11-21; was one in total, so alts
+        undocking together dismissed each other's toasts although each floats
+        over its own client): a new toast for the same key replaces that key's
+        old one, and on_dismiss frees the slot only while it still holds THAT
+        toast, so the dict cannot leak or evict a successor. Tracked separately
+        from the implant toast so neither feature can dismiss the other's
+        window. No on_snooze is wired, so the hint drops the default
+        "right-click: not this session" promise. With no client rect
         there is nothing sensible to sit over, so the toast is skipped rather
         than parked at a guessed screen position -- logged, because a silent
         skip is indistinguishable from a missed edge. The title names the
@@ -25880,10 +25920,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         -- tiled, overlapping, or seen only at a glance -- a bare "Ozone"
         does not say which one."""
         try:
-            prev = self._ozone_toast
+            toasts = self._ozone_toasts
+            prev = toasts.pop(key, None)
             if prev is not None:
                 prev.dismiss()
-                self._ozone_toast = None
             rect = self._implant_client_rect(key)
             if rect is None:
                 # The other way this feature can "not fire": the engine did its
@@ -25891,14 +25931,23 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 # line too, so a skipped warning is still a warning somewhere
                 # -- a log that only says "skipped" cannot be told from noise.
                 log.warning("[ozone] no on-screen EVE client for %s - toast "
-                            "skipped: %s", char_name or key, body)
+                            "skipped: %s", char_name or key,
+                            str(body).replace("\n", " | "))
                 return
             cfg = ozone_watch.normalize_config(self.config.get("ozone_watch"))
+
+            def _free_slot():
+                # Late-bound `toast`: only frees the slot it still owns.
+                if toasts.get(key) is toast:
+                    toasts.pop(key, None)
+
             toast = client_toast.ClientToast(
-                self.root, ozone_watch.toast_title(char_name), body,
+                self.root, title or ozone_watch.toast_title(char_name), body,
                 seconds=cfg["toast_seconds"],
-                on_dismiss=lambda: setattr(self, "_ozone_toast", None))
-            self._ozone_toast = toast
+                height=client_toast.height_for(str(body).count("\n") + 1),
+                hint="click to dismiss",
+                on_dismiss=_free_slot)
+            toasts[key] = toast
             toast.show(rect)
         except Exception:
             log.exception("[ozone] toast failed for %s", key)
@@ -26176,7 +26225,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         """Tk thread: raise the range summary over the posting client's window.
 
         One toast at a time -- a newer range check replaces an older one rather
-        than stacking, the same rule _implant_show_toast follows. No fallback
+        than stacking. No fallback
         position is offered: the hook already refused to get this far without a
         client rect, and parking the window over something else is worse than
         showing nothing."""
@@ -26502,8 +26551,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         """Raise the refit outcome over the posting client's window.
 
         ONE live refit toast at a time -- a newer outcome replaces the older
-        one rather than stacking, the rule _range_check_show_toast and
-        _implant_show_toast both follow. That also covers the chooser: picking
+        one rather than stacking, the rule _range_check_show_toast follows.
+        That also covers the chooser: picking
         a row runs the swap, whose toast dismisses the chooser on its way in.
 
         Blank lines are dropped rather than rendered as empty rows -- the
