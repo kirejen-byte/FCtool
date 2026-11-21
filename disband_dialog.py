@@ -59,6 +59,11 @@ AUTOPUSH_WAIT_S = 15.0
 _POLL_S = 0.1
 
 BUSY_TEXT = "Disband Fleet is already running."
+#: The slide confirmed but the run never started (the disarm raised, or the
+#: worker thread could not start): nothing went to ESI.
+NOT_STARTED_TEXT = ("The disband run could not start, so nothing was sent: "
+                    "the MOTD was not set and nobody was kicked. See "
+                    "fctool.log.")
 NOT_BOSS_TEXT = ("You must be the current fleet boss to disband the fleet.\n"
                  "Use 'Refresh fleet' after forming or joining a fleet, then "
                  "try again.")
@@ -195,14 +200,16 @@ class DisbandFlow:
 
     def _go(self, ids):
         """The slide confirmed: link off FIRST, then the run on a worker. It
-        never raises (the dialog would only log it): a failure here shows the
-        "run failed" result."""
+        never raises (the dialog would only log it): a failure here sent
+        nothing to ESI, so it says exactly that (NOT the "run failed" result,
+        which is for a failure inside the run)."""
         try:
             self._link_off = bool(self._disarm_link())
             _spawn(self._work, ids)
         except Exception:
             self._log.exception("Disband Fleet: the run could not start")
-            self._finish(None, False)
+            tail = [kick_pods.LINK_OFF_LINE] if self._link_off else []
+            self._end("\n".join([NOT_STARTED_TEXT] + tail), "error")
 
     def _work(self, ids):                  # worker
         res, risk = None, False

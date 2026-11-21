@@ -4555,7 +4555,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                               command=lambda: self._post_kick_menu(kick_btn))
         attach_tooltip(kick_btn,
                        "Kick Pods: kick everyone in a capsule.\n"
-                       "Disband Fleet: set the MOTD to \"Fleet is over\", then "
+                       "Disband Fleet: set the MOTD to "
+                       f"\"{disband_dialog.DISBAND_MOTD}\", then "
                        "kick everyone but you.\nESI cannot disband a fleet, so "
                        "you stay in a one-man fleet. Both ask first.")
         close_btn = ttk.Button(role_header, text="Close Clients", style="Red.TButton",

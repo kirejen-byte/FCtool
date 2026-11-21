@@ -44,7 +44,7 @@ def member_ids(members, own_id=None) -> set:
 
 
 def kick_confirmed(auth, fleet_id, confirmed_ids, capsule_ids=(), own_id=None,
-                   *, select=None):
+                   *, select=None, recheck=False):
     """Kick the confirmed pilots who are STILL candidates on a fresh roster.
 
     `select` is a ``(members) -> set`` candidate function; None (the default)
@@ -58,28 +58,63 @@ def kick_confirmed(auth, fleet_id, confirmed_ids, capsule_ids=(), own_id=None,
     confirmed pilots who are no longer candidates (left, swapped ship, or
     gone). Stops after MAX_CONSECUTIVE_FAILURES DELETE failures in a row; the
     pilots not tried count as skipped.
+
+    ``recheck`` (Disband only; Kick Pods leaves it False): a failure streak
+    re-reads the roster instead of stopping at once, because pilots leave on
+    their own once the MOTD says the fleet is over and a DELETE for a pilot
+    who already left fails. An unreadable re-read stops (the boss role is
+    probably gone). A readable one moves the streak's pilots who are no
+    longer candidates from failed to skipped, drops the untried ones who
+    left (skipped too), and goes on with the rest - only ever a subset of
+    the first list. A re-read where every streak pilot is still there means
+    real failures: stop. At most ``len(todo) // MAX_CONSECUTIVE_FAILURES +
+    1`` re-reads. ESI's status code is never consulted.
     """
     members = auth.get_fleet_members(fleet_id=fleet_id)
     if not isinstance(members, list):
         return 0, 0, 0, False
-    if select is None:
-        still = pod_ids(members, capsule_ids, own_id)
-    else:
-        still = set(select(members) or ())
-        still.discard(own_id)
+
+    def candidates(ms):
+        if select is None:
+            return pod_ids(ms, capsule_ids, own_id)
+        out = set(select(ms) or ())
+        out.discard(own_id)
+        return out
+
+    still = candidates(members)
     todo = [c for c in confirmed_ids if c in still and c != own_id]
     skipped = len(confirmed_ids) - len(todo)
-    kicked = failed = streak = 0
-    for i, cid in enumerate(todo):
+    rereads = len(todo) // MAX_CONSECUTIVE_FAILURES + 1 if recheck else 0
+    queue = list(todo)
+    kicked = failed = 0
+    streak = []                    # ids of the current run of failed DELETEs
+    while queue:
+        cid = queue.pop(0)
         if auth.esi_delete(f"/fleets/{fleet_id}/members/{cid}/"):
             kicked += 1
-            streak = 0
-        else:
-            failed += 1
-            streak += 1
-            if streak >= MAX_CONSECUTIVE_FAILURES:
-                skipped += len(todo) - i - 1
-                break
+            streak = []
+            continue
+        failed += 1
+        streak.append(cid)
+        if len(streak) < MAX_CONSECUTIVE_FAILURES:
+            continue
+        if rereads <= 0:
+            break
+        rereads -= 1
+        members = auth.get_fleet_members(fleet_id=fleet_id)
+        if not isinstance(members, list):
+            break
+        now = candidates(members)
+        gone = [c for c in streak if c not in now]
+        if not gone:
+            break                  # all still there: real failures
+        failed -= len(gone)
+        skipped += len(gone)
+        left = [c for c in queue if c in now]
+        skipped += len(queue) - len(left)
+        queue = left
+        streak = []
+    skipped += len(queue)          # the pilots never tried
     return kicked, failed, skipped, True
 
 
@@ -95,7 +130,9 @@ def disband(auth, fleet_id, confirmed_ids, own_id):
     2. The MOTD is written. A failure (False or a raise) does not stop the
        kicks; it is reported through `motd_ok`.
     3. ``kick_confirmed`` re-reads the roster and kicks every confirmed pilot
-       still in the fleet, never `own_id`.
+       still in the fleet, never `own_id`. Pilots leave on their own once the
+       MOTD is up, so a failure streak re-reads the roster (``recheck``)
+       instead of stopping: the leavers count as skipped, not failed.
     """
     if not own_id:
         return None, 0, 0, 0, False
@@ -107,7 +144,7 @@ def disband(auth, fleet_id, confirmed_ids, own_id):
         motd_ok = False
     kicked, failed, skipped, reread_ok = kick_confirmed(
         auth, fleet_id, confirmed_ids, own_id=own_id,
-        select=lambda members: member_ids(members, own_id))
+        select=lambda members: member_ids(members, own_id), recheck=True)
     return motd_ok, kicked, failed, skipped, reread_ok
 
 
@@ -124,6 +161,10 @@ LINK_OFF_LINE = ('"Auto-update MOTD" was turned off; tick it again to '
 MOTD_RISK_LINE = ('An "Auto-update MOTD" push was still running and may have '
                   f'written the template over "{DISBAND_MOTD}". Check the '
                   "MOTD in game.")
+#: The same risk when the disband message itself was never accepted.
+MOTD_FAILED_RISK_LINE = ('The MOTD could not be set, and an "Auto-update '
+                         'MOTD" push was still running. Check the MOTD in '
+                         "game.")
 
 
 def disband_result_text(res, *, link_off=False, motd_risk=False):
@@ -148,7 +189,7 @@ def disband_result_text(res, *, link_off=False, motd_risk=False):
                 "the MOTD was not set and nobody was kicked.")
         return "\n".join([head] + tail), "error"
     if motd_risk:
-        motd_line = MOTD_RISK_LINE
+        motd_line = MOTD_RISK_LINE if motd_ok else MOTD_FAILED_RISK_LINE
     elif motd_ok:
         motd_line = f'The fleet MOTD was set to "{DISBAND_MOTD}".'
     else:
@@ -167,5 +208,10 @@ def disband_result_text(res, *, link_off=False, motd_risk=False):
                      "you lost the boss role).")
         tone = "warn"
     lines += tail
-    lines.append("You are still in a one-man fleet: ESI has no disband call.")
+    if failed or skipped:
+        lines.append("You are still in the fleet, with any pilots who were "
+                     "not kicked: ESI has no disband call.")
+    else:
+        lines.append("You are still in a one-man fleet: ESI has no disband "
+                     "call.")
     return "\n".join(lines), tone
