@@ -13,7 +13,17 @@ one-man fleet. The caller disarms the "Auto-update MOTD" link BEFORE the run
 """
 from __future__ import annotations
 
+import time
+from typing import NamedTuple, Optional
+
 MAX_CONSECUTIVE_FAILURES = 3
+#: Disband re-reads the roster at most this many times per run (each one may
+#: wait out MEMBERS_CACHE_S), which bounds the run's length.
+MAX_RECHECKS = 5
+#: GET /fleets/{id}/members is server-cached ~5 s and the ETag layer replays
+#: the same body inside that window: a re-read waits this long after the
+#: previous read so it sees a fresh roster.
+MEMBERS_CACHE_S = 5.1
 
 #: The MOTD Disband Fleet writes before it kicks anyone.
 DISBAND_MOTD = "Fleet is over"
@@ -44,7 +54,7 @@ def member_ids(members, own_id=None) -> set:
 
 
 def kick_confirmed(auth, fleet_id, confirmed_ids, capsule_ids=(), own_id=None,
-                   *, select=None, recheck=False):
+                   *, select=None, recheck=False, clock=None, sleep=None):
     """Kick the confirmed pilots who are STILL candidates on a fresh roster.
 
     `select` is a ``(members) -> set`` candidate function; None (the default)
@@ -59,20 +69,45 @@ def kick_confirmed(auth, fleet_id, confirmed_ids, capsule_ids=(), own_id=None,
     gone). Stops after MAX_CONSECUTIVE_FAILURES DELETE failures in a row; the
     pilots not tried count as skipped.
 
-    ``recheck`` (Disband only; Kick Pods leaves it False): a failure streak
-    re-reads the roster instead of stopping at once, because pilots leave on
-    their own once the MOTD says the fleet is over and a DELETE for a pilot
-    who already left fails. An unreadable re-read stops (the boss role is
-    probably gone). A readable one moves the streak's pilots who are no
-    longer candidates from failed to skipped, drops the untried ones who
-    left (skipped too), and goes on with the rest - only ever a subset of
-    the first list. A re-read where every streak pilot is still there means
-    real failures: stop. At most ``len(todo) // MAX_CONSECUTIVE_FAILURES +
-    1`` re-reads. ESI's status code is never consulted.
+    ``recheck`` (Disband only; Kick Pods leaves it False - and then `clock` /
+    `sleep` are never called): see ``_kick_run``. ``disband`` calls that
+    directly, so it can tell the pilots who left from the ones never tried.
+    """
+    kicked, failed, skipped, ok, left = _kick_run(
+        auth, fleet_id, confirmed_ids, capsule_ids, own_id, select=select,
+        recheck=recheck, clock=clock, sleep=sleep)
+    return kicked, failed, skipped + left, ok
+
+
+def _kick_run(auth, fleet_id, confirmed_ids, capsule_ids, own_id, *, select,
+              recheck, clock, sleep):
+    """``kick_confirmed``'s body. Returns (kicked, failed, skipped, reread_ok,
+    left): `left` counts the confirmed pilots found no longer candidates (for
+    Disband: gone from the fleet), `skipped` the rest not kicked (never
+    tried, or `own_id`). kicked + failed + skipped + left ==
+    len(confirmed_ids) whenever reread_ok.
+
+    ``recheck`` (Disband only): a failure streak re-reads the roster instead
+    of stopping at once, because pilots leave on their own once the MOTD says
+    the fleet is over and a DELETE for a pilot who already left fails. The
+    members GET is server-cached (~5 s) and the ETag layer replays the cached
+    body, so each re-read first waits until MEMBERS_CACHE_S have passed since
+    the previous read (``clock`` / ``sleep``, default time.monotonic /
+    time.sleep). An unreadable re-read stops (the boss role is probably
+    gone). A readable one moves the streak's pilots who are no longer
+    candidates from failed to left, drops the untried ones who left (left
+    too), and goes on with the rest - only ever a subset of the first list.
+    A re-read where every streak pilot is still there means real failures:
+    stop. At most MAX_RECHECKS re-reads; past that a streak stops the run.
+    ESI's status code is never consulted.
     """
     members = auth.get_fleet_members(fleet_id=fleet_id)
     if not isinstance(members, list):
-        return 0, 0, 0, False
+        return 0, 0, 0, False, 0
+    if recheck:
+        clock = clock or time.monotonic
+        sleep = sleep or time.sleep
+        read_at = clock()
 
     def candidates(ms):
         if select is None:
@@ -83,8 +118,9 @@ def kick_confirmed(auth, fleet_id, confirmed_ids, capsule_ids=(), own_id=None,
 
     still = candidates(members)
     todo = [c for c in confirmed_ids if c in still and c != own_id]
-    skipped = len(confirmed_ids) - len(todo)
-    rereads = len(todo) // MAX_CONSECUTIVE_FAILURES + 1 if recheck else 0
+    left = sum(1 for c in confirmed_ids if c != own_id and c not in still)
+    skipped = len(confirmed_ids) - len(todo) - left
+    rereads = MAX_RECHECKS if recheck else 0
     queue = list(todo)
     kicked = failed = 0
     streak = []                    # ids of the current run of failed DELETEs
@@ -101,7 +137,11 @@ def kick_confirmed(auth, fleet_id, confirmed_ids, capsule_ids=(), own_id=None,
         if rereads <= 0:
             break
         rereads -= 1
+        wait = MEMBERS_CACHE_S - (clock() - read_at)
+        if wait > 0:
+            sleep(wait)            # else the re-read replays the cached roster
         members = auth.get_fleet_members(fleet_id=fleet_id)
+        read_at = clock()
         if not isinstance(members, list):
             break
         now = candidates(members)
@@ -109,43 +149,59 @@ def kick_confirmed(auth, fleet_id, confirmed_ids, capsule_ids=(), own_id=None,
         if not gone:
             break                  # all still there: real failures
         failed -= len(gone)
-        skipped += len(gone)
-        left = [c for c in queue if c in now]
-        skipped += len(queue) - len(left)
-        queue = left
+        left += len(gone)
+        kept = [c for c in queue if c in now]
+        left += len(queue) - len(kept)
+        queue = kept
         streak = []
     skipped += len(queue)          # the pilots never tried
-    return kicked, failed, skipped, True
+    return kicked, failed, skipped, True, left
 
 
-def disband(auth, fleet_id, confirmed_ids, own_id):
+class DisbandResult(NamedTuple):
+    """``disband``'s return. `skipped`: confirmed pilots never tried (the run
+    stopped early); `left`: confirmed pilots who left the fleet on their own
+    before their kick. kicked + failed + skipped + left == the confirmed
+    count whenever reread_ok."""
+    motd_ok: Optional[bool]
+    kicked: int
+    failed: int
+    skipped: int
+    reread_ok: bool
+    left: int = 0
+
+
+def disband(auth, fleet_id, confirmed_ids, own_id, *, clock=None, sleep=None):
     """Disband Fleet's run: MOTD DISBAND_MOTD, then kick the confirmed pilots.
 
-    Returns (motd_ok, kicked, failed, skipped, reread_ok). `motd_ok` is None
-    when the MOTD was never attempted, else whether ESI accepted it.
+    Returns a ``DisbandResult`` (motd_ok, kicked, failed, skipped, reread_ok,
+    left). `motd_ok` is None when the MOTD was never attempted, else whether
+    ESI accepted it.
 
     1. The roster is read first. Unreadable (None / not a list - ESI answers
        403 once the FC is no longer the boss) touches NOTHING: no MOTD, no
        kick. No `own_id` touches nothing either (it could not be kept safe).
     2. The MOTD is written. A failure (False or a raise) does not stop the
        kicks; it is reported through `motd_ok`.
-    3. ``kick_confirmed`` re-reads the roster and kicks every confirmed pilot
+    3. ``_kick_run`` re-reads the roster and kicks every confirmed pilot
        still in the fleet, never `own_id`. Pilots leave on their own once the
-       MOTD is up, so a failure streak re-reads the roster (``recheck``)
-       instead of stopping: the leavers count as skipped, not failed.
+       MOTD is up, so a failure streak re-reads the roster (``recheck``,
+       after the members cache expires - `clock` / `sleep`) instead of
+       stopping: the leavers count as `left`, not failed.
     """
     if not own_id:
-        return None, 0, 0, 0, False
+        return DisbandResult(None, 0, 0, 0, False)
     if not isinstance(auth.get_fleet_members(fleet_id=fleet_id), list):
-        return None, 0, 0, 0, False
+        return DisbandResult(None, 0, 0, 0, False)
     try:
         motd_ok = bool(auth.set_fleet_motd(fleet_id, DISBAND_MOTD))
     except Exception:
         motd_ok = False
-    kicked, failed, skipped, reread_ok = kick_confirmed(
-        auth, fleet_id, confirmed_ids, own_id=own_id,
-        select=lambda members: member_ids(members, own_id), recheck=True)
-    return motd_ok, kicked, failed, skipped, reread_ok
+    kicked, failed, skipped, reread_ok, left = _kick_run(
+        auth, fleet_id, confirmed_ids, (), own_id,
+        select=lambda members: member_ids(members, own_id), recheck=True,
+        clock=clock, sleep=sleep)
+    return DisbandResult(motd_ok, kicked, failed, skipped, reread_ok, left)
 
 
 def pilots(n: int) -> str:
@@ -168,7 +224,11 @@ MOTD_FAILED_RISK_LINE = ('The MOTD could not be set, and an "Auto-update '
 
 
 def disband_result_text(res, *, link_off=False, motd_risk=False):
-    """The result modal for ``disband``'s return (None = the run raised).
+    """The result modal for ``disband``'s return (None = the run raised; a
+    bare 5-tuple without `left` reads as left 0).
+
+    "One-man fleet" only when everyone not kicked left on their own (nothing
+    failed, nobody untried).
 
     ``link_off``: the run turned "Auto-update MOTD" off first (so something
     DID change even when nothing else did). ``motd_risk``: an autopush PUT
@@ -181,7 +241,8 @@ def disband_result_text(res, *, link_off=False, motd_risk=False):
             ["The disband run failed; the MOTD may have been set and some "
              "pilots may already have been kicked. See fctool.log."] + tail
         ), "error"
-    motd_ok, kicked, failed, skipped, reread_ok = res
+    motd_ok, kicked, failed, skipped, reread_ok = tuple(res)[:5]
+    left = res[5] if len(res) > 5 else 0
     if motd_ok is None:
         head = ("Could not read the fleet members: the MOTD was not set and "
                 "nobody was kicked." if link_off else
@@ -199,9 +260,11 @@ def disband_result_text(res, *, link_off=False, motd_risk=False):
                            "so nobody was kicked."] + tail), "error"
     lines = [f"Kicked {pilots(kicked)} from the fleet.", motd_line]
     tone = "ok" if motd_ok and not motd_risk else "warn"
+    if left:
+        lines.append(f"{left} left on their own.")
     if skipped:
-        lines.append(f"{skipped} not kicked (left the fleet, or the run "
-                     "stopped after repeated failures).")
+        lines.append(f"{skipped} not kicked (the run stopped after repeated "
+                     "failures).")
         tone = "warn"
     if failed:
         lines.append(f"{failed} could not be kicked (they may have left, or "

@@ -85,15 +85,17 @@ def run(auth, fleet_id, ids, own_id, *, inflight, clock=None, sleep=None,
         wait_s=AUTOPUSH_WAIT_S):
     """Disband's worker half. Returns ``(res, motd_risk)``.
 
-    ``res`` is ``kick_pods.disband``'s tuple. ``motd_risk`` is True when an
-    autopush PUT was still in flight after the run and the disband message
-    could not be written back after it (the template may be what the fleet
-    sees). ``inflight`` reads the autopush flag (the link is already off, so
-    no NEW autopush starts; only one already dispatched can land)."""
+    ``res`` is ``kick_pods.disband``'s ``DisbandResult`` (its roster
+    re-reads wait on the same ``clock`` / ``sleep``). ``motd_risk`` is True
+    when an autopush PUT was still in flight after the run and the disband
+    message could not be written back after it (the template may be what the
+    fleet sees). ``inflight`` reads the autopush flag (the link is already
+    off, so no NEW autopush starts; only one already dispatched can land)."""
     clock = clock or time.monotonic
     sleep = sleep or time.sleep
     cleared = wait_clear(inflight, wait_s, clock=clock, sleep=sleep)
-    res = kick_pods.disband(auth, fleet_id, ids, own_id)
+    res = kick_pods.disband(auth, fleet_id, ids, own_id, clock=clock,
+                            sleep=sleep)
     if cleared or res[0] is None:           # None: nothing was touched
         return res, False
     if not wait_clear(inflight, wait_s, clock=clock, sleep=sleep):
@@ -104,7 +106,7 @@ def run(auth, fleet_id, ids, own_id, *, inflight, clock=None, sleep=None,
         again = False
     if not again:
         return res, True
-    return (True,) + tuple(res[1:]), False
+    return kick_pods.DisbandResult(True, *res[1:]), False
 
 
 def _spawn(target, *args):
@@ -228,10 +230,12 @@ class DisbandFlow:
                 self._on_motd_set(DISBAND_MOTD)
             except Exception:
                 self._log.exception("Disband Fleet: the MOTD baseline failed")
-        motd, kicked, failed, skipped, reread = res or (None, 0, 0, 0, None)
+        motd, kicked, failed, skipped, reread, left = (
+            kick_pods.DisbandResult(*res) if res is not None
+            else (None, 0, 0, 0, None, 0))
         self._log.info("Disband Fleet: motd=%s risk=%s kicked=%d failed=%d "
-                       "skipped=%d reread=%s link_off=%s", motd, risk, kicked,
-                       failed, skipped, reread, self._link_off)
+                       "skipped=%d left=%d reread=%s link_off=%s", motd, risk,
+                       kicked, failed, skipped, left, reread, self._link_off)
         self._notify(*kick_pods.disband_result_text(
             res, link_off=self._link_off, motd_risk=risk))
 
