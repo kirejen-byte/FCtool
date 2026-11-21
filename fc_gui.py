@@ -1663,7 +1663,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # Off -- and the HUD is a feature of its own.
         self._hud_fg_win32 = None
         # The single live intel-report pop-up (a clicked intel tile row), if
-        # any. Same one-at-a-time rule as _implant_toast / _range_check_toast.
+        # any. Same one-at-a-time rule as _range_check_toast.
         self._hud_detail_toast = None
         self._own_location_sid = None        # primary char (_refresh_current_system)
         self._own_location_mono = 0.0
@@ -25517,7 +25517,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         ``login`` picks the copy -- the login trigger's "logged in - ..."
         line instead of the dock trigger's -- and nothing else: same title,
-        same placement, same duration, same one-at-a-time rule.
+        same placement, same duration, same per-character rule.
 
         DELIBERATE DIVERGENCE from _preview_on_decloak: there is NO
         foreground-suppression here. The decloak alert suppresses when the
@@ -25611,8 +25611,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         Four dicts and a set hang off a character key, plus the engine's own
         latch. (``_ozone_toasts`` is deliberately NOT pruned here: it belongs
-        to the Tk thread and frees itself on dismiss; this runs on the poller.) Without this they accumulate for every character ever previewed
-        in a session and, worse, go STALE: a client closed and reopened an hour
+        to the Tk thread and frees itself on dismiss; this runs on the poller.)
+        Without this they accumulate for every character ever previewed in a
+        session and, worse, go STALE: a client closed and reopened an hour
         later would come back with its old ``(docked, online)`` sample, its old
         ship memo and its old latch, so the first poll pass could read a
         phantom undock edge off a sample from the previous session -- or,
@@ -26200,7 +26201,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         """Tk thread: raise the range summary over the posting client's window.
 
         One toast at a time -- a newer range check replaces an older one rather
-        than stacking, the same rule _implant_show_toast follows. No fallback
+        than stacking. No fallback
         position is offered: the hook already refused to get this far without a
         client rect, and parking the window over something else is worse than
         showing nothing."""
@@ -26526,8 +26527,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         """Raise the refit outcome over the posting client's window.
 
         ONE live refit toast at a time -- a newer outcome replaces the older
-        one rather than stacking, the rule _range_check_show_toast and
-        _implant_show_toast both follow. That also covers the chooser: picking
+        one rather than stacking, the rule _range_check_show_toast follows.
+        That also covers the chooser: picking
         a row runs the swap, whose toast dismisses the chooser on its way in.
 
         Blank lines are dropped rather than rendered as empty rows -- the
