@@ -795,7 +795,9 @@ def _int_or_none(value):
 
 def scan_ship_assets(assets, ship_item_id, dogma=None,
                      fuel_type_id=None) -> ShipCargo:
-    """Reduce an ESI ``/assets/`` page to ``(fitted generator, ozone units)``.
+    """Reduce an ESI ``/assets/`` page to a :class:`ShipCargo`: the fitted
+    generator(s), ozone units, and the fuel half (isotopes, strontium, and
+    whether a siege / triage module is fitted).
 
     Only rows whose ``location_id`` is ``ship_item_id`` count — the payload is
     the character's WHOLE asset list, so every other hangar, container and ship
@@ -1056,9 +1058,9 @@ def edge_toast(char_name, cargo, cost, fuel_short, min_activations) -> tuple:
 
 # ── per-character latch ──────────────────────────────────────────────────────
 
-FIRE = "FIRE"              # a new low-ozone sighting: warn now
-HOLD = "HOLD"              # same ship, same ozone, already warned
-CLEAR = "CLEAR"            # no generator / enough lights / unknown: latch released
+FIRE = "FIRE"              # a new low-ozone / short-fuel sighting: warn now
+HOLD = "HOLD"              # same ship, same ozone + fuel figures, already warned
+CLEAR = "CLEAR"            # nothing low (or unknown): latch released
 SUPPRESSED = "SUPPRESSED"  # per-character opt-out
 
 
@@ -1103,18 +1105,21 @@ class WatchState:
 
     ``observe_edge`` is called on an UNDOCK or LOGIN edge, not on every poll,
     and returns ``FIRE`` only when the sample is new evidence of a low hold.
-    The latch is keyed on ``(ship_item_id, ozone)``, which is what makes the
-    re-arming honest:
+    The latch is keyed on ``(ship_item_id, ozone, isotopes, strontium)``
+    (the fuel figures since 2026-11-21), which is what makes the re-arming
+    honest:
 
-    * the same ship with the same ozone is the same warning — ``HOLD``. That is
-      not a theoretical case: an undock and a login edge routinely arrive as a
-      burst for the same character (logging in undocked fires both), and the
-      wiring may re-observe an edge it is unsure about. ``HOLD`` is what
-      collapses that burst into one toast.
-    * a different ship, or the same ship after the number moved (a restock, or
-      our own cyno-lit decrement), is a new fact — ``FIRE``;
-    * a generator that is gone, or enough lights, releases the latch outright —
-      ``CLEAR``, so the next dip fires again.
+    * the same ship with the same figures is the same warning -- ``HOLD``.
+      That is not a theoretical case: an undock and a login edge routinely
+      arrive as a burst for the same character (logging in undocked fires
+      both), and the wiring may re-observe an edge it is unsure about.
+      ``HOLD`` is what collapses that burst into one toast.
+    * a different ship, or the same ship after any figure moved (a restock, a
+      jump's fuel burn, or our own cyno-lit decrement), is a new fact --
+      ``FIRE``;
+    * nothing low any more (no generator or enough lights, and no fuel
+      shortfall) releases the latch outright -- ``CLEAR``, so the next dip fires
+      again.
 
     ``blind_gap_s`` is the third release, and it exists for the same reason as
     ``implant_reminder.ReminderState.blind_gap_s``: **the signal is sampled,

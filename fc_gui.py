@@ -1962,7 +1962,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # Monotonic stamp of the first observation, so "first sighting" can be
         # told from "FCTool just started" -- see _ozone_observe's login edge.
         self._ozone_started_at = None
-        self._ozone_toast = None               # the single live ClientToast, if any
+        self._ozone_toasts = {}                # char key -> its live ClientToast
         self._ozone_prev = {}                  # char key -> (docked, online) last sample
         self._ozone_ship = {}                  # char key -> (ship_type_id, ship_item_id)
         self._ozone_asset_cache = {}           # (key, ship_item_id) -> (monotonic, ShipCargo)
@@ -25872,8 +25872,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         suppression, for the same reason: a pilot staring at the client he is
         about to undock is exactly who this is for.
 
-        One ozone toast at a time, tracked separately from the implant one so
-        neither feature can dismiss the other's window. With no client rect
+        One ozone toast per CHARACTER (2026-11-21; was one in total, so alts
+        undocking together dismissed each other's toasts although each floats
+        over its own client): a new toast for the same key replaces that key's
+        old one, and on_dismiss frees the slot only while it still holds THAT
+        toast, so the dict cannot leak or evict a successor. Tracked separately
+        from the implant toast so neither feature can dismiss the other's
+        window. No on_snooze is wired, so the hint drops the default
+        "right-click: not this session" promise. With no client rect
         there is nothing sensible to sit over, so the toast is skipped rather
         than parked at a guessed screen position -- logged, because a silent
         skip is indistinguishable from a missed edge. The title names the
@@ -25881,10 +25887,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         -- tiled, overlapping, or seen only at a glance -- a bare "Ozone"
         does not say which one."""
         try:
-            prev = self._ozone_toast
+            toasts = self._ozone_toasts
+            prev = toasts.pop(key, None)
             if prev is not None:
                 prev.dismiss()
-                self._ozone_toast = None
             rect = self._implant_client_rect(key)
             if rect is None:
                 # The other way this feature can "not fire": the engine did its
@@ -25892,15 +25898,23 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 # line too, so a skipped warning is still a warning somewhere
                 # -- a log that only says "skipped" cannot be told from noise.
                 log.warning("[ozone] no on-screen EVE client for %s - toast "
-                            "skipped: %s", char_name or key, body)
+                            "skipped: %s", char_name or key,
+                            str(body).replace("\n", " | "))
                 return
             cfg = ozone_watch.normalize_config(self.config.get("ozone_watch"))
+
+            def _free_slot():
+                # Late-bound `toast`: only frees the slot it still owns.
+                if toasts.get(key) is toast:
+                    toasts.pop(key, None)
+
             toast = client_toast.ClientToast(
                 self.root, title or ozone_watch.toast_title(char_name), body,
                 seconds=cfg["toast_seconds"],
                 height=client_toast.height_for(str(body).count("\n") + 1),
-                on_dismiss=lambda: setattr(self, "_ozone_toast", None))
-            self._ozone_toast = toast
+                hint="click to dismiss",
+                on_dismiss=_free_slot)
+            toasts[key] = toast
             toast.show(rect)
         except Exception:
             log.exception("[ozone] toast failed for %s", key)
