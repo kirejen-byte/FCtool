@@ -157,6 +157,8 @@ import window_activator
 # "Close Clients" (Fleet tab): list + slide-to-confirm dialog + watch. Imports
 # no fc_gui / ctypes -- the button's click handler injects its collaborators.
 import close_clients
+# Kick > "Disband Fleet": the whole flow + its slide question (rules: kick_pods).
+import disband_dialog
 import preview_layout
 # Cycle-group ROLES: the pure criteria vocabulary + ring resolution, plus the
 # cycle-groups dialog's RoleCriteriaPanel editor (pure core + Tk shell in one
@@ -360,7 +362,7 @@ from ui_theme import (
 from ui_helpers import (make_modal, attach_tooltip, update_tooltip,
                         relift_topmost_tooltips, center_over,
                         make_glyph_button, normalize_hex_color,
-                        make_color_swatch, make_split_button)
+                        make_color_swatch, make_split_button, ARROW_GLYPH)
 
 # Update awareness. app_version owns the released version string (and the one
 # tag parser); update_check owns the single GitHub /releases/latest call and the
@@ -4521,6 +4523,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # what REMAINS of the row, so on screen it still reads
         #   Role Tracker [+ Add Role] [Reset All] [Collapse All] [Expand All]
         #     … <status> [Close Clients] [Kick Pods] [Fleet Templates] [Screenshot]
+        # ("Kick Pods" is now the red Kick menu button: Kick Pods / Disband
+        # Fleet - same slot, same pack priority.)
         # width=-len(text) on every label shorter than ttk's 11-char default
         # is a MINIMUM, not a truncation (precedent: the x-up Reset above);
         # with the old dim "(not case sensitive)" label folded into a tooltip
@@ -4545,8 +4549,16 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         templates_btn = ttk.Button(role_header, text="Fleet Templates",
                                    style="Dark.TButton",
                                    command=self._open_fleet_templates)
-        kick_btn = ttk.Button(role_header, text="Kick Pods", style="Red.TButton",
-                              width=-9, command=self._kick_pods_from_fleet)
+        # "Kick" + a down triangle: posts Kick Pods / Disband Fleet.
+        kick_btn = ttk.Button(role_header, text="Kick " + ARROW_GLYPH,
+                              style="Red.TButton", width=-6,
+                              command=lambda: self._post_kick_menu(kick_btn))
+        attach_tooltip(kick_btn,
+                       "Kick Pods: kick everyone in a capsule.\n"
+                       "Disband Fleet: set the MOTD to "
+                       f"\"{disband_dialog.DISBAND_MOTD}\", then "
+                       "kick everyone but you.\nESI cannot disband a fleet, so "
+                       "you stay in a one-man fleet. Both ask first.")
         close_btn = ttk.Button(role_header, text="Close Clients", style="Red.TButton",
                                command=self._close_all_clients)
         attach_tooltip(close_btn, "Close every running EVE client (asks first).")
@@ -17523,6 +17535,18 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             self._motd_last_check_ts = time.monotonic()
             self._motd_maybe_autopush()   # push now if something changed
         self._motd_update_link_indicator()
+
+    def _motd_disarm_link(self):
+        """Turn Auto-update MOTD off for good (Kick > Disband Fleet), live AND
+        remembered, through the one writer above. True when it was on."""
+        was_on = bool(getattr(self, "_motd_link_enabled", False)
+                      or self.config.get("fittings", {}).get("motd_link"))
+        var = getattr(self, "_motd_link_var", None)
+        if was_on and var is not None:
+            var.set(False)
+            self._motd_toggle_link()
+        self._motd_link_enabled = False
+        return was_on
 
     def _motd_maybe_autopush(self):
         """If linked, recompute the MOTD and re-push it to the fleet when it has
@@ -36940,6 +36964,36 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                                buttons=[("OK", "Dark.TButton", None)], accent=accent)
 
         threading.Thread(target=fetch, daemon=True).start()
+
+    def _post_kick_menu(self, btn):
+        """The red Kick button: post "Kick Pods" / "Disband Fleet" under it.
+        Built per click; ``_post_menu`` posts it and tears it down."""
+        menu = tk.Menu(btn, tearoff=0, bg=BG_PANEL, fg=FG_TEXT,
+                       activebackground=FG_ACCENT, activeforeground=BG_DARK)
+        menu.add_command(label="Kick Pods", command=self._kick_pods_from_fleet)
+        menu.add_command(label="Disband Fleet", command=self._disband_fleet)
+        self._post_menu(menu, btn.winfo_rootx(),
+                        btn.winfo_rooty() + btn.winfo_height())
+
+    def _disband_fleet(self):
+        """Kick > "Disband Fleet". Wiring only: disband_dialog.DisbandFlow
+        owns the gate, roster fetch, slide question, run and result (one run
+        at a time). Hosts the worker-read ``inflight`` lambda, hence listed
+        in tests/test_no_worker_after.py::WORKER_METHODS."""
+        self._disband_flow = disband_dialog.launch(
+            getattr(self, "_disband_flow", None), self.root, self.esi_auth,
+            getattr(self, "_last_polled_fleet_id", None),
+            getattr(self, "_last_polled_fleet_is_boss", False),
+            post_ui=self._post_ui, log=log,
+            notify=lambda text, tone: self._themed_modal(
+                "Disband Fleet", text, buttons=[("OK", "Dark.TButton", None)],
+                accent={"ok": FG_GREEN, "warn": FG_YELLOW,
+                        "info": FG_ACCENT}.get(tone, FG_RED)),
+            disarm_link=self._motd_disarm_link,
+            inflight=lambda: getattr(self, "_motd_autopush_inflight", False),
+            on_motd_set=self._motd_record_manual_push,   # the new baseline
+            status=lambda text: self._screenshot_link.config(text=text,
+                                                             fg=FG_DIM))
 
     def _set_all_roles_collapsed(self, collapsed: bool):
         """Expand or collapse all role slots at once."""
