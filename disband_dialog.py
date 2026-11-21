@@ -82,7 +82,7 @@ def wait_clear(inflight, wait_s, *, clock, sleep) -> bool:
 
 
 def run(auth, fleet_id, ids, own_id, *, inflight, clock=None, sleep=None,
-        wait_s=AUTOPUSH_WAIT_S):
+        wait_s=AUTOPUSH_WAIT_S, progress=None):
     """Disband's worker half. Returns ``(res, motd_risk)``.
 
     ``res`` is ``kick_pods.disband``'s ``DisbandResult`` (its roster
@@ -90,12 +90,15 @@ def run(auth, fleet_id, ids, own_id, *, inflight, clock=None, sleep=None,
     when an autopush PUT was still in flight after the run and the disband
     message could not be written back after it (the template may be what the
     fleet sees). ``inflight`` reads the autopush flag (the link is already
-    off, so no NEW autopush starts; only one already dispatched can land)."""
+    off, so no NEW autopush starts; only one already dispatched can land).
+    ``progress(text)``: optional worker-side status lines (see
+    ``kick_pods.disband``)."""
     clock = clock or time.monotonic
     sleep = sleep or time.sleep
+    kick_pods.say_progress(progress, "Disbanding: setting MOTD...")
     cleared = wait_clear(inflight, wait_s, clock=clock, sleep=sleep)
     res = kick_pods.disband(auth, fleet_id, ids, own_id, clock=clock,
-                            sleep=sleep)
+                            sleep=sleep, progress=progress)
     if cleared or res[0] is None:           # None: nothing was touched
         return res, False
     if not wait_clear(inflight, wait_s, clock=clock, sleep=sleep):
@@ -128,11 +131,14 @@ class DisbandFlow:
                          the autopush baseline to it.
     ``log``              logger; counts only, never a name.
     ``resolve_name(cid)``  optional; default ``zkill_monitor.resolve_name``.
+    ``status(text)``     optional, Tk thread: a transient progress line while
+                         the run works ("" clears it; the run can take tens
+                         of seconds waiting on ESI's members cache).
     """
 
     def __init__(self, parent, auth, fleet_id, is_boss, *, post_ui, notify,
                  disarm_link, inflight, on_motd_set, log, resolve_name=None,
-                 clock=None, sleep=None):
+                 clock=None, sleep=None, status=None):
         self.parent, self.auth = parent, auth
         self.fleet_id, self.is_boss = fleet_id, bool(is_boss)
         self._post_ui, self._notify = post_ui, notify
@@ -140,6 +146,7 @@ class DisbandFlow:
         self._on_motd_set, self._log = on_motd_set, log
         self._resolve_name = resolve_name
         self._clock, self._sleep = clock, sleep
+        self._status = status
         self._link_off = False
         self.busy = False
 
@@ -218,13 +225,25 @@ class DisbandFlow:
         try:
             res, risk = run(self.auth, self.fleet_id, ids, self.own,
                             inflight=self._inflight, clock=self._clock,
-                            sleep=self._sleep)
+                            sleep=self._sleep,
+                            progress=lambda t: self._post_ui(self._show, t))
         except Exception:
             self._log.exception("Disband Fleet: the run failed")
         self._post_ui(self._finish, res, risk)
 
+    def _show(self, text):
+        """Tk thread: the injected status line; never raises."""
+        if self._status is None:
+            return
+        try:
+            self._status(text)
+        except Exception:
+            self._log.debug("Disband Fleet: the status line failed",
+                            exc_info=True)
+
     def _finish(self, res, risk):
         self.busy = False
+        self._show("")
         if res is not None and res[0]:
             try:
                 self._on_motd_set(DISBAND_MOTD)
@@ -240,7 +259,7 @@ class DisbandFlow:
             res, link_off=self._link_off, motd_risk=risk))
 
     def _end(self, text, tone):
-        self.busy = False
+        self.busy = False                  # no run started: nothing to clear
         self._notify(text, tone)
 
 

@@ -36991,7 +36991,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                         "info": FG_ACCENT}.get(tone, FG_RED)),
             disarm_link=self._motd_disarm_link,
             inflight=lambda: getattr(self, "_motd_autopush_inflight", False),
-            on_motd_set=self._motd_record_manual_push)   # the new baseline
+            on_motd_set=self._motd_record_manual_push,   # the new baseline
+            status=lambda text: self._screenshot_link.config(text=text,
+                                                             fg=FG_DIM))
 
     def _set_all_roles_collapsed(self, collapsed: bool):
         """Expand or collapse all role slots at once."""

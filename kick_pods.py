@@ -18,12 +18,16 @@ from typing import NamedTuple, Optional
 
 MAX_CONSECUTIVE_FAILURES = 3
 #: Disband re-reads the roster at most this many times per run (each one may
-#: wait out MEMBERS_CACHE_S), which bounds the run's length.
+#: wait out MEMBERS_CACHE_S), which bounds the run's waiting to about
+#: MAX_RECHECKS * MEMBERS_CACHE_S. The final check (see ``_kick_run``) is one
+#: of these re-reads, not an extra one.
 MAX_RECHECKS = 5
 #: GET /fleets/{id}/members is server-cached ~5 s and the ETag layer replays
 #: the same body inside that window: a re-read waits this long after the
-#: previous read so it sees a fresh roster.
-MEMBERS_CACHE_S = 5.1
+#: previous read RETURNED so it sees a fresh roster. ESI's Expires header is
+#: whole seconds, so the cached body can outlive "5 s" by up to a second; the
+#: extra 1.1 s covers that rounding plus clock skew.
+MEMBERS_CACHE_S = 6.1
 
 #: The MOTD Disband Fleet writes before it kicks anyone.
 DISBAND_MOTD = "Fleet is over"
@@ -79,8 +83,19 @@ def kick_confirmed(auth, fleet_id, confirmed_ids, capsule_ids=(), own_id=None,
     return kicked, failed, skipped + left, ok
 
 
+def say_progress(progress, text):
+    """Report ``text`` to the optional ``progress`` callback; never raises (a
+    broken status line must not stop a kick run half-way)."""
+    if progress is None:
+        return
+    try:
+        progress(text)
+    except Exception:
+        pass
+
+
 def _kick_run(auth, fleet_id, confirmed_ids, capsule_ids, own_id, *, select,
-              recheck, clock, sleep):
+              recheck, clock, sleep, progress=None):
     """``kick_confirmed``'s body. Returns (kicked, failed, skipped, reread_ok,
     left): `left` counts the confirmed pilots found no longer candidates (for
     Disband: gone from the fleet), `skipped` the rest not kicked (never
@@ -92,14 +107,22 @@ def _kick_run(auth, fleet_id, confirmed_ids, capsule_ids, own_id, *, select,
     the fleet is over and a DELETE for a pilot who already left fails. The
     members GET is server-cached (~5 s) and the ETag layer replays the cached
     body, so each re-read first waits until MEMBERS_CACHE_S have passed since
-    the previous read (``clock`` / ``sleep``, default time.monotonic /
-    time.sleep). An unreadable re-read stops (the boss role is probably
-    gone). A readable one moves the streak's pilots who are no longer
-    candidates from failed to left, drops the untried ones who left (left
-    too), and goes on with the rest - only ever a subset of the first list.
-    A re-read where every streak pilot is still there means real failures:
-    stop. At most MAX_RECHECKS re-reads; past that a streak stops the run.
-    ESI's status code is never consulted.
+    the previous read returned (``clock`` / ``sleep``, default
+    time.monotonic / time.sleep). An unreadable re-read stops (the boss role
+    is probably gone). A readable one moves EVERY failed pilot who is no
+    longer a candidate from failed to left, drops the untried ones who left
+    (left too), and goes on with the rest - only ever a subset of the first
+    list. A re-read where every streak pilot is still there means real
+    failures: stop. At most MAX_RECHECKS re-reads; past that a streak stops
+    the run.
+
+    The final check (recheck only): a lone failure between two successes
+    never makes a streak, so it would never be re-read. When the loop ends
+    with failed pilots whose DELETE came after the last read, that read was
+    readable, and a re-read is left in the budget, ONE more roster GET (same
+    cache wait, no DELETEs) moves the failed pilots gone from it to left. An
+    unreadable final read changes nothing. ESI's status code is never
+    consulted. ``progress(text)``, if given, gets a short status line.
     """
     members = auth.get_fleet_members(fleet_id=fleet_id)
     if not isinstance(members, list):
@@ -107,7 +130,7 @@ def _kick_run(auth, fleet_id, confirmed_ids, capsule_ids, own_id, *, select,
     if recheck:
         clock = clock or time.monotonic
         sleep = sleep or time.sleep
-        read_at = clock()
+        read_at = clock()          # stamped AFTER the read returned
 
     def candidates(ms):
         if select is None:
@@ -116,46 +139,70 @@ def _kick_run(auth, fleet_id, confirmed_ids, capsule_ids, own_id, *, select,
         out.discard(own_id)
         return out
 
+    def reread():
+        """Wait out the members cache, then GET; the roster or None."""
+        nonlocal read_at
+        say_progress(progress, "Disbanding: waiting for ESI...")
+        wait = MEMBERS_CACHE_S - (clock() - read_at)
+        if wait > 0:
+            sleep(wait)            # else the re-read replays the cached roster
+        ms = auth.get_fleet_members(fleet_id=fleet_id)
+        read_at = clock()
+        return ms if isinstance(ms, list) else None
+
+    def settle(now):
+        """Move the failed pilots gone from candidate set `now` to left."""
+        nonlocal failed, left
+        left += sum(1 for c in failed if c not in now)
+        failed = [c for c in failed if c in now]
+
     still = candidates(members)
     todo = [c for c in confirmed_ids if c in still and c != own_id]
     left = sum(1 for c in confirmed_ids if c != own_id and c not in still)
     skipped = len(confirmed_ids) - len(todo) - left
     rereads = MAX_RECHECKS if recheck else 0
     queue = list(todo)
-    kicked = failed = 0
+    kicked = attempts = 0
+    failed = []                    # ids whose DELETE failed (still failed)
+    unchecked = []                 # of those, the ones failed since the read
     streak = []                    # ids of the current run of failed DELETEs
+    readable = True                # False once a re-read came back unreadable
     while queue:
         cid = queue.pop(0)
+        attempts += 1
+        say_progress(progress, f"Disbanding: kicking {attempts}/"
+                       f"{attempts + len(queue)}...")
         if auth.esi_delete(f"/fleets/{fleet_id}/members/{cid}/"):
             kicked += 1
             streak = []
             continue
-        failed += 1
+        failed.append(cid)
+        unchecked.append(cid)
         streak.append(cid)
         if len(streak) < MAX_CONSECUTIVE_FAILURES:
             continue
         if rereads <= 0:
             break
         rereads -= 1
-        wait = MEMBERS_CACHE_S - (clock() - read_at)
-        if wait > 0:
-            sleep(wait)            # else the re-read replays the cached roster
-        members = auth.get_fleet_members(fleet_id=fleet_id)
-        read_at = clock()
-        if not isinstance(members, list):
+        members = reread()
+        if members is None:
+            readable = False
             break
         now = candidates(members)
-        gone = [c for c in streak if c not in now]
-        if not gone:
+        unchecked = []
+        settle(now)
+        if not [c for c in streak if c not in now]:
             break                  # all still there: real failures
-        failed -= len(gone)
-        left += len(gone)
         kept = [c for c in queue if c in now]
         left += len(queue) - len(kept)
         queue = kept
         streak = []
+    if recheck and readable and unchecked and rereads > 0:
+        members = reread()         # the final check: no DELETEs
+        if members is not None:
+            settle(candidates(members))
     skipped += len(queue)          # the pilots never tried
-    return kicked, failed, skipped, True, left
+    return kicked, len(failed), skipped, True, left
 
 
 class DisbandResult(NamedTuple):
@@ -171,7 +218,8 @@ class DisbandResult(NamedTuple):
     left: int = 0
 
 
-def disband(auth, fleet_id, confirmed_ids, own_id, *, clock=None, sleep=None):
+def disband(auth, fleet_id, confirmed_ids, own_id, *, clock=None, sleep=None,
+            progress=None):
     """Disband Fleet's run: MOTD DISBAND_MOTD, then kick the confirmed pilots.
 
     Returns a ``DisbandResult`` (motd_ok, kicked, failed, skipped, reread_ok,
@@ -187,12 +235,18 @@ def disband(auth, fleet_id, confirmed_ids, own_id, *, clock=None, sleep=None):
        still in the fleet, never `own_id`. Pilots leave on their own once the
        MOTD is up, so a failure streak re-reads the roster (``recheck``,
        after the members cache expires - `clock` / `sleep`) instead of
-       stopping: the leavers count as `left`, not failed.
+       stopping: the leavers count as `left`, not failed. A lone failure
+       gets the final check (one more read at the end), so a pilot who left
+       between the read and their DELETE is `left` too.
+
+    ``progress(text)``: optional short status lines ("Disbanding: ...") for
+    the caller to show while the run waits; it never stops the run.
     """
     if not own_id:
         return DisbandResult(None, 0, 0, 0, False)
     if not isinstance(auth.get_fleet_members(fleet_id=fleet_id), list):
         return DisbandResult(None, 0, 0, 0, False)
+    say_progress(progress, "Disbanding: setting MOTD...")
     try:
         motd_ok = bool(auth.set_fleet_motd(fleet_id, DISBAND_MOTD))
     except Exception:
@@ -200,7 +254,7 @@ def disband(auth, fleet_id, confirmed_ids, own_id, *, clock=None, sleep=None):
     kicked, failed, skipped, reread_ok, left = _kick_run(
         auth, fleet_id, confirmed_ids, (), own_id,
         select=lambda members: member_ids(members, own_id), recheck=True,
-        clock=clock, sleep=sleep)
+        clock=clock, sleep=sleep, progress=progress)
     return DisbandResult(motd_ok, kicked, failed, skipped, reread_ok, left)
 
 
