@@ -205,6 +205,16 @@ def _xup_word(xup, field, default):
     return (word, False) if word else (default, True)
 
 
+def xup_is_off(xup) -> bool:
+    """True when the x-up trigger OR clear word is present but blank - the
+    same rule ``build_lines`` uses for its ``(off)``. A non-dict block is
+    junk, so not off."""
+    if not isinstance(xup, dict):
+        return False
+    return (_xup_word(xup, "trigger_word", "x")[1]
+            or _xup_word(xup, "fire_word", "FIRE")[1])
+
+
 def _help_usage(help_keyword) -> str:
     keyword = " ".join(str(help_keyword or "").split())
     if not keyword or _squash(keyword) == _squash(DEFAULTS["keyword"]):

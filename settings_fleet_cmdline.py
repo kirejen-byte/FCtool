@@ -183,12 +183,13 @@ class CategoryPills:
 
 def off_states(config) -> dict:
     """``{pill key: switched off?}`` from a RAW config, through each feature's
-    own gate. X-up has no off switch. Never raises on junk blocks."""
+    own gate. X-up has no switch: it is off when a trigger/clear word is blank
+    (``help_command.xup_is_off``). Never raises on junk blocks."""
     cfg = config if isinstance(config, dict) else {}
     rng_block = cfg.get("range_check")
     rng = range_check.normalize_config(rng_block)
     return {
-        "xup": False,
+        "xup": help_command.xup_is_off(cfg.get("xup")),
         "range": (not range_check.is_enabled(rng_block)) or not rng["keyword"],
         "refit": not refit_command.is_enabled(cfg.get("refit_command")),
         "form": not form_command.is_enabled(cfg.get("form_command")),
