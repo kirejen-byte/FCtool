@@ -306,6 +306,22 @@ DEFAULT_CONFIG = {
         "enabled": True,            # MASTER GATE (opt-out)
         "keyword": "refit",         # must START the body; BLANK = off
     },
+    # Fleet-chat "form" command (form_command.py). Typing `form <doctrine>` in
+    # Fleet chat selects that doctrine in the MOTD composer, loads its top MOTD
+    # template, resets its refits to their defaults and pushes the MOTD once,
+    # so an FC can broadcast a doctrine without leaving the client.
+    #
+    # DEFAULT ON, the refit command's posture above: it fires only for the
+    # owner's OWN logged-in characters AND only for a line that STARTS with
+    # the keyword, so nothing a fleet member types can reach it.
+    #
+    # A BLANK keyword disables it. Key-for-key mirror of form_command.DEFAULTS
+    # (guarded by tests/test_default_config.py) - fc_gui never names a default
+    # itself.
+    "form_command": {
+        "enabled": True,            # MASTER GATE (opt-out)
+        "keyword": "form",          # must START the body; BLANK = off
+    },
     # Fleet loss tracking source (spike 2026-07-25-zkill-loss-source). The
     # capsule-transition detector in loss_tracker.py is FAST (~20-35s) but blind
     # to podded pilots (measured 26-43% of PvP ship losses) and does not run at
