@@ -197,7 +197,7 @@ def _role_usage(role_letters) -> str:
 def _xup_word(xup, field, default):
     """``(word, off)`` for one x-up word. Absent / ``None`` -> the default, not
     off; present but blank (whitespace only) -> the default AND off, because
-    the counter then matches nothing. Inner whitespace collapses."""
+    ``XUpCounter._is_xup`` / ``_is_fire`` guard a blank word to match nothing. Inner whitespace collapses."""
     raw = xup.get(field)
     if raw is None:
         return default, False
@@ -233,7 +233,8 @@ def build_lines(*, xup, role_letters, range_block, refit_block, form_block,
     module -> its line is omitted). A command is ``(off)`` iff its OWN
     ``is_enabled`` says so (the range check's blank keyword also counts: its
     engine disables on one). The x-up trigger / clear words have no switch,
-    but a BLANK one matches nothing (``xup_counter``), so that line shows the
+    but a BLANK one matches nothing (the guard in ``XUpCounter._is_xup`` /
+    ``_is_fire``, not this module), so that line shows the
     default word and ``(off)`` too; an ABSENT word is just the default. The
     footnote appears only when something is off. Every line is at most
     ``MAX_LINE`` glyphs. Never raises on junk input."""

@@ -55,12 +55,16 @@ class XUpCounter:
     def _is_xup(self, message: str) -> bool:
         msg = self._normalize(message)
         trigger = self._normalize(self.trigger_word)
+        if not trigger:
+            return False    # a blank trigger word matches nothing
         # Exact match or starts with trigger + space (e.g., "x Maelstrom")
         return msg == trigger or msg.startswith(trigger + " ")
 
     def _is_fire(self, message: str) -> bool:
         msg = self._normalize(message)
         fire = self._normalize(self.fire_word)
+        if not fire:
+            return False    # a blank fire word matches nothing (not every "!")
         return msg == fire or msg.startswith(fire + " ") or msg.startswith(fire + "!")
 
     def process_message(self, msg: ChatMessage):

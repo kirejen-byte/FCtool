@@ -33780,9 +33780,17 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # never be re-read). None on the startup pass.
         prev_xup_state = getattr(
             getattr(self, "xup_counter", None), "state", None)
+        # A hand-edited null word falls back to the default; a deliberate
+        # blank ("") stays blank (the counter then matches nothing).
+        _xup_trigger = xup_cfg.get("trigger_word", "x")
+        _xup_fire = xup_cfg.get("fire_word", "FIRE")
+        if _xup_trigger is None:
+            _xup_trigger = "x"
+        if _xup_fire is None:
+            _xup_fire = "FIRE"
         self.xup_counter = XUpCounter(
-            trigger_word=xup_cfg.get("trigger_word", "x"),
-            fire_word=xup_cfg.get("fire_word", "FIRE"),
+            trigger_word=_xup_trigger,
+            fire_word=_xup_fire,
             threshold=xup_cfg.get("threshold", 50),
             case_sensitive=xup_cfg.get("case_sensitive", False),
             on_ready=self._on_xup_ready,
