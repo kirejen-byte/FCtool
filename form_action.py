@@ -334,7 +334,8 @@ class FormController:
                 return False
             if self._live_gen is not None:
                 pending = self._pending
-                if retry and pending is not None and not pending[2]:
+                if (retry and pending is not None and not pending[2]
+                        and pending[0] == doctrine_id):
                     log.info("[form] retry for %r dropped - a form command's "
                              "push is already queued", doctrine_id)
                     self._release()
@@ -523,6 +524,10 @@ class FormController:
         if autopush_late and getattr(host, "_motd_link_enabled", False):
             if hasattr(host, "_motd_last_pushed_markup"):
                 host._motd_last_pushed_markup = None
+                # Invalidate a late autopush _done's captured generation so
+                # it cannot write a stale baseline equal to the current markup.
+                host._motd_baseline_gen = getattr(
+                    host, "_motd_baseline_gen", 0) + 1
             log.warning("[form] MOTD pushed while an auto-update push was "
                         "still out - the auto-update link will re-push it")
             return
