@@ -221,6 +221,10 @@ import refit_toast
 # Settings tick and the autopush stand-down; neither module imports fc_gui.
 import form_command
 import form_action
+# Fleet-chat "help FCT" command (default ON): help_command is the pure matcher
+# + toast-body builder; wiring is _help_observe on the any-character tail
+# (_build_range_monitor) and _help_show_toast. It imports no fc_gui.
+import help_command
 # The module, alongside the `from jump_range import ...` names above: the range
 # check injects jump_range.calculate_ly_distance as its distance function.
 import jump_range
@@ -26484,6 +26488,112 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         except Exception:
             log.exception("[refit] chat hook failed")
 
+    def _help_observe(self, msg):
+        """Chat-tail hook: is ONE fleet message the ``help FCT`` command?
+
+        Rides the any-character tail (self._range_monitor, registered in
+        _build_range_monitor), so it works from any of the owner's characters
+        and with the range check switched off. Chat poll thread, NO Tk: the
+        body is built on the Tk thread (role letters are StringVars).
+
+        Gates, cheapest first: help_command.is_enabled (the master gate the
+        Settings tick will read) -> the whole-line match -> the stale-log age
+        gate (help_command.MAX_AGE_S, so a startup replay pops nothing) -> the
+        sender owns a live client (the range check's own-character lookup) ->
+        that client is not minimized (warned once per character) -> the
+        per-sender cooldown, consulted LAST so a refused line never burns it.
+        Never raises into the poll loop."""
+        try:
+            block = self.config.get("help_command")
+            if not help_command.is_enabled(block):
+                return
+            keyword = help_command.normalize_config(block)["keyword"]
+            if not help_command.matches(getattr(msg, "message", "") or "",
+                                        keyword):
+                return
+            ts = getattr(msg, "timestamp", None)
+            if not form_command.is_fresh(ts, max_age_s=help_command.MAX_AGE_S):
+                age = form_command.message_age_s(ts)
+                log.debug("[help] stale fleet-chat line (%s s old) - ignored",
+                          "?" if age is None else f"{age:.0f}")
+                return
+            key = range_check.own_key(getattr(msg, "sender", "") or "")
+            clients = {c.key: c for c in self._range_check_clients(key) if c.key}
+            client = clients.get(key)
+            if client is None:
+                return          # not one of the owner's characters: no-op
+            if client.is_iconic:
+                warned = getattr(self, "_help_no_client", None)
+                if warned is None:
+                    warned = self._help_no_client = set()
+                if key not in warned:
+                    warned.add(key)
+                    log.warning("[help] no on-screen EVE client for %s - "
+                                "help toast skipped", key)
+                return
+            cooldown = getattr(self, "_help_cooldown", None)
+            if cooldown is None:
+                cooldown = self._help_cooldown = refit_command.Cooldown(
+                    help_command.COOLDOWN_SECONDS)
+            if not cooldown.consider(key):
+                return
+            self._post_ui(self._help_show_toast, key, tuple(client.rect))
+        except Exception:
+            log.exception("[help] chat hook failed")
+
+    def _help_show_toast(self, key, rect):
+        """Tk thread: the ``help FCT`` toast over ``key``'s client.
+
+        Reads the live values here (role letters are Tk StringVars; the x-up
+        threshold is the live counter's, which "= DPS" may have re-tied) and
+        leaves every wording / ``(off)`` decision to help_command.build_lines.
+        One live toast per character: a new one dismisses the old, and the
+        late-bound _free_slot only frees the slot it still owns. No snooze is
+        wired, so the hint is overridden. Never grabs, never raises."""
+        try:
+            cfg = self.config
+            roles = []
+            for slot in getattr(self, "_role_slots", None) or ():
+                try:
+                    roles.append((slot["letter_var"].get(),
+                                  slot["title_var"].get()))
+                except Exception:
+                    continue
+            xup = dict(cfg.get("xup") or {})
+            live = getattr(getattr(self, "xup_counter", None), "threshold", None)
+            if live is not None:
+                xup["threshold"] = live
+            lines = help_command.build_lines(
+                xup=xup, role_letters=roles,
+                range_block=cfg.get("range_check"),
+                refit_block=cfg.get("refit_command"),
+                form_block=cfg.get("form_command") or {},
+                help_keyword=help_command.normalize_config(
+                    cfg.get("help_command"))["keyword"])
+            toasts = getattr(self, "_help_toasts", None)
+            if toasts is None:
+                toasts = self._help_toasts = {}
+            prev = toasts.pop(key, None)
+            if prev is not None:
+                prev.dismiss()
+
+            def _free_slot():
+                # Late-bound `toast`: only frees the slot it still owns.
+                if toasts.get(key) is toast:
+                    toasts.pop(key, None)
+
+            toast = client_toast.ClientToast(
+                self.root, help_command.TITLE, "\n".join(lines),
+                seconds=help_command.TOAST_SECONDS,
+                width=help_command.TOAST_WIDTH,
+                height=client_toast.height_for(len(lines)),
+                hint=help_command.HINT,
+                on_dismiss=_free_slot)
+            toasts[key] = toast
+            toast.show(rect)
+        except Exception:
+            log.exception("[help] toast failed for %s", key)
+
     def _refit_command_doctrine(self):
         """THE doctrine a fleet-chat refit command acts on.
 
@@ -33692,9 +33802,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                     and FCToolGUI._zkill_signature(config) == built_sig)
 
     def _build_range_monitor(self, logs_path, channel):
-        """Build (and hook up) the range check's own fleet tail.
+        """Build (and hook up) the any-character fleet command tail.
 
-        The range check's tail is the SAME fleet channel as ``chat_monitor``
+        It carries the two commands that work from ANY of the owner's
+        characters: the range check (_range_check_observe) and, since
+        2026-11-22, ``help FCT`` (_help_observe) -- each inert behind its own
+        master gate, so neither depends on the other being switched on.
+
+        This tail is the SAME fleet channel as ``chat_monitor``
         with NO listener filter, so a command typed on any of the owner's
         characters is seen even when the tracked character is not in that fleet
         (the owner's field case: only Another Pilot was in fleet, tracked was
@@ -33730,6 +33845,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             pin_max_idle_s=chat_monitor.DISCOVERY_MAX_IDLE_S,
         )
         self._range_monitor.on_message(self._range_check_observe)
+        self._range_monitor.on_message(self._help_observe)
 
     def _setup_modules(self, keep_zkill=False):
         # Fleet Management
@@ -34070,7 +34186,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # (2026-09-18): it rides its own listener-agnostic tail, registered in
         # _build_range_monitor on self._range_monitor, so the command works
         # from any of the owner's characters and not only the tracked one.
-        # Calling it from here as well would fire the same line twice.
+        # Calling it from here as well would fire the same line twice. The
+        # "help FCT" command (_help_observe) rides that same tail, for the
+        # same reason.
         #
         # The two fleet-chat COMMANDS, LAST on purpose: they are the only
         # consumers here that can do real work (a window read, then a

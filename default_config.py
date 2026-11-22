@@ -322,6 +322,16 @@ DEFAULT_CONFIG = {
         "enabled": True,            # MASTER GATE (opt-out)
         "keyword": "form",          # must START the body; BLANK = off
     },
+    # Fleet-chat "help FCT" command (help_command.py). Typing `help FCT` (or
+    # `help FCTool`) in Fleet chat from one of the owner's OWN characters pops
+    # a toast over that client listing every fleet-chat command, marking the
+    # switched-off ones. DEFAULT ON: own characters only, whole-line match,
+    # and all it does is show a toast. A BLANK keyword disables it. Key-for-key
+    # mirror of help_command.DEFAULTS (guarded by tests/test_default_config.py).
+    "help_command": {
+        "enabled": True,            # MASTER GATE (opt-out)
+        "keyword": "help fct",      # whole line, spaces optional; BLANK = off
+    },
     # Fleet loss tracking source (spike 2026-07-25-zkill-loss-source). The
     # capsule-transition detector in loss_tracker.py is FAST (~20-35s) but blind
     # to podded pilots (measured 26-43% of PvP ship losses) and does not run at
