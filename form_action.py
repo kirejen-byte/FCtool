@@ -34,15 +34,23 @@ Load-bearing invariants, each a place this feature could be silently wrong:
   refit reset (whose refresh chain would otherwise run the armed auto-update
   link's push) until ``_push_done`` or any early refusal; fc_gui's autopush
   returns early while it is set. A success is recorded as the link's baseline
-  (``_motd_record_manual_push``). A retry whose markup the armed link already
-  pushed in the meantime skips its PUT.
+  (``_motd_record_manual_push``) -- EXCEPT after a timed-out autopush wait
+  (below). A retry whose markup the armed link already pushed in the meantime
+  skips its PUT.
 * **The form's PUT is the LAST one.** fc_gui's gate only stops NEW autopushes;
   one already dispatched can still land. So the worker first waits (up to
   ``AUTOPUSH_WAIT_S``, polling the plain ``_motd_autopush_inflight`` bool, no
-  Tk) for it to report back, then sends. Likewise only ONE form worker is out
-  at a time: a form typed while one is live is queued (the latest wins) and
-  started from ``_push_done``, and ``push_inflight`` stays True until no form
-  worker is outstanding.
+  Tk) for it to report back, then sends. If that wait TIMES OUT the late
+  autopush PUT may still land after the form's, so a success then does NOT
+  record the baseline as synced: with the link armed it clears
+  ``_motd_last_pushed_markup`` instead, and the link re-pushes the current
+  markup on its next tick after the late PUT reports back. Likewise only ONE
+  form worker is out at a time: a form typed while one is live is queued (the
+  latest wins) and started from ``_push_done``, and ``push_inflight`` stays
+  True until no form worker is outstanding. A request is checked against the
+  composer (shows its doctrine, clean) BEFORE it may queue, so one the
+  composer has moved past never displaces a live one, and a retry never
+  replaces a queued non-retry push.
 * **One live toast at a time**; a newer toast dismisses the older.
 * **Retry is one click, one attempt.** The not-boss and unreachable toasts
   carry ``("retry", "Retry in 15 s")``; a pick schedules ONE ``root.after``.
@@ -51,7 +59,9 @@ Load-bearing invariants, each a place this feature could be silently wrong:
   markup. An ESI rejection (a PUT 4xx other than 403/404/420/429) has NO retry:
   re-sending the same markup cannot succeed.
 * **Stale chat lines never act** (``form_command.is_fresh``): a command
-  replayed from the log at startup is older than ``MAX_MESSAGE_AGE_S``.
+  replayed from the log at startup is older than ``MAX_MESSAGE_AGE_S``. The
+  first stale line of a session is a WARNING naming its age (a PC clock
+  running fast makes every line stale); later ones are debug only.
 * **No success toast** -- the MOTD itself is the confirmation; success shows on
   the MOTD tab's fleet-status label only.
 """
@@ -154,6 +164,8 @@ class FormController:
         #: while a worker was out; started from ``_push_done``. Latest wins.
         self._pending = None
         self._failed_push_ts = None
+        #: The once-per-session stale-line WARNING has been logged.
+        self._stale_warned = False
         #: True while a form push owns the MOTD (read by fc_gui's autopush).
         self.push_inflight = False
 
@@ -179,9 +191,9 @@ class FormController:
                                        keyword)
             if query is None:
                 return
-            if not form_command.is_fresh(getattr(msg, "timestamp", None)):
-                log.info("[form] stale fleet-chat line (replayed from the "
-                         "log) - form command ignored")
+            ts = getattr(msg, "timestamp", None)
+            if not form_command.is_fresh(ts):
+                self._note_stale(ts)
                 return
             key = range_check.own_key(getattr(msg, "sender", "") or "")
             clients = {c.key: c for c in host._range_check_clients(key)
@@ -205,6 +217,17 @@ class FormController:
             host._post_ui(self.resolve_and_apply, query, tuple(client.rect))
         except Exception:
             log.exception("[form] chat hook failed")
+
+    def _note_stale(self, ts) -> None:
+        """CHAT-POLL THREAD: ONE warning per session naming the measured age
+        (a PC clock running fast makes every line stale); debug after that."""
+        age = form_command.message_age_s(ts)
+        if not self._stale_warned:
+            self._stale_warned = True
+            log.warning("[form] %s", form_command.stale_note(age))
+        else:
+            log.debug("[form] stale fleet-chat line (%s s old) - form command "
+                      "ignored", "?" if age is None else f"{age:.0f}")
 
     # -- Tk thread ------------------------------------------------------------
 
@@ -290,19 +313,17 @@ class FormController:
     def push(self, doctrine_id, client_rect, *, retry=False) -> bool:
         """Tk thread: compose and start ONE silent push worker.
 
-        Drops silently (clearing ``push_inflight``) when the composer no longer
-        shows ``doctrine_id`` or has unsaved edits. While another form worker is
-        out this only QUEUES the push (latest wins; ``_push_done`` starts it,
-        re-checking the composer and re-composing then). True iff a worker
+        Drops silently (clearing ``push_inflight`` unless a worker is still
+        out) when the composer no longer shows ``doctrine_id`` or has unsaved
+        edits -- checked FIRST, so such a request never queues and never
+        displaces a pending one. While another form worker is out a request
+        that passes only QUEUES (latest wins; ``_push_done`` starts it,
+        re-checking the composer and re-composing then), except that a
+        ``retry`` never replaces a queued non-retry push. True iff a worker
         started or the push was queued."""
         host = self.host
         self.push_inflight = True
         title = "Form"
-        if self._live_gen is not None:
-            self._pending = (doctrine_id, client_rect, retry)
-            log.info("[form] a form MOTD push is still out - %r queued "
-                     "behind it", doctrine_id)
-            return True
         try:
             shown = host._motd_selected_doctrine()
             if (shown is None or getattr(shown, "id", None) != doctrine_id
@@ -311,6 +332,17 @@ class FormController:
                          "moved on", doctrine_id)
                 self._release()
                 return False
+            if self._live_gen is not None:
+                pending = self._pending
+                if retry and pending is not None and not pending[2]:
+                    log.info("[form] retry for %r dropped - a form command's "
+                             "push is already queued", doctrine_id)
+                    self._release()
+                    return False
+                self._pending = (doctrine_id, client_rect, retry)
+                log.info("[form] a form MOTD push is still out - %r queued "
+                         "behind it", doctrine_id)
+                return True
             title = _title(str(getattr(shown, "name", "") or ""))
             try:
                 markup, _compacted = host._motd_output_markup()
@@ -356,15 +388,17 @@ class FormController:
     def _worker(self, auth, markup, doctrine_id, client_rect, gen):
         """WORKER thread: ESI only. Marshals the outcome to ``_push_done``."""
         outcome, fleet_state, status = "unreachable", None, None
+        autopush_late = False
         try:
-            self._wait_autopush_clear()
+            autopush_late = not self._wait_autopush_clear()
             outcome, fleet_state, status = self._send(auth, markup)
         except Exception as e:
             log.debug("[form] MOTD push failed: %s", e)
             outcome, fleet_state, status = "unreachable", None, None
         finally:
             self.host._post_ui(self._push_done, outcome, markup, doctrine_id,
-                               client_rect, gen, fleet_state, status)
+                               client_rect, gen, fleet_state, status,
+                               autopush_late)
 
     def _wait_autopush_clear(self) -> bool:
         """WORKER thread: wait (at most ``AUTOPUSH_WAIT_S``) for an autopush
@@ -427,13 +461,14 @@ class FormController:
     # -- Tk thread: outcome ---------------------------------------------------
 
     def _push_done(self, outcome, markup, doctrine_id, client_rect, gen=None,
-                   fleet_state=None, status=None):
+                   fleet_state=None, status=None, autopush_late=False):
         """Tk thread: record, report, then start the queued push if any.
 
         ``push_inflight`` clears only when no form push is queued behind this
         one. A queued push supersedes this one's toast (the status label still
         tells the truth about what landed). A result from an unknown worker
-        generation is dropped."""
+        generation is dropped. ``autopush_late`` = the worker's autopush wait
+        timed out, so that PUT may land AFTER this one (see ``_record_ok``)."""
         if gen is not None and gen != self._push_gen:
             log.info("[form] a superseded MOTD push finished (%s)", outcome)
             return
@@ -443,7 +478,7 @@ class FormController:
         # fleet-state seam below must never lose it (-> a second ESI write).
         if outcome == "ok":
             try:
-                host._motd_record_manual_push(markup)
+                self._record_ok(markup, autopush_late)
             except Exception:
                 log.exception("[form] recording the MOTD baseline failed")
         try:
@@ -474,6 +509,24 @@ class FormController:
                                status=status)
         except Exception:
             log.exception("[form] reporting the MOTD push failed")
+
+    def _record_ok(self, markup, autopush_late) -> None:
+        """Tk thread: a successful form PUT becomes the link's baseline.
+
+        Unless the autopush wait timed out with the link ARMED: the late
+        autopush PUT can still land after this one, so recording this markup
+        as synced would leave the fleet on the stale MOTD for good. The
+        baseline is cleared instead, so the link re-pushes the current markup
+        on its first tick after the late PUT reports back. With the link off
+        nothing would re-push either way, so it records as usual."""
+        host = self.host
+        if autopush_late and getattr(host, "_motd_link_enabled", False):
+            if hasattr(host, "_motd_last_pushed_markup"):
+                host._motd_last_pushed_markup = None
+            log.warning("[form] MOTD pushed while an auto-update push was "
+                        "still out - the auto-update link will re-push it")
+            return
+        host._motd_record_manual_push(markup)
 
     def _note_fleet_state(self, fleet_state):
         """Keep the composer's stored fleet / boss state (and its Set button)

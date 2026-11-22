@@ -26396,8 +26396,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
            refit 2 of those" is not a command. A non-command costs one
            startswith and returns here, before the client read below — which on
            a previews-off box is a full window enumeration. Right after it,
-           form_command.is_fresh drops a line older than 60 s (replayed from
-           the log at startup), before that read too.
+           form_command.is_fresh drops a line older than MAX_MESSAGE_AGE_S
+           (10 min; replayed from the log at startup), before that read too.
+           The first such drop per session is a WARNING naming the line's age:
+           EVE log times are server UTC, so a PC clock running that fast makes
+           EVERY line stale and the command silently dead.
         3. The sender must own one of the owner's live client windows. That
            list is BOTH the own-character gate and the source of the toast's
            rect, so the two can never disagree about who counts.
@@ -26428,9 +26431,16 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             # The stale-log age gate (shared with the form command): the chat
             # monitor resumes from a saved position at startup, so a refit
             # typed while FCTool was closed must not fire on this launch.
-            if not form_command.is_fresh(getattr(msg, "timestamp", None)):
-                log.info("[refit] stale fleet-chat line (replayed from the "
-                         "log) - refit command ignored")
+            ts = getattr(msg, "timestamp", None)
+            if not form_command.is_fresh(ts):
+                age = form_command.message_age_s(ts)
+                if not getattr(self, "_refit_stale_warned", False):
+                    self._refit_stale_warned = True     # once per session
+                    log.warning("[refit] %s", form_command.stale_note(age))
+                else:
+                    log.debug("[refit] stale fleet-chat line (%s s old) - "
+                              "refit command ignored",
+                              "?" if age is None else f"{age:.0f}")
                 return
             # Same own-character gate as the range check, through the same
             # lookup — a character the two disagreed about would be able to

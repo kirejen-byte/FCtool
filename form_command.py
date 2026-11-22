@@ -50,7 +50,11 @@ Load-bearing decisions, each a place this feature could be silently wrong:
   the keyword can prefix-match a doctrine by accident.
 * **Stale lines never act** (``is_fresh``): the chat monitor resumes from a
   saved position at startup, so a command typed while FCTool was closed would
-  otherwise fire on the next launch. Shared with the refit command.
+  otherwise fire on the next launch. Shared with the refit command. The gate
+  is 10 minutes wide because EVE stamps lines in SERVER (UTC) time and a PC
+  clock running fast ages every line by its skew; a skew beyond the gate
+  silences both commands, which each caller makes diagnosable with ONE
+  warning per session naming the measured age (``stale_note``).
 """
 from __future__ import annotations
 
@@ -79,8 +83,11 @@ MIN_QUERY_LEN = 3
 #: A possessive/plural fold never produces a form shorter than this.
 MIN_FORM_LEN = 3
 #: A chat line older than this (seconds, by its log timestamp) is never acted
-#: on: it was replayed from the log, not typed just now.
-MAX_MESSAGE_AGE_S = 60
+#: on: it was replayed from the log, not typed just now. 10 minutes: a line
+#: replayed from a closed FCTool is minutes-to-hours old, while a PC clock a
+#: few minutes FAST (EVE log times are server UTC) must not block a command
+#: typed just now.
+MAX_MESSAGE_AGE_S = 600
 
 #: Every ``FormMatch.kind``. ``form`` is the ONLY one that carries an id.
 KINDS = ("form", "ambiguous", "none", "ignore")
@@ -148,6 +155,26 @@ def parse(body, keyword) -> str | None:
     return " ".join(words)
 
 
+def message_age_s(ts, now=None):
+    """Seconds between log timestamp ``ts`` and now (negative = in the
+    future), or None when it cannot be measured.
+
+    EVE log times are UTC and ``chat_monitor`` parses them NAIVE, so a naive
+    ``ts`` is compared against naive UTC now (never local time) and an aware
+    one against aware UTC now. A missing or non-datetime ``ts``, or any
+    comparison error (naive vs aware ``now``), is None. Never raises."""
+    if not isinstance(ts, datetime):
+        return None
+    try:
+        if now is None:
+            now = datetime.now(timezone.utc)
+            if ts.tzinfo is None:
+                now = now.replace(tzinfo=None)
+        return (now - ts).total_seconds()
+    except Exception:
+        return None
+
+
 def is_fresh(ts, now=None, max_age_s=MAX_MESSAGE_AGE_S) -> bool:
     """Was a chat line with log timestamp ``ts`` typed within ``max_age_s``?
 
@@ -155,22 +182,36 @@ def is_fresh(ts, now=None, max_age_s=MAX_MESSAGE_AGE_S) -> bool:
     monitor resumes from a saved position at startup, so a command typed while
     FCTool was closed is delivered on the next launch and must not fire.
 
-    EVE log times are UTC and ``chat_monitor`` parses them NAIVE, so a naive
-    ``ts`` is compared against naive UTC now (never local time) and an aware
-    one against aware UTC now. Fail-OPEN: a missing or non-datetime ``ts``, or
-    any comparison error (naive vs aware ``now``), counts as fresh. A future
-    timestamp (clock skew) is fresh. Never raises."""
-    if not isinstance(ts, datetime):
+    Fails OPEN when the age cannot be measured (``message_age_s`` is None: a
+    missing or non-datetime ``ts``, naive vs aware ``now``) and when the PC
+    clock runs SLOW (a future timestamp is fresh). Fails CLOSED when the PC
+    clock runs more than ``max_age_s`` FAST: EVE stamps lines in server UTC
+    time, so every line then looks stale and both commands go silent -- the
+    callers log one warning per session (``stale_note``) so that is
+    diagnosable. Never raises."""
+    age = message_age_s(ts, now)
+    if age is None:
         return True
     try:
-        if now is None:
-            now = datetime.now(timezone.utc)
-            if ts.tzinfo is None:
-                now = now.replace(tzinfo=None)
-        age = (now - ts).total_seconds()
         return age <= float(max_age_s)
     except Exception:
         return True
+
+
+def stale_note(age_s) -> str:
+    """The once-per-session WARNING text for a line ``is_fresh`` dropped.
+
+    ASCII only; names the measured age so a PC clock running fast (every line
+    "stale", the commands silently dead) can be told apart from a replay."""
+    try:
+        age = f"{float(age_s):.0f} s"
+    except (TypeError, ValueError):
+        age = "an unknown time"
+    return (f"fleet-chat command line is {age} old (limit "
+            f"{MAX_MESSAGE_AGE_S} s) - ignored as replayed from the log. "
+            "If commands typed just now are ignored, check the PC clock: EVE "
+            "log times are server (UTC) time. Further stale lines this "
+            "session are logged at debug level only.")
 
 
 # -- normalisation ------------------------------------------------------------
