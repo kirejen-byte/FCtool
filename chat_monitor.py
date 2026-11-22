@@ -607,7 +607,14 @@ class ChatMonitor:
         messages = self._poll_once()
         for msg in messages:
             for cb in self._callbacks:
-                cb(msg)
+                # Read positions are already advanced, so a raising hook must
+                # not cost the other hooks (or later messages) this batch.
+                try:
+                    cb(msg)
+                except Exception:
+                    log.exception(
+                        "chat monitor callback %s raised; continuing",
+                        getattr(cb, "__qualname__", cb))
         return messages
 
     def run(self):
