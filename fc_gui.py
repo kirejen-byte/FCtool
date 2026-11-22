@@ -225,6 +225,9 @@ import form_action
 # + toast-body builder; wiring is _help_observe on the any-character tail
 # (_build_range_monitor) and _help_show_toast. It imports no fc_gui.
 import help_command
+# Settings > "Fleet Command Line" section builder + its CategoryPills row
+# (tkinter + ui_theme + the pure command engines; imports no fc_gui).
+import settings_fleet_cmdline
 # The module, alongside the `from jump_range import ...` names above: the range
 # check injects jump_range.calculate_ly_distance as its distance function.
 import jump_range
@@ -20335,141 +20338,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # ── Channels (tagged registry) ────────────────────────────────────
         self._build_channels_settings(scroll_frame)
 
-        # ── X-Up Settings ────────────────────────────────────────────────────
-        self._add_section(scroll_frame, "Fleet Management", toc_title="Fleet Mgmt")
-        xup = self.config.get("xup", {})
-
-        self._setting_entries = {}
-        self._add_setting(scroll_frame, "Trigger Word", "xup_trigger",
-                          xup.get("trigger_word", "x"),
-                          tooltip=("The word a pilot types in the fleet channel "
-                                   "to x-up. Each pilot is counted once; an alert "
-                                   "fires when the count reaches the threshold."))
-        self._add_setting(scroll_frame, "Clear Word", "xup_fire",
-                          xup.get("fire_word", "FIRE"),
-                          tooltip=("Resets the x-up tally to zero, clearing "
-                                   "everyone who has x'd up, so you can start a "
-                                   "fresh count."))
-        self._add_setting(scroll_frame, "Channel Name", "xup_channel",
-                          xup.get("channel_name", "Fleet"))
-
-        # ── Fleet-chat range check (range_check.py; default OFF) ─────────────
-        # Both controls read their initial state through the module: is_enabled
-        # is THE master gate (the chat hook gates on the same call, so a ticked
-        # box can never sit over a feature that cannot fire) and normalize_config
-        # owns the keyword default. No default value is typed here.
-        _rc_block = self.config.get("range_check")
-        self._range_check_enabled_var = tk.BooleanVar(
-            value=range_check.is_enabled(_rc_block))
-        rc_frame = tk.Frame(scroll_frame, bg=BG_DARK)
-        rc_frame.pack(fill=tk.X, padx=20, pady=2)
-        rc_check = tk.Checkbutton(
-            rc_frame, text="Range check on fleet chat",
-            variable=self._range_check_enabled_var,
-            font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
-            selectcolor=BG_ENTRY, activebackground=BG_DARK,
-            activeforeground=FG_TEXT,
-            command=self._on_range_check_toggle)
-        rc_check.pack(side=tk.LEFT)
-        attach_tooltip(
-            rc_check,
-            "Type the keyword below in Fleet chat and a short-lived window "
-            "pops up over that character's EVE client, showing which staging "
-            "systems are in Titan, Capital, Command Carrier and Blops jump "
-            "range of them (JDC 5).\n\n"
-            "Only YOUR OWN logged-in characters can trigger it — a fleet "
-            "member saying the keyword is ignored. Naming systems in the "
-            "message replaces the staging list for that check.\n\n"
-            "NEEDS FCPreview or the Eve-O overlay for full coverage: only "
-            "those poll every logged-in character's location. With previews "
-            "OFF (the default) just the signed-in PRIMARY character's own "
-            "location is known, so a check typed by any other character "
-            "answers \"Location unknown\" instead of a range table.\n\n"
-            "A BLANK keyword below also switches it off — a ticked box over an "
-            "empty keyword field matches nothing and does nothing.")
-
-        rc_kw_frame = tk.Frame(scroll_frame, bg=BG_DARK)
-        rc_kw_frame.pack(fill=tk.X, padx=20, pady=2)
-        rc_kw_label = tk.Label(rc_kw_frame, text="Range check keyword:",
-                               font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
-                               width=28, anchor=tk.W)
-        rc_kw_label.pack(side=tk.LEFT)
-        self._range_check_keyword_var = tk.StringVar(
-            value=range_check.normalize_config(_rc_block).get("keyword", ""))
-        self._range_check_keyword_entry = tk.Entry(
-            rc_kw_frame, textvariable=self._range_check_keyword_var,
-            font=("Consolas", 10), bg=BG_ENTRY, fg=FG_WHITE,
-            insertbackground=FG_WHITE, width=40, borderwidth=1, relief=tk.RIDGE)
-        self._range_check_keyword_entry.pack(side=tk.LEFT, padx=5)
-        # The dim tell for the OTHER off switch. A ticked box over a blank
-        # keyword is a dead feature and the checkbox cannot show that; the
-        # keyword tooltip says so but a tooltip has to be hovered to be read.
-        # Same idiom as the "(blank = all accounts)" hint further up this tab.
-        self._range_check_hint = tk.Label(
-            rc_kw_frame, text="", font=("Consolas", 9), fg=FG_DIM, bg=BG_DARK)
-        self._range_check_hint.pack(side=tk.LEFT, padx=5)
-        self._refresh_range_check_hint()
-        # Autosave on leaving the field / pressing Enter, the same instant-apply
-        # the Staging System entry uses (_autosave_staging_system). Save Settings
-        # collects it too, so a value still being typed is never lost.
-        self._range_check_keyword_entry.bind(
-            "<FocusOut>", self._autosave_range_check_keyword, add="+")
-        self._range_check_keyword_entry.bind(
-            "<Return>", self._autosave_range_check_keyword, add="+")
-        for _w in (rc_kw_label, self._range_check_keyword_entry):
-            attach_tooltip(
-                _w,
-                "Case-insensitive; matches anywhere in the message, so "
-                "\"range check on me\" fires too.\n\n"
-                "Leave it BLANK to switch the feature off — a blank keyword "
-                "matches nothing rather than every line.")
-
-        # ── Fleet-chat refit command (refit_command.py; default ON) ──────────
-        # ONE control: the master gate, read through the module's own predicate
-        # for the same reason the tick above is. No keyword entry — the config
-        # key exists for power users, but a second free-text field here would
-        # be a second thing to get wrong for a feature nobody renames.
-        self._refit_command_enabled_var = tk.BooleanVar(
-            value=refit_command.is_enabled(self.config.get("refit_command")))
-        rf_frame = tk.Frame(scroll_frame, bg=BG_DARK)
-        rf_frame.pack(fill=tk.X, padx=20, pady=2)
-        rf_check = tk.Checkbutton(
-            rf_frame, text="Refit commands on fleet chat",
-            variable=self._refit_command_enabled_var,
-            font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
-            selectcolor=BG_ENTRY, activebackground=BG_DARK,
-            activeforeground=FG_TEXT,
-            command=self._on_refit_command_toggle)
-        rf_check.pack(side=tk.LEFT)
-        attach_tooltip(
-            rf_check,
-            "In fleet chat, from one of your own characters:\n"
-            "refit <ship or role> <number|name>   e.g. refit dps 2 / "
-            "refit muninn ac\n"
-            "refit <name>   when only one ship has refits\n"
-            "refit reset   back to defaults")
-
-        # -- Fleet-chat form command (form_command.py; default ON) ------------
-        # The refit tick's twin: ONE control, seeded through the module's own
-        # master gate; the keyword stays config-only for the same reason.
-        self._form_command_enabled_var = tk.BooleanVar(
-            value=form_command.is_enabled(self.config.get("form_command")))
-        fm_frame = tk.Frame(scroll_frame, bg=BG_DARK)
-        fm_frame.pack(fill=tk.X, padx=20, pady=2)
-        fm_check = tk.Checkbutton(
-            fm_frame, text="Form commands on fleet chat",
-            variable=self._form_command_enabled_var,
-            font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
-            selectcolor=BG_ENTRY, activebackground=BG_DARK,
-            activeforeground=FG_TEXT,
-            command=self._on_form_command_toggle)
-        fm_check.pack(side=tk.LEFT)
-        attach_tooltip(
-            fm_check,
-            "In fleet chat, from one of your own characters:\n"
-            "form <doctrine name>   e.g. form svipuls\n"
-            "selects that doctrine, loads its top MOTD template,\n"
-            "resets its refits to default and pushes the MOTD.")
+        # -- Fleet Command Line (settings_fleet_cmdline.py) ------------------
+        # Was "Fleet Management": the fleet channel row, then one pill per
+        # fleet-chat command (X-up / Range check / Refit / Form / Help) with
+        # exactly one panel shown. Every var / entry Save Settings and the
+        # _on_*_toggle callbacks read is still set on self under its old name.
+        settings_fleet_cmdline.build_section(self, scroll_frame)
 
         # ── zKillboard Settings ──────────────────────────────────────────────
         self._add_section(scroll_frame, "zKillboard", toc_title="zKillboard")
@@ -26294,7 +26168,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         except Exception:
             log.exception("[range] toast failed")
 
-    # ── Range-check config (Settings > Fleet Management) ────────────────────
+    # -- Range-check config (Settings > Fleet Command Line) ------------------
 
     def _range_check_config(self) -> dict:
         """The live ``config['range_check']`` block, created lazily.
@@ -26319,6 +26193,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._range_check_config()["enabled"] = bool(
             self._range_check_enabled_var.get())
         self._save_config()
+        settings_fleet_cmdline.refresh_pills(self)   # the pill's " . off"
 
     def _collect_range_check_settings(self) -> bool:
         """Fold the keyword entry into config WITHOUT saving, so Save Settings
@@ -26335,6 +26210,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             return False
         self._range_check_config()["keyword"] = (var.get() or "").strip()
         self._refresh_range_check_hint()
+        settings_fleet_cmdline.refresh_pills(self)   # blank keyword = off
         return True
 
     def _refresh_range_check_hint(self):
@@ -26875,6 +26751,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._refit_command_config()["enabled"] = bool(
             self._refit_command_enabled_var.get())
         self._save_config()
+        settings_fleet_cmdline.refresh_pills(self)
 
     def _collect_refit_command_settings(self) -> bool:
         """Fold the tick into config WITHOUT saving, so Save Settings persists
@@ -26907,6 +26784,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._form_command_config()["enabled"] = bool(
             self._form_command_enabled_var.get())
         self._save_config()
+        settings_fleet_cmdline.refresh_pills(self)
 
     def _collect_form_command_settings(self) -> bool:
         """Fold the tick into config WITHOUT saving, ahead of Save Settings'
@@ -26916,6 +26794,34 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         if var is None:
             return False
         self._form_command_config()["enabled"] = bool(var.get())
+        return True
+
+    def _help_command_config(self) -> dict:
+        """The live ``config['help_command']`` block, created lazily and
+        seeded from ``help_command.DEFAULTS`` (mirrors _form_command_config)."""
+        block = self.config.setdefault(
+            "help_command", help_command.normalize_config(None))
+        if not isinstance(block, dict):
+            block = help_command.normalize_config(None)
+            self.config["help_command"] = block
+        return block
+
+    def _on_help_command_toggle(self):
+        """Persist the master gate immediately; only ``enabled`` is written
+        (mirrors _on_form_command_toggle)."""
+        self._help_command_config()["enabled"] = bool(
+            self._help_command_enabled_var.get())
+        self._save_config()
+        settings_fleet_cmdline.refresh_pills(self)
+
+    def _collect_help_command_settings(self) -> bool:
+        """Fold the tick into config WITHOUT saving, ahead of Save Settings'
+        config reload (mirrors _collect_form_command_settings). False when
+        the Settings tab was never built."""
+        var = getattr(self, "_help_command_enabled_var", None)
+        if var is None:
+            return False
+        self._help_command_config()["enabled"] = bool(var.get())
         return True
 
     def _overlay_start_poller(self):
@@ -33574,6 +33480,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # landed. Guarded — the section may never have been built.
         self._collect_refit_command_settings()
         self._collect_form_command_settings()   # the form command's twin tick
+        self._collect_help_command_settings()   # ...and the help command's
 
         self.config.setdefault("zkillboard", {})
         self.config["zkillboard"]["enabled"] = self._zkill_enabled_var.get()
