@@ -215,6 +215,12 @@ import range_check
 # modules import no fc_gui.
 import refit_command
 import refit_toast
+# Fleet-chat "form <doctrine>" command (default ON): form_command is the pure
+# parse/match engine, form_action the FormController that gates, applies,
+# pushes and retries. Wiring is the chat-tail hook in _on_chat_message, the
+# Settings tick and the autopush stand-down; neither module imports fc_gui.
+import form_command
+import form_action
 # The module, alongside the `from jump_range import ...` names above: the range
 # check injects jump_range.calculate_ly_distance as its distance function.
 import jump_range
@@ -2017,6 +2023,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # Fittings-library column sort state (click-to-sort headers).
         self._fit_sort_column: str = "name"
         self._fit_sort_reverse: bool = False
+        # Fleet-chat "form <doctrine>" command (form_action.py). Built here --
+        # after the fittings store it resolves against and the boot hook's
+        # palette (it reads ui_theme's colours at construction), before
+        # _start_monitoring starts the chat tail that feeds it.
+        self._form_controller = form_action.FormController(self)
 
         # ── Market scanner (Phase B) state ──────────────────────────────────
         # Lazily-built scanner (needs the type catalog above). The snapshot +
@@ -17575,6 +17586,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         ESI hiccup never drops the link."""
         if not getattr(self, "_motd_link_enabled", False):
             return
+        # A fleet-chat "form" push owns the MOTD until it reports back: one
+        # ESI write per form command (its success becomes this link's
+        # baseline via _motd_record_manual_push).
+        if getattr(getattr(self, "_form_controller", None),
+                   "push_inflight", False):
+            return
         auth = self._motd_selected_fc_auth() or self.esi_auth
         if auth is None or not auth.is_authenticated:
             return
@@ -17917,6 +17934,31 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # Clear blanks the doctrine combo, so the Refits ▾ button must go with
         # it — a button offering swaps in a doctrine nothing is showing is the
         # same class of lie as the push guard above.
+        self._refits_update_buttons()
+
+    def _motd_load_default_doc(self):
+        """Load a fresh default document for the CURRENT doctrine, clean.
+
+        The fleet-chat form command's no-template path (form_action): the tail
+        of _clear_motd_builder WITHOUT the doctrine clear. The caller has
+        already selected the doctrine, so _motd_default_doc derives its lines
+        from THAT doctrine -- never the outgoing canvas text. No prompt, no
+        push."""
+        self._motd_loaded_fits = None
+        cv = getattr(self, "_motd_canvas", None)
+        if cv is not None:
+            cv.set_doc(self._motd_default_doc())     # silent (no on_change)
+        if getattr(self, "_motd_saved_var", None) is not None:
+            self._motd_saved_var.set(self._MOTD_SAVED_BLANK)
+        self._motd_refresh_saved_dropdown()
+        pal = getattr(self, "_motd_palette", None)
+        if pal is not None:
+            pal.refresh_tray()
+        self._motd_loaded_template_snapshot = (
+            self._motd_snapshot_state() if cv is not None else None)
+        self._motd_template_dirty = False
+        self._motd_update_dirty_indicator()
+        self._rebuild_motd_preview()
         self._refits_update_buttons()
 
     def _clear_motd(self):
@@ -20418,6 +20460,28 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             "refit muninn ac\n"
             "refit <name>   when only one ship has refits\n"
             "refit reset   back to defaults")
+
+        # -- Fleet-chat form command (form_command.py; default ON) ------------
+        # The refit tick's twin: ONE control, seeded through the module's own
+        # master gate; the keyword stays config-only for the same reason.
+        self._form_command_enabled_var = tk.BooleanVar(
+            value=form_command.is_enabled(self.config.get("form_command")))
+        fm_frame = tk.Frame(scroll_frame, bg=BG_DARK)
+        fm_frame.pack(fill=tk.X, padx=20, pady=2)
+        fm_check = tk.Checkbutton(
+            fm_frame, text="Form commands on fleet chat",
+            variable=self._form_command_enabled_var,
+            font=("Consolas", 10), fg=FG_TEXT, bg=BG_DARK,
+            selectcolor=BG_ENTRY, activebackground=BG_DARK,
+            activeforeground=FG_TEXT,
+            command=self._on_form_command_toggle)
+        fm_check.pack(side=tk.LEFT)
+        attach_tooltip(
+            fm_check,
+            "In fleet chat, from one of your own characters:\n"
+            "form <doctrine name>   e.g. form svipuls\n"
+            "selects that doctrine, loads its top MOTD template,\n"
+            "resets its refits to default and pushes the MOTD.")
 
         # ── zKillboard Settings ──────────────────────────────────────────────
         self._add_section(scroll_frame, "zKillboard", toc_title="zKillboard")
@@ -26712,6 +26776,33 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         if var is None:
             return False
         self._refit_command_config()["enabled"] = bool(var.get())
+        return True
+
+    def _form_command_config(self) -> dict:
+        """The live ``config['form_command']`` block, created lazily and
+        seeded from ``form_command.DEFAULTS`` (mirrors _refit_command_config)."""
+        block = self.config.setdefault(
+            "form_command", form_command.normalize_config(None))
+        if not isinstance(block, dict):
+            block = form_command.normalize_config(None)
+            self.config["form_command"] = block
+        return block
+
+    def _on_form_command_toggle(self):
+        """Persist the master gate immediately; only ``enabled`` is written
+        (mirrors _on_refit_command_toggle)."""
+        self._form_command_config()["enabled"] = bool(
+            self._form_command_enabled_var.get())
+        self._save_config()
+
+    def _collect_form_command_settings(self) -> bool:
+        """Fold the tick into config WITHOUT saving, ahead of Save Settings'
+        config reload (mirrors _collect_refit_command_settings). False when
+        the Settings tab was never built."""
+        var = getattr(self, "_form_command_enabled_var", None)
+        if var is None:
+            return False
+        self._form_command_config()["enabled"] = bool(var.get())
         return True
 
     def _overlay_start_poller(self):
@@ -33369,6 +33460,7 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # the config reload below would drop a click the autosave has not yet
         # landed. Guarded — the section may never have been built.
         self._collect_refit_command_settings()
+        self._collect_form_command_settings()   # the form command's twin tick
 
         self.config.setdefault("zkillboard", {})
         self.config["zkillboard"]["enabled"] = self._zkill_enabled_var.get()
@@ -33977,13 +34069,17 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         # from any of the owner's characters and not only the tracked one.
         # Calling it from here as well would fire the same line twice.
         #
-        # Fleet-chat refit command, LAST on purpose: it is the only consumer
-        # here that can do real work (a window read, then a doctrine
-        # resolution), and nothing above it may wait on that. Inert in one
-        # predicate call while the feature is switched off. It stays on the
-        # TRACKED tail by the owner's decision ("Ok to keep other fleet chat
-        # tracking to the tracked character").
+        # The two fleet-chat COMMANDS, LAST on purpose: they are the only
+        # consumers here that can do real work (a window read, then a
+        # resolution on the Tk thread), and nothing above them may wait on
+        # that. Each is inert in one predicate call while switched off. Both
+        # stay on the TRACKED tail by the owner's decision ("Ok to keep other
+        # fleet chat tracking to the tracked character"). The form command's
+        # controller is getattr-guarded so a host without one is inert.
         self._refit_observe(msg)
+        form = getattr(self, "_form_controller", None)
+        if form is not None:
+            form.observe(msg)
 
     def _on_xup_update(self, state: XUpState):
         self._post_ui(self._update_xup_display, state)
