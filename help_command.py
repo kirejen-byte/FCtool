@@ -197,7 +197,8 @@ def _role_usage(role_letters) -> str:
 def _xup_word(xup, field, default):
     """``(word, off)`` for one x-up word. Absent / ``None`` -> the default, not
     off; present but blank (whitespace only) -> the default AND off, because
-    ``XUpCounter._is_xup`` / ``_is_fire`` guard a blank word to match nothing. Inner whitespace collapses."""
+    ``XUpCounter._is_xup`` / ``_is_fire`` guard a blank word to match
+    nothing. Inner whitespace collapses."""
     raw = xup.get(field)
     if raw is None:
         return default, False
