@@ -26374,7 +26374,10 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
 
         Gates, cheapest first: help_command.is_enabled (the master gate the
         Settings tick will read) -> the whole-line match -> the stale-log age
-        gate (help_command.MAX_AGE_S, so a startup replay pops nothing) -> the
+        gate (the SHARED form/refit window, form_command.is_fresh's default:
+        a help replayed from a log older than that pops nothing; one WARNING
+        per session on the first drop, since a PC clock running fast makes
+        every line look stale) -> the
         sender owns a live client (the range check's own-character lookup) ->
         that client is not minimized (warned once per character) -> the
         per-sender cooldown, consulted LAST so a refused line never burns it.
@@ -26388,10 +26391,14 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                                         keyword):
                 return
             ts = getattr(msg, "timestamp", None)
-            if not form_command.is_fresh(ts, max_age_s=help_command.MAX_AGE_S):
+            if not form_command.is_fresh(ts):
                 age = form_command.message_age_s(ts)
-                log.debug("[help] stale fleet-chat line (%s s old) - ignored",
-                          "?" if age is None else f"{age:.0f}")
+                if not getattr(self, "_help_stale_warned", False):
+                    self._help_stale_warned = True      # once per session
+                    log.warning("[help] %s", form_command.stale_note(age))
+                else:
+                    log.debug("[help] stale fleet-chat line (%s s old) - "
+                              "ignored", "?" if age is None else f"{age:.0f}")
                 return
             key = range_check.own_key(getattr(msg, "sender", "") or "")
             clients = {c.key: c for c in self._range_check_clients(key) if c.key}
@@ -26421,7 +26428,8 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         """Tk thread: the ``help FCT`` toast over ``key``'s client.
 
         Reads the live values here (role letters are Tk StringVars; the x-up
-        threshold is the live counter's, which "= DPS" may have re-tied) and
+        threshold and trigger / fire words are the live counter's -- "= DPS"
+        may have re-tied the threshold -- else the config's) and
         leaves every wording / ``(off)`` decision to help_command.build_lines.
         One live toast per character: a new one dismisses the old, and the
         late-bound _free_slot only frees the slot it still owns. No snooze is
@@ -26436,9 +26444,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 except Exception:
                     continue
             xup = dict(cfg.get("xup") or {})
-            live = getattr(getattr(self, "xup_counter", None), "threshold", None)
-            if live is not None:
-                xup["threshold"] = live
+            counter = getattr(self, "xup_counter", None)
+            for field in ("threshold", "trigger_word", "fire_word"):
+                live = getattr(counter, field, None)
+                if live is not None:
+                    xup[field] = live
             lines = help_command.build_lines(
                 xup=xup, role_letters=roles,
                 range_block=cfg.get("range_check"),
@@ -26458,11 +26468,12 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 if toasts.get(key) is toast:
                     toasts.pop(key, None)
 
+            body = "\n".join(lines)
             toast = client_toast.ClientToast(
-                self.root, help_command.TITLE, "\n".join(lines),
+                self.root, help_command.TITLE, body,
                 seconds=help_command.TOAST_SECONDS,
                 width=help_command.TOAST_WIDTH,
-                height=client_toast.height_for(len(lines)),
+                height=client_toast.height_for(body.count("\n") + 1),
                 hint=help_command.HINT,
                 on_dismiss=_free_slot)
             toasts[key] = toast

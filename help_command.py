@@ -34,13 +34,16 @@ DEFAULTS = {
     "keyword": "help fct",   # whole-line match, spaces optional; BLANK = off
 }
 
-#: Per-sender cooldown, so a repeated line cannot stack toasts.
-COOLDOWN_SECONDS = 20.0
+#: Per-sender double-send guard (refit's figure). A new toast already
+#: replaces the old one per character, so a longer cooldown would only
+#: refuse a re-ask after an accidental dismiss.
+COOLDOWN_SECONDS = 3.0
 #: Toast hold before the fade.
 TOAST_SECONDS = 20.0
-#: Freshness window (seconds, by the line's log timestamp). Shorter than the
-#: form/refit gate: a startup replay of a help typed minutes ago must not pop.
-MAX_AGE_S = 120
+# Freshness: the SHARED form/refit window (form_command.is_fresh's default,
+# MAX_MESSAGE_AGE_S). EVE log times are server UTC, so on a PC whose clock
+# runs fast a line's "age" is that skew; a shorter window would silently kill
+# help on such a box.
 
 TITLE = "FCTool fleet-chat commands"
 #: No snooze is wired, so the default hint's right-click promise is dropped.
@@ -97,6 +100,9 @@ def normalize_config(block) -> dict:
 
 # -- matching -----------------------------------------------------------------
 
+_MARKS = ("?", "!", ".")
+
+
 def _squash(text) -> str:
     return "".join(str(text or "").casefold().split())
 
@@ -106,14 +112,18 @@ def matches(body, keyword) -> bool:
 
     Whole-line: strip, casefold, collapse whitespace, drop ONE trailing
     ``?``/``!``/``.``, then compare with all spaces removed against the keyword
-    with spaces removed. With the default keyword, ``help fctool`` matches too.
-    A blank keyword matches nothing. Never raises."""
+    with spaces removed and ONE trailing mark dropped too (so a custom keyword
+    ``fct?`` matches the line ``fct?``). With the default keyword,
+    ``help fctool`` matches too. A blank keyword matches nothing. Never
+    raises."""
     try:
         needle = _squash(keyword)
+        if needle[-1:] in _MARKS:
+            needle = needle[:-1]
         if not needle:
             return False
         text = " ".join(str(body or "").casefold().split())
-        if text[-1:] in ("?", "!", "."):
+        if text[-1:] in _MARKS:
             text = text[:-1]
         text = text.replace(" ", "")
         if not text:
@@ -144,9 +154,10 @@ def _row(usage, desc, off=False) -> str:
 
 def _keyword_or_default(normalized, defaults) -> str:
     """The live keyword; a BLANK one (= off) shows the module's DEFAULT, so
-    the line still reads as the command it is."""
-    keyword = str((normalized or {}).get("keyword") or "").strip()
-    return keyword or str(defaults.get("keyword") or "")
+    the line still reads as the command it is. Inner whitespace (a pasted
+    tab or newline) collapses to one space, like every other user string."""
+    keyword = " ".join(str((normalized or {}).get("keyword") or "").split())
+    return keyword or " ".join(str(defaults.get("keyword") or "").split())
 
 
 def _role_usage(role_letters) -> str:
@@ -177,8 +188,9 @@ def _role_usage(role_letters) -> str:
             break
         shown.append(entry)
     if not shown:                          # one entry too long on its own
-        return _fit(entries[0], USAGE_W - len(more)) + (
-            more if len(entries) > 1 else "")
+        if len(entries) == 1:              # nothing follows: the full width
+            return _fit(entries[0], USAGE_W)
+        return _fit(entries[0], USAGE_W - len(more)) + more
     return sep.join(shown) + (more if len(shown) < len(entries) else "")
 
 
