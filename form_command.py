@@ -31,18 +31,31 @@ Load-bearing decisions, each a place this feature could be silently wrong:
   "Svipul", not "Svipul Training"). Two or more exact matches -- including two
   doctrines with the identical normalised name -- ASK; the engine never
   guesses.
-* **Casual chat is a SILENT no-op.** With no exact match, a query with no word
-  of at least ``MIN_QUERY_LEN`` characters ("form up", "form on me") resolves
-  to ``ignore`` (no toast). Anything longer that matches nothing is ``none``
-  with the message "No doctrine matches '<query>'".
+* **Casual chat is a SILENT no-op.** With no exact match, a query whose FIRST
+  word is shorter than ``MIN_QUERY_LEN`` characters, or that has no letter or
+  digit at all, resolves to ``ignore`` (no toast, no work): "form up on the
+  titan", "form up please", "form ???", "form :-)". An exact match is checked
+  first, so a short-worded doctrine ("T3 Cruisers", "AB Svipul") still forms
+  when typed in full. Anything else that matches nothing is ``none`` with the
+  message "No doctrine matches '<query>'".
 * **Prefix matching is word-anchored and contiguous.** The query's words must
   match a contiguous run of the name's words in order; every word but the last
   must match fully (by forms), the last may be a prefix. "fleet" therefore
   finds "Hurricane Fleet", but "fleet svipul" finds nothing.
+* **Only WHOLE words act directly.** A single prefix-ladder hit forms only when
+  every query word matched a name word as a whole word (``word_forms``
+  intersection: "svipuls" -> "Svipul Fleet"). One that needed a PARTIAL last
+  word ("here" -> "Heretic Fleet", "svip" -> "Svipul") is ``ambiguous`` with
+  that ONE option -- a click to confirm, because ordinary chat starting with
+  the keyword can prefix-match a doctrine by accident.
+* **Stale lines never act** (``is_fresh``): the chat monitor resumes from a
+  saved position at startup, so a command typed while FCTool was closed would
+  otherwise fire on the next launch. Shared with the refit command.
 """
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
 #: Shape + defaults of ``config['form_command']``. Mirrored in
 #: ``default_config.DEFAULT_CONFIG`` (guarded by ``test_default_config.py``);
@@ -50,8 +63,11 @@ from dataclasses import dataclass, field
 #: per-key defaulting, never a deep merge.
 #:
 #: ON by default, the refit command's posture: only the owner's OWN characters
-#: can trigger it and a line must START with the keyword, so leaving it armed
-#: costs at most a toast.
+#: can trigger it and a line must START with the keyword. An armed keyword CAN
+#: do real work -- an exact or whole-word match switches the composer's
+#: doctrine and pushes the MOTD -- so ordinary chat is fenced off by the
+#: noise gate (``ignore``), the whole-word rule (a partial match only asks) and
+#: the age gate (``is_fresh``); see the module docstring.
 DEFAULTS = {
     "enabled": True,
     "keyword": "form",       # must START the body; BLANK = disabled
@@ -62,6 +78,9 @@ DEFAULTS = {
 MIN_QUERY_LEN = 3
 #: A possessive/plural fold never produces a form shorter than this.
 MIN_FORM_LEN = 3
+#: A chat line older than this (seconds, by its log timestamp) is never acted
+#: on: it was replayed from the log, not typed just now.
+MAX_MESSAGE_AGE_S = 60
 
 #: Every ``FormMatch.kind``. ``form`` is the ONLY one that carries an id.
 KINDS = ("form", "ambiguous", "none", "ignore")
@@ -127,6 +146,31 @@ def parse(body, keyword) -> str | None:
     if not words:
         return None                      # bare keyword selects nothing
     return " ".join(words)
+
+
+def is_fresh(ts, now=None, max_age_s=MAX_MESSAGE_AGE_S) -> bool:
+    """Was a chat line with log timestamp ``ts`` typed within ``max_age_s``?
+
+    The stale-log age gate shared by the form and refit commands: the chat
+    monitor resumes from a saved position at startup, so a command typed while
+    FCTool was closed is delivered on the next launch and must not fire.
+
+    EVE log times are UTC and ``chat_monitor`` parses them NAIVE, so a naive
+    ``ts`` is compared against naive UTC now (never local time) and an aware
+    one against aware UTC now. Fail-OPEN: a missing or non-datetime ``ts``, or
+    any comparison error (naive vs aware ``now``), counts as fresh. A future
+    timestamp (clock skew) is fresh. Never raises."""
+    if not isinstance(ts, datetime):
+        return True
+    try:
+        if now is None:
+            now = datetime.now(timezone.utc)
+            if ts.tzinfo is None:
+                now = now.replace(tzinfo=None)
+        age = (now - ts).total_seconds()
+        return age <= float(max_age_s)
+    except Exception:
+        return True
 
 
 # -- normalisation ------------------------------------------------------------
@@ -234,20 +278,32 @@ def _word_prefixes(query_word_forms, name_word_forms) -> bool:
                for q in query_word_forms for n in name_word_forms)
 
 
-def _is_prefix(query_forms, name_forms) -> bool:
-    """Do the query's words prefix-match a contiguous run of the name's?"""
+def _prefix_kind(query_forms, name_forms):
+    """Do the query's words prefix-match a contiguous run of the name's?
+
+    ``"whole"`` when some run matches every query word as a WHOLE word (forms
+    intersect), ``"partial"`` when a run matches only with the last query word
+    as a prefix, else None."""
     k = len(query_forms)
+    found = None
     for start in range(len(name_forms) - k + 1):
         run = name_forms[start:start + k]
-        if (all(q & n for q, n in zip(query_forms[:-1], run[:-1]))
-                and _word_prefixes(query_forms[-1], run[-1])):
-            return True
-    return False
+        if not all(q & n for q, n in zip(query_forms[:-1], run[:-1])):
+            continue
+        if query_forms[-1] & run[-1]:
+            return "whole"
+        if _word_prefixes(query_forms[-1], run[-1]):
+            found = "partial"
+    return found
 
 
 def _verdict(hits) -> FormMatch:
     if len(hits) == 1:
         return FormMatch(kind="form", doctrine_id=hits[0][0])
+    return _ask(hits)
+
+
+def _ask(hits) -> FormMatch:
     return FormMatch(kind="ambiguous",
                      options=tuple((i, n) for i, n, _f in hits),
                      message="Which doctrine?")
@@ -257,9 +313,11 @@ def match(doctrines, query) -> FormMatch:
     """Which doctrine does ``query`` name? Pure; mutates nothing; never raises.
 
     Ladder: (a) whole-name EXACT (same word count, every word pair shares a
-    form) -- one hit forms, several ask; (b) no word of ``MIN_QUERY_LEN``
-    characters -> ``ignore``; (c) word-anchored PREFIX -- one hit forms,
-    several ask, none -> ``none`` with the toast message."""
+    form) -- one hit forms, several ask; (b) the noise gate: no letter/digit,
+    or a first word shorter than ``MIN_QUERY_LEN`` -> ``ignore``; (c)
+    word-anchored PREFIX -- one WHOLE-word hit forms, one partial hit asks
+    with that single option, several ask; none -> ``none`` with the toast
+    message."""
     text = " ".join(str(query or "").split())
     words = tokenize(text)
     query_forms = tuple(word_forms(w) for w in words)
@@ -270,12 +328,18 @@ def match(doctrines, query) -> FormMatch:
         if exact:
             return _verdict(exact)
 
-    if len(text) < MIN_QUERY_LEN or (
-            words and max(len(w) for w in words) < MIN_QUERY_LEN):
+    if not words or len(words[0]) < MIN_QUERY_LEN:
         return FormMatch(kind="ignore")
 
-    if query_forms:
-        prefix = [e for e in entries if _is_prefix(query_forms, e[2])]
-        if prefix:
-            return _verdict(prefix)
+    hits, whole = [], []
+    for entry in entries:
+        kind = _prefix_kind(query_forms, entry[2])
+        if kind is not None:
+            hits.append(entry)
+            if kind == "whole":
+                whole.append(entry)
+    if len(hits) == 1 and not whole:
+        return _ask(hits)            # a partial word only ever asks
+    if hits:
+        return _verdict(hits)
     return FormMatch(kind="none", message=f"No doctrine matches '{text}'")

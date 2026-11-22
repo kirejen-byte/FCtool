@@ -17914,36 +17914,20 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         if getattr(self, "_motd_doctrine_var", None) is not None:
             self._motd_doctrine_var.set("")
             self._motd_doctrine_prev = ""
-
-        cv = getattr(self, "_motd_canvas", None)
-        if cv is not None:
-            cv.set_doc(self._motd_default_doc())     # silent (no on_change)
-
-        if getattr(self, "_motd_saved_var", None) is not None:
-            self._motd_saved_var.set(self._MOTD_SAVED_BLANK)
-        self._motd_refresh_saved_dropdown()
-        pal = getattr(self, "_motd_palette", None)
-        if pal is not None:
-            pal.refresh_tray()
-
-        self._motd_loaded_template_snapshot = (
-            self._motd_snapshot_state() if cv is not None else None)
-        self._motd_template_dirty = False
-        self._motd_update_dirty_indicator()
-        self._rebuild_motd_preview()
-        # Clear blanks the doctrine combo, so the Refits ▾ button must go with
-        # it — a button offering swaps in a doctrine nothing is showing is the
-        # same class of lie as the push guard above.
-        self._refits_update_buttons()
+        # The shared tail: default doc for the (now blank) doctrine, clean
+        # baseline, preview, and the Refits button re-derived -- Clear blanks
+        # the doctrine combo, so a button offering swaps in a doctrine nothing
+        # is showing would be the same class of lie as the push guard above.
+        self._motd_load_default_doc()
 
     def _motd_load_default_doc(self):
         """Load a fresh default document for the CURRENT doctrine, clean.
 
-        The fleet-chat form command's no-template path (form_action): the tail
-        of _clear_motd_builder WITHOUT the doctrine clear. The caller has
-        already selected the doctrine, so _motd_default_doc derives its lines
-        from THAT doctrine -- never the outgoing canvas text. No prompt, no
-        push."""
+        The fleet-chat form command's no-template path (form_action), and the
+        tail of _clear_motd_builder (which clears the doctrine first). The
+        caller has already set the doctrine, so _motd_default_doc derives its
+        lines from THAT doctrine -- never the outgoing canvas text. No prompt,
+        no push."""
         self._motd_loaded_fits = None
         cv = getattr(self, "_motd_canvas", None)
         if cv is not None:
@@ -26411,7 +26395,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
            check's substring rule: a command carries arguments, so "we should
            refit 2 of those" is not a command. A non-command costs one
            startswith and returns here, before the client read below — which on
-           a previews-off box is a full window enumeration.
+           a previews-off box is a full window enumeration. Right after it,
+           form_command.is_fresh drops a line older than 60 s (replayed from
+           the log at startup), before that read too.
         3. The sender must own one of the owner's live client windows. That
            list is BOTH the own-character gate and the source of the toast's
            rect, so the two can never disagree about who counts.
@@ -26438,6 +26424,13 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
             keyword = refit_command.normalize_config(block)["keyword"]
             command = refit_command.parse(body, keyword)
             if command is None:
+                return
+            # The stale-log age gate (shared with the form command): the chat
+            # monitor resumes from a saved position at startup, so a refit
+            # typed while FCTool was closed must not fire on this launch.
+            if not form_command.is_fresh(getattr(msg, "timestamp", None)):
+                log.info("[refit] stale fleet-chat line (replayed from the "
+                         "log) - refit command ignored")
                 return
             # Same own-character gate as the range check, through the same
             # lookup — a character the two disagreed about would be able to
