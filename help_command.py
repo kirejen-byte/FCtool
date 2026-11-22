@@ -194,6 +194,17 @@ def _role_usage(role_letters) -> str:
     return sep.join(shown) + (more if len(shown) < len(entries) else "")
 
 
+def _xup_word(xup, field, default):
+    """``(word, off)`` for one x-up word. Absent / ``None`` -> the default, not
+    off; present but blank (whitespace only) -> the default AND off, because
+    the counter then matches nothing. Inner whitespace collapses."""
+    raw = xup.get(field)
+    if raw is None:
+        return default, False
+    word = " ".join(str(raw).split())
+    return (word, False) if word else (default, True)
+
+
 def _help_usage(help_keyword) -> str:
     keyword = " ".join(str(help_keyword or "").split())
     if not keyword or _squash(keyword) == _squash(DEFAULTS["keyword"]):
@@ -211,11 +222,14 @@ def build_lines(*, xup, role_letters, range_block, refit_block, form_block,
     range check, refit and form commands (``form_block=None`` = no form
     module -> its line is omitted). A command is ``(off)`` iff its OWN
     ``is_enabled`` says so (the range check's blank keyword also counts: its
-    engine disables on one). The footnote appears only when something is off.
-    Every line is at most ``MAX_LINE`` glyphs. Never raises on junk input."""
+    engine disables on one). The x-up trigger / clear words have no switch,
+    but a BLANK one matches nothing (``xup_counter``), so that line shows the
+    default word and ``(off)`` too; an ABSENT word is just the default. The
+    footnote appears only when something is off. Every line is at most
+    ``MAX_LINE`` glyphs. Never raises on junk input."""
     xup = xup if isinstance(xup, dict) else {}
-    trigger = " ".join(str(xup.get("trigger_word") or "x").split()) or "x"
-    fire = " ".join(str(xup.get("fire_word") or "FIRE").split()) or "FIRE"
+    trigger, trigger_off = _xup_word(xup, "trigger_word", "x")
+    fire, fire_off = _xup_word(xup, "fire_word", "FIRE")
     threshold = xup.get("threshold", 50)
     try:
         threshold = int(threshold)
@@ -224,14 +238,14 @@ def build_lines(*, xup, role_letters, range_block, refit_block, form_block,
 
     lines = ["Anyone in fleet:",
              _row(f"{trigger}  /  {trigger} <ship>",
-                  f"x-up (counts toward {threshold})"),
-             _row(fire, "reset the x-up count")]
+                  f"x-up (counts toward {threshold})", trigger_off),
+             _row(fire, "reset the x-up count", fire_off)]
     roles = _role_usage(role_letters)
     if roles:
         lines.append(_row(roles, "join that role slot"))
     lines.append(_row("paste burst charges", "update Links coverage"))
 
-    any_off = False
+    any_off = trigger_off or fire_off
     lines.append("Your characters:")
 
     rng = range_check.normalize_config(range_block)

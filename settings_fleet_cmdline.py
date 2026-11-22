@@ -74,7 +74,11 @@ class CategoryPills:
     category - never an empty body. Styling mirrors the FCPreview categories:
     active = SUNKEN on the accent, others RIDGE on the entry colour; a pill
     marked ``dim`` (see ``set_suffix``) draws its label in the dim colour
-    while not active. ``on_select(key)`` is called after every select."""
+    while not active. The first category is shown from construction on (the
+    body is never empty); ``on_select(key)`` is called after every LATER
+    select, not that initial one. A select that hides the panel holding the
+    keyboard focus moves the focus to the pill row first, so that widget's
+    ``<FocusOut>`` (an entry's autosave) still fires."""
 
     def __init__(self, parent, categories, *, on_select=None, padx=20):
         self.categories = tuple(categories)
@@ -100,11 +104,34 @@ class CategoryPills:
             btn.pack(side=tk.LEFT, padx=(0, 6))
             self.buttons[key] = btn
             self.panels[key] = tk.Frame(self.body, bg=BG_DARK)
+        self._on_select = None               # the initial show is silent
+        self.select(self.current)
+        self._on_select = on_select
+
+    def _release_focus(self, keep):
+        """If the focus sits inside a panel other than ``keep``'s (about to be
+        hidden), move it to the pill row: a focused widget in an un-packed
+        frame never sees ``<FocusOut>`` until the user clicks elsewhere, so an
+        entry's autosave (and its pill refresh) would silently wait."""
+        try:
+            widget = self.row.focus_get()
+        except (KeyError, tk.TclError):      # the ttk combobox popdown quirk
+            return
+        hidden = [f for k, f in self.panels.items() if k != keep]
+        while widget is not None:
+            if any(widget is f for f in hidden):
+                try:
+                    self.row.focus_set()
+                except tk.TclError:
+                    pass
+                return
+            widget = getattr(widget, "master", None)
 
     def select(self, key):
         """Reveal ``key``'s panel (unknown -> the first) and restyle."""
         if key not in self._labels:
             key = self.categories[0][0]
+        self._release_focus(key)
         self.current = key
         for frame in self.panels.values():
             try:
@@ -220,6 +247,9 @@ def build_section(app, parent):
                               "and help."))
 
     def _remember(key):
+        # Session memory of the shown pill. The Settings tab is built once
+        # per run today, so this only matters if a future in-session rebuild
+        # calls build_section again; the select() below honours it then.
         app._fleet_cmdline_category = key
 
     pills = CategoryPills(parent, CATEGORIES, on_select=_remember)
@@ -237,7 +267,8 @@ def build_section(app, parent):
 
 def _build_xup_panel(app, panel, xup):
     _dim(panel, "Anyone in fleet: type the trigger word to x-up (each pilot "
-                "counts once),\nthe clear word to reset the count.",
+                "counts once),\nthe clear word to reset the count (read from "
+                "the tracked character's\nfleet chat).",
          pady=(4, 2))
     app._add_setting(panel, "Trigger Word", "xup_trigger",
                      xup.get("trigger_word", "x"),
@@ -249,7 +280,7 @@ def _build_xup_panel(app, panel, xup):
                      tooltip=("Resets the x-up tally to zero, clearing "
                               "everyone who has x'd up, so you can start a "
                               "fresh count."))
-    _dim(panel, "The x-up threshold is on the Fleet tab.")
+    _dim(panel, "The x-up threshold is on the Fleet Management tab.")
 
 
 def _build_range_panel(app, panel):
@@ -330,8 +361,15 @@ def _build_refit_panel(app, panel):
     # for the same reason the range tick is. No keyword entry - the config
     # key exists for power users, but a second free-text field here would
     # be a second thing to get wrong for a feature nobody renames.
+    # The intro and its usage lines are ONE label above the tick, so the
+    # intro's ":" leads straight into what it introduces.
     _dim(panel, "In fleet chat, from one of your own characters (read from "
-                "the tracked\ncharacter's fleet chat):", pady=(4, 2))
+                "the tracked\ncharacter's fleet chat):\n"
+                "  refit <ship or role> <number|name>   e.g. refit dps 2 / "
+                "refit muninn ac\n"
+                "  refit <name>    when only one ship has refits\n"
+                "  refit reset     every slot back to its default",
+         pady=(4, 2))
     app._refit_command_enabled_var = tk.BooleanVar(
         value=refit_command.is_enabled(app.config.get("refit_command")))
     rf_check = _check(panel, "Refit commands on fleet chat",
@@ -344,10 +382,6 @@ def _build_refit_panel(app, panel):
         "refit muninn ac\n"
         "refit <name>   when only one ship has refits\n"
         "refit reset   back to defaults")
-    _dim(panel, "refit <ship or role> <number|name>   e.g. refit dps 2 / "
-                "refit muninn ac\n"
-                "refit <name>    when only one ship has refits\n"
-                "refit reset     every slot back to its default")
 
 
 def _build_form_panel(app, panel):
@@ -373,9 +407,12 @@ def _build_form_panel(app, panel):
 def _build_help_panel(app, panel):
     # -- Fleet-chat help command (help_command.py; default ON) ----------------
     # Same one-control shape, seeded through help_command.is_enabled.
-    _dim(panel, "Type \"help FCT\" (or \"help FCTool\") from any of your "
-                "characters - a\n%g s list of every fleet-chat command."
-                % help_command.TOAST_SECONDS, pady=(4, 2))
+    secs = help_command.TOAST_SECONDS
+    if float(secs).is_integer():
+        secs = int(secs)
+    _dim(panel, "Type \"help FCT\" (or \"help FCTool\") in fleet chat from any "
+                "of your characters:\na %s s list of every fleet-chat command."
+                % secs, pady=(4, 2))
     app._help_command_enabled_var = tk.BooleanVar(
         value=help_command.is_enabled(app.config.get("help_command")))
     hp_check = _check(panel, "help FCT command on fleet chat",

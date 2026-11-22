@@ -33492,6 +33492,9 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
         self._collect_refit_command_settings()
         self._collect_form_command_settings()   # the form command's twin tick
         self._collect_help_command_settings()   # ...and the help command's
+        # One pill refresh after the last fold: Save Settings alone leaves
+        # every " . off" suffix matching what it is about to write.
+        settings_fleet_cmdline.refresh_pills(self)
 
         self.config.setdefault("zkillboard", {})
         self.config["zkillboard"]["enabled"] = self._zkill_enabled_var.get()
@@ -34069,10 +34072,11 @@ class FCToolGUI(group_wiring.GroupConfigMixin, ping_wiring.PingWiringMixin):
                 # check discards lines as they arrive and nothing accumulates.
                 # getattr: a host built before __init__ reached the attribute
                 # must still get its tracked-tail poll.
-                # Separate try from the tracked poll above: chat_monitor.poll()
-                # runs its callbacks INLINE, so an exception raised out of one
-                # of those (_on_chat_message and friends) must not skip this
-                # poll and freeze the range tail's read positions.
+                # Separate try from the tracked poll above. ChatMonitor.poll()
+                # isolates its callbacks itself (one raising hook is logged and
+                # the batch goes on), so what this split still guards is the
+                # tracked poll's OWN failure (a _poll_once I/O error): it must
+                # not skip this poll and freeze the range tail's read positions.
                 range_monitor = getattr(self, "_range_monitor", None)
                 if range_monitor:
                     range_monitor.poll()
